@@ -1,4 +1,4 @@
-{% if board in ('pi4-64', 'pi5', 'arm64') %}
+{% if board in ('pi4-64', 'pi3-64', 'pi5', 'arm64') %}
 # archive.raspberrypi.com ships ffmpeg patched with v4l2_request
 # enabled (``--enable-v4l2-request --enable-libudev
 # --enable-vout-drm --enable-sand --enable-neon``). Stock Debian
@@ -9,6 +9,20 @@
 # * Pi 4-64 — V3D V4L2 M2M (H.264 via stateful v4l2m2m, works on
 #   stock too) plus the dedicated rpi-hevc-dec block (HEVC via
 #   v4l2_request, needs ``+rpt1``).
+# * Pi 3-64 — VideoCore IV bcm2835-codec H.264 via the stateful
+#   V4L2 M2M path (``h264_v4l2m2m``), the same eglfs/Qt6 video path
+#   as pi4-64 — this is M2M, NOT the v4l2_request/stateless decoders
+#   pi5/arm64 use. Verified on real Pi 3 hardware: with stock Debian
+#   ffmpeg QtMultimedia never opens /dev/video10 and falls back to
+#   SW (can't sustain 1080p30 — 0.74x realtime — so it drops frames
+#   / stalls presentation under thermal + memory pressure, issue
+#   #3084); with the ``+rpt1`` libav* build it engages the M2M
+#   decoder (/dev/video10 held, 1080p dropped=0). The decoder itself
+#   works on stock standalone (``ffmpeg -c:v h264_v4l2m2m`` = 2.49x
+#   realtime) — it's QtMultimedia's HW selection that needs +rpt1.
+#   pi3-64 was added (#2985) after this pin's board list (#2885) and
+#   grouped with pi4-64 everywhere else, so its omission here was an
+#   oversight.
 # * Pi 5 — Hantro G2 HEVC via v4l2_request (needs ``+rpt1``).
 # * arm64 — Rock Pi 4 / RK3399's ``rkvdec`` (HEVC) and Hantro VPU
 #   (H.264) are also stateless v4l2_request decoders. Live test
