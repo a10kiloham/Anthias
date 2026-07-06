@@ -63,20 +63,64 @@ def _read_cpu_brand() -> str:
     return ''
 
 
-def get_friendly_device_model() -> str:
-    """Operator-facing label for the host the player is running on.
+# Trailing corporate-suffix tokens peeled off a DMI vendor string.
+# Compared case-insensitively with any trailing comma stripped, so
+# 'Co.,' matches 'co.'. Multi-token suffixes like 'Co., Ltd.' fall out
+# of the peel loop naturally.
+_VENDOR_SUFFIX_TOKENS = frozenset(
+    {
+        'corporation',
+        'incorporated',
+        'corp.',
+        'corp',
+        'inc.',
+        'inc',
+        'ltd.',
+        'ltd',
+        'co.',
+        'co',
+        'llc',
+        'gmbh',
+        'ag',
+    }
+)
 
-    Pi:  whatever the firmware Model line reads
-         ('Raspberry Pi 5 Model B Rev 1.0').
-    x86: '<vendor> <product> · <CPU>' when DMI is exposed via
-         /sys/class/dmi/id, otherwise just the CPU brand. Falls back
-         to 'Generic x86_64 Device' when neither is readable so the
-         System Info card never renders blank.
+
+def _strip_corporate_suffix(vendor: str) -> str:
+    """Drop trailing corporate-suffix tokens from a DMI vendor string.
+
+    'Intel Corporation' -> 'Intel', 'Dell Inc.' -> 'Dell',
+    'ASUSTeK Computer INC.' -> 'ASUSTeK Computer', 'Foo Co., Ltd.' ->
+    'Foo'. Leaves a vendor that is *only* a suffix untouched so we never
+    return an empty string here (the caller decides the fallback).
+    """
+    tokens = vendor.split()
+    while (
+        len(tokens) > 1
+        and tokens[-1].lower().rstrip(',') in _VENDOR_SUFFIX_TOKENS
+    ):
+        tokens.pop()
+    return ' '.join(tokens)
+
+
+def get_device_model_parts() -> tuple[str, str]:
+    """(primary, secondary) label for the host, for a two-line card.
+
+    Returns the board/chassis as the primary line and the CPU brand as
+    the secondary line so the System Info card can stack them rather than
+    cramming both onto one row joined by a separator.
+
+    Pi:  ('Raspberry Pi 5 Model B Rev 1.0', '') — the firmware Model
+         line, no separate CPU line.
+    x86: ('Whiskey Platform', 'Intel Celeron 4205U @ 1.80GHz') when DMI
+         exposes a real chassis; ('Intel Celeron ...', '') when it only
+         yields a CPU. Falls back to ('Generic x86_64 Device', '') when
+         neither is readable so the card never renders blank.
     """
     cpu_info = parse_cpu_info()
     pi_model = cpu_info.get('model')
     if isinstance(pi_model, str) and pi_model:
-        return pi_model
+        return pi_model, ''
 
     vendor = _read_sysfs('/sys/class/dmi/id/sys_vendor')
     product = _read_sysfs('/sys/class/dmi/id/product_name')
@@ -116,15 +160,31 @@ def get_friendly_device_model() -> str:
         vendor = ''
     if product in placeholders or _looks_virtual(product):
         product = ''
+
+    # Trim the corporate suffix DMI vendors carry ('Intel Corporation',
+    # 'Dell Inc.', 'ASUSTeK Computer INC.') — noise in a device label.
+    vendor = _strip_corporate_suffix(vendor)
+
+    # Drop the board vendor when the CPU brand already names it. Whitebox
+    # / reference boards set sys_vendor to the CPU maker ('Intel
+    # Corporation' next to an 'Intel Celeron ...' CPU), which would stutter
+    # as 'Intel ...' on both the board and CPU lines. Branded OEM boxes
+    # (Dell, Lenovo) keep their vendor because it differs from the CPU.
+    if vendor and cpu_brand:
+        if vendor.split()[0].lower() in cpu_brand.lower().split():
+            vendor = ''
+
     chassis = ' '.join(part for part in (vendor, product) if part).strip()
 
-    parts = [p for p in (chassis, cpu_brand) if p]
-    if parts:
-        return ' · '.join(parts)
+    if chassis:
+        # Board on the primary line, CPU (when known) on the secondary.
+        return chassis, cpu_brand
+    if cpu_brand:
+        return cpu_brand, ''
 
     from platform import machine
 
-    return f'Generic {machine() or "x86_64"} Device'
+    return f'Generic {machine() or "x86_64"} Device', ''
 
 
 def get_device_type() -> str:

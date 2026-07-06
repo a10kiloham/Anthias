@@ -2495,10 +2495,10 @@ def test_schedule_pills_everyday_short_circuit(asset: Asset) -> None:
 
 
 # ---------------------------------------------------------------------------
-# get_friendly_device_model — Pi vs x86 vs virt
+# get_device_model_parts — (primary, secondary) for the two-line card
 
 
-def test_friendly_device_model_pi(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_device_model_parts_pi(monkeypatch: pytest.MonkeyPatch) -> None:
     from anthias_common import device_helper
 
     monkeypatch.setattr(
@@ -2509,12 +2509,14 @@ def test_friendly_device_model_pi(monkeypatch: pytest.MonkeyPatch) -> None:
             'model': 'Raspberry Pi 5 Model B Rev 1.0',
         },
     )
-    assert device_helper.get_friendly_device_model() == (
-        'Raspberry Pi 5 Model B Rev 1.0'
+    # Pi: the firmware Model line is the whole label; no separate CPU row.
+    assert device_helper.get_device_model_parts() == (
+        'Raspberry Pi 5 Model B Rev 1.0',
+        '',
     )
 
 
-def test_friendly_device_model_x86_with_dmi(
+def test_device_model_parts_x86_with_dmi(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from anthias_common import device_helper
@@ -2536,12 +2538,78 @@ def test_friendly_device_model_x86_with_dmi(
         '_read_cpu_brand',
         lambda: 'Intel Core i5-1135G7 @ 2.40GHz',
     )
-    assert device_helper.get_friendly_device_model() == (
-        'Intel Corp. NUC11PAHi5 · Intel Core i5-1135G7 @ 2.40GHz'
+    # The 'Intel Corp.' board vendor is redundant with the 'Intel Core'
+    # CPU, so it's dropped — leaving the NUC product on the primary line
+    # and the CPU on the secondary.
+    assert device_helper.get_device_model_parts() == (
+        'NUC11PAHi5',
+        'Intel Core i5-1135G7 @ 2.40GHz',
     )
 
 
-def test_friendly_device_model_drops_virt_chassis(
+def test_device_model_parts_x86_drops_redundant_vendor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reference / whitebox boards set sys_vendor to the CPU maker
+    ('Intel Corporation' next to an 'Intel Celeron' CPU). The stuttering
+    vendor is dropped, leaving the board product as the primary line and
+    the CPU as the secondary."""
+    from anthias_common import device_helper
+
+    monkeypatch.setattr(
+        device_helper, 'parse_cpu_info', lambda: {'cpu_count': 2}
+    )
+
+    def fake_sysfs(path: str) -> str:
+        if path.endswith('sys_vendor'):
+            return 'Intel Corporation'
+        if path.endswith('product_name'):
+            return 'Whiskey Platform'
+        return ''
+
+    monkeypatch.setattr(device_helper, '_read_sysfs', fake_sysfs)
+    monkeypatch.setattr(
+        device_helper,
+        '_read_cpu_brand',
+        lambda: 'Intel Celeron 4205U @ 1.80GHz',
+    )
+    assert device_helper.get_device_model_parts() == (
+        'Whiskey Platform',
+        'Intel Celeron 4205U @ 1.80GHz',
+    )
+
+
+def test_device_model_parts_x86_keeps_branded_vendor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A branded OEM vendor that differs from the CPU maker is kept, but
+    its corporate suffix ('Inc.') is trimmed."""
+    from anthias_common import device_helper
+
+    monkeypatch.setattr(
+        device_helper, 'parse_cpu_info', lambda: {'cpu_count': 8}
+    )
+
+    def fake_sysfs(path: str) -> str:
+        if path.endswith('sys_vendor'):
+            return 'Dell Inc.'
+        if path.endswith('product_name'):
+            return 'OptiPlex 7090'
+        return ''
+
+    monkeypatch.setattr(device_helper, '_read_sysfs', fake_sysfs)
+    monkeypatch.setattr(
+        device_helper,
+        '_read_cpu_brand',
+        lambda: 'Intel Core i5-10500 @ 3.10GHz',
+    )
+    assert device_helper.get_device_model_parts() == (
+        'Dell OptiPlex 7090',
+        'Intel Core i5-10500 @ 3.10GHz',
+    )
+
+
+def test_device_model_parts_drops_virt_chassis(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from anthias_common import device_helper
@@ -2563,12 +2631,15 @@ def test_friendly_device_model_drops_virt_chassis(
         '_read_cpu_brand',
         lambda: 'AMD Ryzen 7 5700G',
     )
-    # Chassis is dropped because both vendor + product look virtual;
-    # only the CPU brand survives.
-    assert device_helper.get_friendly_device_model() == 'AMD Ryzen 7 5700G'
+    # Chassis is dropped because both vendor + product look virtual; the
+    # CPU brand becomes the primary line with no secondary.
+    assert device_helper.get_device_model_parts() == (
+        'AMD Ryzen 7 5700G',
+        '',
+    )
 
 
-def test_friendly_device_model_generic_fallback(
+def test_device_model_parts_generic_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from anthias_common import device_helper
@@ -2578,8 +2649,9 @@ def test_friendly_device_model_generic_fallback(
     )
     monkeypatch.setattr(device_helper, '_read_sysfs', lambda _path: '')
     monkeypatch.setattr(device_helper, '_read_cpu_brand', lambda: '')
-    out = device_helper.get_friendly_device_model()
-    assert out.startswith('Generic ') and out.endswith(' Device')
+    primary, secondary = device_helper.get_device_model_parts()
+    assert primary.startswith('Generic ') and primary.endswith(' Device')
+    assert secondary == ''
 
 
 def test_cpu_brand_strips_marketing(monkeypatch: pytest.MonkeyPatch) -> None:
