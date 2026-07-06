@@ -2,6 +2,8 @@
 Tests for asset-related API endpoints.
 """
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 from unittest import mock
 
@@ -61,6 +63,46 @@ def _get_asset(client: APIClient, asset_id: str, version: str) -> Any:
 def _delete_asset(client: APIClient, asset_id: str, version: str) -> Any:
     url = reverse(f'api:asset_detail_{version}', args=[asset_id])
     return client.delete(url)
+
+
+@contextmanager
+def _patched_youtube_dispatch() -> Iterator[dict[str, Any]]:
+    """Patch every version's ``dispatch_download`` plus ``url_fails``.
+
+    Both YouTube create tests share this scaffolding: the four per-view
+    ``dispatch_download`` hooks (so a test can assert which one fired,
+    or that none did) and ``url_fails`` on both serializer modules (so
+    the reachability probe never touches the network). Yields the
+    dispatch mocks keyed by API version.
+    """
+    with (
+        mock.patch(
+            'anthias_server.api.views.v1.dispatch_download'
+        ) as v1_dispatch,
+        mock.patch(
+            'anthias_server.api.views.v1_1.dispatch_download'
+        ) as v1_1_dispatch,
+        mock.patch(
+            'anthias_server.api.views.v1_2.dispatch_download'
+        ) as v1_2_dispatch,
+        mock.patch(
+            'anthias_server.api.views.v2.dispatch_download'
+        ) as v2_dispatch,
+        mock.patch(
+            'anthias_server.api.serializers.mixins.url_fails',
+            return_value=False,
+        ),
+        mock.patch(
+            'anthias_server.api.serializers.v1_1.url_fails',
+            return_value=False,
+        ),
+    ):
+        yield {
+            'v1': v1_dispatch,
+            'v1_1': v1_1_dispatch,
+            'v1_2': v1_2_dispatch,
+            'v2': v2_dispatch,
+        }
 
 
 @pytest.mark.django_db
@@ -566,32 +608,7 @@ def test_create_youtube_asset_dispatches_celery_task(
     }
 
     asset_list_url = reverse(f'api:asset_list_{version}')
-    with (
-        mock.patch(
-            'anthias_server.api.views.v1.dispatch_download'
-        ) as v1_dispatch,
-        mock.patch(
-            'anthias_server.api.views.v1_1.dispatch_download'
-        ) as v1_1_dispatch,
-        mock.patch(
-            'anthias_server.api.views.v1_2.dispatch_download'
-        ) as v1_2_dispatch,
-        mock.patch(
-            'anthias_server.api.views.v2.dispatch_download'
-        ) as v2_dispatch,
-        # Skip the network probe — url_fails would be invoked on the
-        # local mp4 destination, which is a no-op in practice but
-        # avoids any future url_fails behaviour change leaking into
-        # this test.
-        mock.patch(
-            'anthias_server.api.serializers.mixins.url_fails',
-            return_value=False,
-        ),
-        mock.patch(
-            'anthias_server.api.serializers.v1_1.url_fails',
-            return_value=False,
-        ),
-    ):
+    with _patched_youtube_dispatch() as dispatchers:
         response = api_client.post(
             asset_list_url, data=get_request_data(payload, version)
         )
@@ -599,24 +616,51 @@ def test_create_youtube_asset_dispatches_celery_task(
     assert response.status_code == status.HTTP_201_CREATED
     asset_id = response.data['asset_id']
 
-    dispatch_for_version = {
-        'v1': v1_dispatch,
-        'v1_1': v1_1_dispatch,
-        'v1_2': v1_2_dispatch,
-        'v2': v2_dispatch,
-    }[version]
-    dispatch_for_version.assert_called_once_with(asset_id, youtube_url)
+    dispatchers[version].assert_called_once_with(asset_id, youtube_url)
 
     # The other versions' dispatchers must stay untouched — proves
     # we routed through the right view, not just any of them.
-    for v, m in {
-        'v1': v1_dispatch,
-        'v1_1': v1_1_dispatch,
-        'v1_2': v1_2_dispatch,
-        'v2': v2_dispatch,
-    }.items():
+    for v, m in dispatchers.items():
         if v != version:
             m.assert_not_called()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('version', ['v1', 'v1_1', 'v1_2', 'v2'])
+def test_create_youtube_asset_rejects_non_youtube_uri(
+    api_client: APIClient, version: str
+) -> None:
+    """A ``youtube_asset`` create must be rejected when its URI is not a
+    YouTube URL.
+
+    ``mimetype`` is a free-form CharField, so without the
+    ``is_youtube_url`` gate a client could claim ``youtube_asset`` for
+    any http(s) URL and have the device fetch it server-side through
+    yt-dlp's generic extractor — an SSRF to internal / cloud-metadata
+    hosts. The HTML create path already enforces this; every API
+    version must match.
+    """
+    payload = {
+        **ASSET_CREATION_DATA,
+        # Cloud-metadata endpoint — the SSRF target this gate blocks.
+        'uri': 'http://169.254.169.254/latest/meta-data/',  # NOSONAR
+        'mimetype': 'youtube_asset',
+        'duration': 0,
+    }
+    asset_list_url = reverse(f'api:asset_list_{version}')
+
+    with _patched_youtube_dispatch() as dispatchers:
+        response = api_client.post(
+            asset_list_url, data=get_request_data(payload, version)
+        )
+
+    # Rejected as a 400 keyed on ``uri`` (every version routes the
+    # failure through serializer validation), and yt-dlp is never
+    # dispatched on any version.
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert 'uri' in response.data
+    for dispatcher in dispatchers.values():
+        dispatcher.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

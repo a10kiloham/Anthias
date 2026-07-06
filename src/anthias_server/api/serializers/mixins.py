@@ -3,6 +3,7 @@ from inspect import cleandoc
 from os import path, rename
 from typing import Any
 
+from rest_framework.exceptions import ValidationError
 from rest_framework.serializers import CharField, Serializer
 
 from anthias_server.api.errors import AssetCreationError
@@ -14,7 +15,7 @@ from anthias_common.utils import (
     get_video_duration,
     url_fails,
 )
-from anthias_common.youtube import youtube_destination_path
+from anthias_common.youtube import is_youtube_url, youtube_destination_path
 from anthias_server.processing import needs_image_normalisation
 from anthias_server.settings import settings
 
@@ -104,6 +105,22 @@ class CreateAssetSerializerMixin:
         # missing/None mimetype. Both bugs were inherited from the
         # pre-celery code path.
         is_youtube = asset['mimetype'] == 'youtube_asset'
+        # ``mimetype`` is a free-form CharField, so a client can claim
+        # ``youtube_asset`` for any URI. Confirm the URI is actually a
+        # YouTube link before handing it to yt-dlp, mirroring the
+        # ``is_youtube_url`` gate the HTML create path applies — without
+        # it, an arbitrary http(s) URL (including internal / metadata
+        # hosts) would be fetched server-side through yt-dlp's generic
+        # extractor. The URI already passed ``validate_uri``.
+        if is_youtube and not is_youtube_url(uri):
+            # DRF ``ValidationError`` (not ``AssetCreationError``) so
+            # ``serializer.is_valid()`` catches it and the create view
+            # returns a 400 keyed on ``uri`` — matching the v1.1
+            # serializer. A bare ``AssetCreationError`` from here would
+            # escape ``is_valid()`` and surface as a 500.
+            raise ValidationError(
+                {'uri': 'A youtube_asset URI must point at a YouTube URL.'}
+            )
         if is_youtube:
             # Defer the download to download_youtube_asset (Celery).
             # The row lands with mimetype='video', is_processing set,
