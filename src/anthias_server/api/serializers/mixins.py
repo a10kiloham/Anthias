@@ -20,9 +20,11 @@ from anthias_server.processing import needs_image_normalisation
 from anthias_server.settings import settings
 
 from . import (
+    DURATION_RANGE_ERROR,
     get_unique_name,
     validate_uri,
 )
+from anthias_server.app.models import DURATION_S_MAX, clamp_duration
 
 
 class CreateAssetSerializerMixin:
@@ -182,7 +184,18 @@ class CreateAssetSerializerMixin:
             and not is_remote_video_download
         ):
             duration_raw = data.get('duration')
-            if duration_raw is not None and int(duration_raw) == 0:
+            # Guarded parse: v1.2 models duration as a CharField, so
+            # ``'abc'`` must 400 keyed on ``duration``, not escape as
+            # an unhandled ValueError (500).
+            try:
+                duration_is_zero = (
+                    duration_raw is not None and int(duration_raw) == 0
+                )
+            except (TypeError, ValueError):
+                raise ValidationError(
+                    {'duration': 'A valid integer is required.'}
+                )
+            if duration_is_zero:
                 if needs_video:
                     # Defer ffprobe to ``normalize_video_asset``: a
                     # passthrough-eligible upload still needs a
@@ -199,22 +212,37 @@ class CreateAssetSerializerMixin:
                         raise AssetCreationError(
                             f'Could not determine duration of video {uri!r}'
                         )
-                    duration = video_duration.total_seconds()
-                    asset['duration'] = (
-                        duration if version == 'v2' else int(duration)
+                    # Clamp (not reject): the file itself is playable,
+                    # only a corrupted container header can advertise
+                    # an out-of-range length — and that must not put
+                    # an over-cap value in the DB (Sentry ANTHIAS-3E).
+                    asset['duration'] = clamp_duration(
+                        video_duration.total_seconds()
                     )
             else:
                 raise AssetCreationError(
                     'Duration must be zero for video assets.'
                 )
         elif not is_youtube and not is_remote_video_download:
-            # Crashes if it's not an int. We want that.
             duration = data.get('duration', settings['default_duration'])
 
             if version == 'v2':
+                # Already an int bounded by the v2 IntegerField.
                 asset['duration'] = duration
             else:
-                asset['duration'] = int(duration)
+                # v1.2 models duration as a CharField, so parse and
+                # bound the value here — a non-integer must 400 like
+                # the other keyed validation errors (not 500), and an
+                # out-of-range duration would crash-loop the viewer's
+                # Event.wait (Sentry ANTHIAS-3E).
+                try:
+                    asset['duration'] = int(duration)
+                except (TypeError, ValueError):
+                    raise ValidationError(
+                        {'duration': 'A valid integer is required.'}
+                    )
+                if not 0 <= asset['duration'] <= DURATION_S_MAX:
+                    raise ValidationError({'duration': DURATION_RANGE_ERROR})
 
         asset['play_order'] = (
             data.get('play_order') if data.get('play_order') else 0

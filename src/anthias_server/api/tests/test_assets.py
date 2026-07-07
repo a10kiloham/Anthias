@@ -18,6 +18,7 @@ from anthias_server.api.tests.test_common import (
     ASSET_UPDATE_DATA_V2,
     get_request_data,
 )
+from anthias_server.app.models import DURATION_S_MAX
 
 
 @pytest.fixture
@@ -467,6 +468,182 @@ def test_v2_patch_refresh_interval_out_of_range_rejected(
     )
     assert response.status_code == status.HTTP_400_BAD_REQUEST
     assert 'refresh_interval_s' in response.data
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'value',
+    [-1, DURATION_S_MAX + 1],
+    ids=['negative', 'over-one-year-cap'],
+)
+def test_v2_patch_duration_out_of_range_rejected(
+    api_client: APIClient, v2_asset_detail_url: str, value: int
+) -> None:
+    """Both bounds of the 0..DURATION_S_MAX range must 400 on write.
+    A stored duration past C ``PyTime_t`` range crash-loops the
+    viewer's ``Event.wait`` (Sentry ANTHIAS-3E — an operator entered
+    9999999999999 to mean "forever" and took the screen down)."""
+    response = api_client.patch(
+        v2_asset_detail_url,
+        data={'duration': value},
+        format='json',
+    )
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert 'duration' in response.data
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('version', ['v1', 'v1_1', 'v1_2', 'v2'])
+def test_create_asset_duration_out_of_range_rejected(
+    api_client: APIClient, version: str
+) -> None:
+    """Every create path must bound duration — the v1 family models it
+    as a CharField, so the range check lives in the prepare_asset
+    paths rather than on the field (Sentry ANTHIAS-3E)."""
+    response = api_client.post(
+        reverse(f'api:asset_list_{version}'),
+        data=get_request_data(
+            {**ASSET_CREATION_DATA, 'duration': 9999999999999}, version
+        ),
+    )
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('version', ['v1', 'v1_1', 'v1_2', 'v2'])
+def test_create_asset_non_integer_duration_rejected(
+    api_client: APIClient, version: str
+) -> None:
+    """A non-integer duration must be a keyed 400, not a 500 — the
+    v1.2 path used to let ``int('abc')`` escape as an unhandled
+    ValueError."""
+    response = api_client.post(
+        reverse(f'api:asset_list_{version}'),
+        data=get_request_data(
+            {**ASSET_CREATION_DATA, 'duration': 'abc'}, version
+        ),
+    )
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+
+@pytest.mark.django_db
+def test_v1_1_create_video_clamps_absurd_probed_duration(
+    api_client: APIClient,
+) -> None:
+    """A corrupted container header can advertise an out-of-range
+    length; the probe-inferred duration must be bounded like operator
+    input would be — clamped rather than rejected, since the file
+    itself is playable (Sentry ANTHIAS-3E)."""
+    from datetime import timedelta
+
+    from anthias_server.app.models import Asset
+
+    payload = {
+        **ASSET_CREATION_DATA,
+        'uri': '/data/anthias_assets/test-video.mp4',
+        'mimetype': 'video',
+        'duration': 0,
+    }
+    with (
+        mock.patch('anthias_server.processing.dispatch_normalize_video'),
+        mock.patch('anthias_server.processing.stamp_processing_start'),
+        mock.patch('anthias_server.api.serializers.v1_1.rename'),
+        mock.patch(
+            'anthias_server.api.serializers.v1_1.validate_uri',
+            return_value=True,
+        ),
+        mock.patch(
+            'anthias_server.api.serializers.v1_1.url_fails',
+            return_value=False,
+        ),
+        mock.patch(
+            'anthias_server.api.serializers.v1_1.get_video_duration',
+            return_value=timedelta(seconds=9999999999999),
+        ),
+    ):
+        response = api_client.post(
+            reverse('api:asset_list_v1_1'),
+            data=get_request_data(payload, 'v1_1'),
+        )
+    assert response.status_code == status.HTTP_201_CREATED
+    assert Asset.objects.get().duration == DURATION_S_MAX
+
+
+@pytest.mark.django_db
+def test_v1_2_create_stream_clamps_absurd_probed_duration(
+    api_client: APIClient,
+) -> None:
+    """Same as above for the mixin's probe path (v1.2/v2), reached via
+    a non-downloadable remote video URI."""
+    from datetime import timedelta
+
+    from anthias_server.app.models import Asset
+
+    payload = {
+        **ASSET_CREATION_DATA,
+        'uri': 'rtsp://example.com/stream',
+        'mimetype': 'video',
+        'duration': 0,
+    }
+    with (
+        mock.patch(
+            'anthias_server.api.serializers.mixins.url_fails',
+            return_value=False,
+        ),
+        mock.patch(
+            'anthias_server.api.serializers.mixins.get_video_duration',
+            return_value=timedelta(seconds=9999999999999),
+        ),
+    ):
+        response = api_client.post(
+            reverse('api:asset_list_v1_2'),
+            data=get_request_data(payload, 'v1_2'),
+        )
+    assert response.status_code == status.HTTP_201_CREATED
+    assert Asset.objects.get().duration == DURATION_S_MAX
+
+
+@pytest.mark.django_db
+def test_v1_2_create_video_non_integer_duration_rejected(
+    api_client: APIClient,
+) -> None:
+    """The video branch's zero-check parses the raw CharField value —
+    ``'abc'`` must be a keyed 400, not an unhandled ValueError."""
+    payload = {
+        **ASSET_CREATION_DATA,
+        'uri': 'rtsp://example.com/stream',
+        'mimetype': 'video',
+        'duration': 'abc',
+    }
+    with mock.patch(
+        'anthias_server.api.serializers.mixins.url_fails',
+        return_value=False,
+    ):
+        response = api_client.post(
+            reverse('api:asset_list_v1_2'),
+            data=get_request_data(payload, 'v1_2'),
+        )
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert 'duration' in str(response.data)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('version', ['v1', 'v1_1', 'v1_2', 'v2'])
+def test_update_asset_duration_out_of_range_rejected(
+    api_client: APIClient, version: str
+) -> None:
+    asset = _create_asset(api_client, ASSET_CREATION_DATA, version)
+
+    if version == 'v2':
+        data = ASSET_UPDATE_DATA_V2
+    else:
+        data = ASSET_UPDATE_DATA_V1_2
+
+    response = api_client.put(
+        reverse(f'api:asset_detail_{version}', args=[asset['asset_id']]),
+        data=get_request_data({**data, 'duration': 9999999999999}, version),
+    )
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
 
 
 @pytest.mark.django_db
