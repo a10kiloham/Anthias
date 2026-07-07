@@ -5,7 +5,7 @@
 Make sure that you have [Git](https://git-scm.com/) installed on your machine.
 You can install the [GitHub CLI](https://cli.github.com/) to make it easier to fork and clone repositories and checking out between pull requests.
 
-To get started, fork the [Screenly/Anthias](https://github.com/Screenly/Anthias/) repository and clone your fork.
+To get started, fork the [a10kiloham/Anthias](https://github.com/a10kiloham/Anthias/) repository and clone your fork.
 
 ```bash
 git clone https://github.com/your-username/Anthias.git
@@ -26,7 +26,7 @@ types:
 ### Creating Pull Requests
 
 - All pull requests should be made against the `master` branch of the
-  [Screenly/Anthias](https://github.com/Screenly/Anthias/) repository.
+  [a10kiloham/Anthias](https://github.com/a10kiloham/Anthias/) repository.
 - Associate the pull request with the [Anthias project](https://github.com/orgs/Screenly/projects/2).
 - Add a label to the pull request that describes the changes you made.
   - Add a `bug` label if you are fixing a bug.

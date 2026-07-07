@@ -29,14 +29,14 @@ alone.
 
 ## Why `dtoverlay=vc4-kms-v3d` matters
 
-Since [#2905](https://github.com/Screenly/Anthias/pull/2905) the Pi 4 viewer
+Since [#2905](https://github.com/a10kiloham/Anthias/pull/2905) the Pi 4 viewer
 renders through Qt's `eglfs_kms` platform (and Pi 5 / x86 through `cage` /
 wlroots). Both require the **full-KMS** atomic driver `vc4-kms-v3d`. Under
 firmware-KMS (`vc4-fkms-v3d`), or if the overlay value is malformed (e.g. stray
 quotes that the firmware can't parse), the display never comes up and the device
 hangs on the boot splash. Codifying the overlay here is what keeps that value
 correct and identical across the fleet — exactly the kind of dashboard typo that
-caused [#2947](https://github.com/Screenly/Anthias/issues/2947).
+caused [#2947](https://github.com/a10kiloham/Anthias/issues/2947).
 
 ## Settings reference
 

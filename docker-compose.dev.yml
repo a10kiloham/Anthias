@@ -10,7 +10,7 @@ services:
     hostname: anthias
     build:
       context: .
-      dockerfile: docker/Dockerfile.server
+      dockerfile: ./docker/Dockerfile.server
     environment:
       - HOME=/data
       - LISTEN=0.0.0.0

@@ -41,7 +41,7 @@ Alternatively, you can [download our pre-built Balena disk images from the relea
 
 # Using the images from the releases
 
-You can find the latest release [here](https://github.com/Screenly/Anthias/releases/latest). From there, you can download the disk image that you need and flash it to your SD card.
+You can find the latest release [here](https://github.com/a10kiloham/Anthias/releases/latest). From there, you can download the disk image that you need and flash it to your SD card.
 The image file looks something like `<yyyy>-<mm>-<dd>-anthias-<board>.img.xz`. Take note that the `.img` file is compressed in this `.img.xz` file.
 
 > **Note**
@@ -83,8 +83,8 @@ If you'd like more control over your digital signage instance, try installing it
 > * 32-bit Raspberry Pi OS is not supported on Pi 5
 > * If you experience any issues, please report them either:
 >   * On our [forums](https://forums.screenly.io)
->   * As a [GitHub issue](https://github.com/Screenly/Anthias/issues)
->   * In [GitHub Discussions](https://github.com/Screenly/Anthias/discussions)
+>   * As a [GitHub issue](https://github.com/a10kiloham/Anthias/issues)
+>   * In [GitHub Discussions](https://github.com/a10kiloham/Anthias/discussions)
 
 The TL;DR for on [Raspberry Pi OS](https://www.raspberrypi.com/software/) or Debian is:
 
@@ -131,7 +131,7 @@ You can choose between the following choices &mdash; `latest` and `tag`.
 
 Select this option if you want to install a pinned version of Anthias. You'll be prompted to enter
 a specific tag to install. You can find the tags in the
-[releases](https://github.com/Screenly/Anthias/releases) page.
+[releases](https://github.com/a10kiloham/Anthias/releases) page.
 
 The script will check if the tag specified is valid and can be installed.
 If it's not, you need to run the script again and enter a valid tag.

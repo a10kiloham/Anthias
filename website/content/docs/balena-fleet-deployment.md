@@ -94,7 +94,7 @@ Open your terminal and clone the Anthias repository if you haven't already:
 
 ```bash
 $ cd $WORKSPACE_DIRECTORY
-$ git clone git@github.com:Screenly/Anthias.git
+$ git clone git@github.com:a10kiloham/Anthias.git
 $ cd Anthias/
 ```
 

@@ -44,7 +44,7 @@
 # to fetching the signed asset by tag.
 - name: Install upgrade_anthias.sh from the configured branch
   ansible.builtin.get_url:
-    url: "https://raw.githubusercontent.com/Screenly/Anthias/{{ anthias_branch }}/bin/install.sh"
+    url: "https://raw.githubusercontent.com/a10kiloham/Anthias/{{ anthias_branch }}/bin/install.sh"
     dest: /usr/local/sbin/upgrade_anthias.sh
     mode: "0700"
     owner: root

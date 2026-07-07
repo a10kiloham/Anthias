@@ -14,5 +14,5 @@ SERVICES = (
     'viewer',
     'test',
 )
-GITHUB_REPO_URL = 'https://github.com/Screenly/Anthias'
+GITHUB_REPO_URL = 'https://github.com/a10kiloham/Anthias'
 BASE_IMAGE = 'mirror.gcr.io/library/debian'

@@ -31,7 +31,7 @@ LAST_VERDICT_KEY_PREFIX = 'is-up-to-date:last-verdict'
 DEFAULT_REQUESTS_TIMEOUT = 5  # seconds
 
 GITHUB_RELEASES_LATEST_URL = (
-    'https://api.github.com/repos/Screenly/Anthias/releases/latest'
+    'https://api.github.com/repos/a10kiloham/Anthias/releases/latest'
 )
 GITHUB_API_ACCEPT = 'application/vnd.github+json'
 
