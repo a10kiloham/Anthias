@@ -1,10 +1,12 @@
 import logging
+import shutil
 import uuid
-from os import getenv, path, remove
+from os import getenv, link, path, remove
 from typing import Any
 
 import yaml
 from django.conf import settings as django_settings
+from django.db.models import F
 from django.http import HttpRequest, HttpResponse
 from django.shortcuts import render
 from django.utils import timezone
@@ -119,6 +121,89 @@ def remove_default_assets() -> None:
     for asset in Asset.objects.all():
         if asset.asset_id.startswith('default_'):
             asset.delete()
+
+
+class AssetDuplicationError(Exception):
+    """Raised when an asset can't be cloned (still processing, or its
+    on-disk file couldn't be linked/copied)."""
+
+
+def duplicate_asset(asset: Asset) -> Asset:
+    """Clone ``asset`` as an independent playlist entry placed right
+    after the source, and return the new row.
+
+    The playlist has no item entity — the ``Asset`` row *is* the
+    playlist slot — so scheduling the same media twice means cloning
+    the row under a fresh ``asset_id``. Copies are fully independent
+    afterwards: each can carry its own duration, play window, or date
+    range, and editing one never touches the other.
+
+    When the source's file lives in ``assetdir``, the copy gets its
+    own directory entry via a hardlink (same inode, ~zero disk cost;
+    falls back to a real copy on filesystems without hardlinks). Every
+    row keeps exclusive ownership of its ``uri`` path, so
+    ``delete_asset_with_file()`` and the ``cleanup()`` orphan sweep
+    need no refcounting — the data is freed when the last link goes.
+
+    Shared by the v2 API duplicate endpoint and the HTML row action.
+    """
+    if asset.is_processing:
+        raise AssetDuplicationError('Asset is still processing')
+
+    new_uri = asset.uri
+    if asset.uri and asset.uri.startswith(settings['assetdir']):
+        ext = path.splitext(asset.uri)[1]
+        new_uri = path.join(
+            settings['assetdir'], f'{uuid.uuid4().hex}{ext}'
+        )
+        try:
+            link(asset.uri, new_uri)
+        except OSError:
+            try:
+                shutil.copy2(asset.uri, new_uri)
+            except OSError as exc:
+                logger.warning(
+                    'Failed to clone asset file %s: %s', asset.uri, exc
+                )
+                raise AssetDuplicationError(
+                    'Could not copy the asset file'
+                ) from exc
+
+    # Slot the copy directly after the source: shift everything below
+    # it down one. Only enabled rows carry a meaningful play_order (the
+    # home page and the viewer both order the active list by it), so a
+    # disabled source just reuses its play_order verbatim.
+    if asset.is_enabled:
+        Asset.objects.filter(
+            is_enabled=True, play_order__gt=asset.play_order
+        ).update(play_order=F('play_order') + 1)
+
+    duplicate = Asset.objects.create(
+        name=f'{asset.name} (copy)' if asset.name else None,
+        uri=new_uri,
+        md5=asset.md5,
+        start_date=asset.start_date,
+        end_date=asset.end_date,
+        duration=asset.duration,
+        mimetype=asset.mimetype,
+        is_enabled=asset.is_enabled,
+        is_processing=False,
+        nocache=asset.nocache,
+        play_order=asset.play_order + 1,
+        skip_asset_check=asset.skip_asset_check,
+        play_days=asset.play_days,
+        play_time_from=asset.play_time_from,
+        play_time_to=asset.play_time_to,
+        is_reachable=asset.is_reachable,
+        last_reachability_check=asset.last_reachability_check,
+        metadata=dict(asset.metadata or {}),
+    )
+
+    # Wake the viewer so an active copy joins the rotation now rather
+    # than on the next DB-mtime poll.
+    ViewerPublisher.get_instance().send_to_viewer('reload')
+
+    return duplicate
 
 
 def delete_asset_with_file(asset: Asset, *, nudge_viewer: bool = True) -> None:

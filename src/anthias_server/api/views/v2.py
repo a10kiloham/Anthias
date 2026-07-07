@@ -20,7 +20,9 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from anthias_server.app.helpers import (
+    AssetDuplicationError,
     add_default_assets,
+    duplicate_asset,
     remove_default_assets,
 )
 from anthias_server.app.models import Asset
@@ -475,6 +477,44 @@ class AssetViewV2(APIView, DeleteAssetViewMixin):
     @authorized
     def put(self, request: Request, asset_id: str) -> Response:
         return self.update(request, asset_id, partial=False)
+
+
+class AssetDuplicateViewV2(APIView):
+    """Clone an asset into an independent playlist entry.
+
+    The playlist has no item entity — the Asset row *is* the playlist
+    slot — so scheduling the same media twice means cloning the row.
+    See ``app.helpers.duplicate_asset`` for the file-ownership
+    (hardlink) and play-order semantics.
+    """
+
+    serializer_class = AssetSerializerV2
+
+    @extend_schema(
+        summary='Duplicate asset',
+        description=(
+            'Creates an independent copy of the asset, inserted into '
+            'the playlist directly after the source. The copy has its '
+            'own asset_id and can be scheduled, reordered, edited, and '
+            'deleted separately. Returns 409 while the source asset is '
+            'still processing.'
+        ),
+        request=None,
+        responses={201: AssetSerializerV2, 404: None, 409: None},
+    )
+    @authorized
+    def post(self, request: Request, asset_id: str) -> Response:
+        asset = get_object_or_404(Asset, asset_id=asset_id)
+        try:
+            duplicate = duplicate_asset(asset)
+        except AssetDuplicationError as error:
+            return Response(
+                {'error': str(error)}, status=status.HTTP_409_CONFLICT
+            )
+        return Response(
+            AssetSerializerV2(duplicate).data,
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class AssetRecheckViewV2(APIView):

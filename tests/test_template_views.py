@@ -753,6 +753,195 @@ def test_assets_delete_removes_local_file(
 
 
 @pytest.mark.django_db
+def test_assets_duplicate_creates_independent_copy(
+    client: Client, asset: Asset
+) -> None:
+    """POST assets/<id>/duplicate/ clones the row after the source.
+
+    URL-backed asset (uri outside assetdir): no file work, just a new
+    row with its own asset_id, name suffixed ``(copy)``, slotted at
+    ``source.play_order + 1``.
+    """
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        response = client.post(
+            reverse(
+                'anthias_app:assets_duplicate', args=[asset.asset_id]
+            )
+        )
+
+    assert response.status_code in (200, 302)
+    rows = list(Asset.objects.order_by('play_order'))
+    assert len(rows) == 2
+    copy = next(a for a in rows if a.asset_id != asset.asset_id)
+    assert copy.name == 'Test asset (copy)'
+    assert copy.uri == asset.uri
+    assert copy.play_order == asset.play_order + 1
+    assert copy.is_enabled
+    assert not copy.is_processing
+
+
+@pytest.mark.django_db
+def test_assets_duplicate_shifts_following_play_orders(
+    client: Client,
+) -> None:
+    """Duplicating the first of three active assets slots the copy at
+    position 1 and pushes the other two down one each."""
+    now = timezone.now()
+    originals = [
+        Asset.objects.create(
+            name=f'a{i}',
+            uri=f'https://example.com/{i}',
+            mimetype='webpage',
+            duration=1,
+            is_enabled=True,
+            play_order=i,
+            start_date=now,
+            end_date=now + timedelta(days=30),
+        )
+        for i in range(3)
+    ]
+
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        client.post(
+            reverse(
+                'anthias_app:assets_duplicate',
+                args=[originals[0].asset_id],
+            )
+        )
+
+    by_order = {
+        a.play_order: a.name for a in Asset.objects.order_by('play_order')
+    }
+    assert by_order == {0: 'a0', 1: 'a0 (copy)', 2: 'a1', 3: 'a2'}
+
+
+@pytest.mark.django_db
+def test_assets_duplicate_hardlinks_local_file(
+    client: Client, tmp_path: Any
+) -> None:
+    """A local upload's clone gets its own directory entry, so deleting
+    the source afterwards must not take the copy's file with it — the
+    failure mode that ruled out naive uri-sharing."""
+    from anthias_server.settings import settings as anthias_settings
+
+    assetdir = tmp_path / 'assets'
+    assetdir.mkdir()
+    src_path = assetdir / 'video.mp4'
+    src_path.write_bytes(b'\x00\x01video-payload')
+
+    now = timezone.now()
+    asset = Asset.objects.create(
+        name='Local video',
+        uri=str(src_path),
+        mimetype='video',
+        duration=10,
+        is_enabled=True,
+        play_order=0,
+        start_date=now,
+        end_date=now + timedelta(days=30),
+    )
+
+    with (
+        mock.patch.dict(anthias_settings, {'assetdir': str(assetdir)}),
+        mock.patch(
+            'anthias_server.settings.ViewerPublisher.send_to_viewer',
+            return_value=None,
+        ),
+    ):
+        client.post(
+            reverse('anthias_app:assets_duplicate', args=[asset.asset_id])
+        )
+        copy = Asset.objects.exclude(asset_id=asset.asset_id).get()
+        assert copy.uri != asset.uri
+        assert copy.uri.startswith(str(assetdir))
+
+        client.post(
+            reverse('anthias_app:assets_delete', args=[asset.asset_id])
+        )
+
+    assert not src_path.exists()
+    assert Asset.objects.filter(asset_id=copy.asset_id).exists()
+    with open(copy.uri, 'rb') as f:
+        assert f.read() == b'\x00\x01video-payload'
+
+
+@pytest.mark.django_db
+def test_assets_duplicate_falls_back_to_copy_without_hardlinks(
+    client: Client, tmp_path: Any
+) -> None:
+    """FAT / network filesystems reject os.link — the clone must fall
+    back to a byte copy instead of failing."""
+    from anthias_server.settings import settings as anthias_settings
+
+    assetdir = tmp_path / 'assets'
+    assetdir.mkdir()
+    src_path = assetdir / 'image.png'
+    src_path.write_bytes(b'png-payload')
+
+    now = timezone.now()
+    asset = Asset.objects.create(
+        name='Local image',
+        uri=str(src_path),
+        mimetype='image',
+        duration=10,
+        is_enabled=True,
+        play_order=0,
+        start_date=now,
+        end_date=now + timedelta(days=30),
+    )
+
+    with (
+        mock.patch.dict(anthias_settings, {'assetdir': str(assetdir)}),
+        mock.patch(
+            'anthias_server.app.helpers.link',
+            side_effect=OSError('EPERM: hardlinks not supported'),
+        ),
+        mock.patch(
+            'anthias_server.settings.ViewerPublisher.send_to_viewer',
+            return_value=None,
+        ),
+    ):
+        client.post(
+            reverse('anthias_app:assets_duplicate', args=[asset.asset_id])
+        )
+
+    copy = Asset.objects.exclude(asset_id=asset.asset_id).get()
+    with open(copy.uri, 'rb') as f:
+        assert f.read() == b'png-payload'
+
+
+@pytest.mark.django_db
+def test_assets_duplicate_rejects_processing_asset(
+    client: Client,
+) -> None:
+    now = timezone.now()
+    asset = Asset.objects.create(
+        name='Still transcoding',
+        uri='https://example.com/raw.mov',
+        mimetype='video',
+        duration=0,
+        is_enabled=False,
+        is_processing=True,
+        play_order=0,
+        start_date=now,
+        end_date=now + timedelta(days=30),
+    )
+
+    response = client.post(
+        reverse('anthias_app:assets_duplicate', args=[asset.asset_id])
+    )
+
+    assert response.status_code in (200, 302)
+    assert Asset.objects.count() == 1
+
+
+@pytest.mark.django_db
 def test_assets_order_persists_play_order(client: Client) -> None:
     a1 = Asset.objects.create(
         name='a1',
