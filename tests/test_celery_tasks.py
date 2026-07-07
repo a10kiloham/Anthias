@@ -294,6 +294,121 @@ def test_shutdown_anthias_uses_balena_supervisor_on_balena() -> None:
     mock_shutdown.assert_called_once()
 
 
+def test_reboot_anthias_retries_until_supervisor_recovers() -> None:
+    """The supervisor is routinely down right when a reboot fires
+    (it restarts itself during an OTA apply) — the task must keep
+    retrying past the first refused connection and also treat a 5xx
+    from a half-started supervisor as retryable (Sentry ANTHIAS-3F)."""
+    import requests as requests_module
+
+    error_response = mock.MagicMock()
+    error_response.raise_for_status.side_effect = (
+        requests_module.exceptions.HTTPError('503')
+    )
+    ok_response = mock.MagicMock()
+    ok_response.raise_for_status.return_value = None
+    with (
+        mock.patch.object(
+            celery_tasks_module, 'is_balena_app', return_value=True
+        ),
+        mock.patch.object(
+            celery_tasks_module,
+            'reboot_via_balena_supervisor',
+            side_effect=[
+                requests_module.exceptions.ConnectionError(),
+                error_response,
+                ok_response,
+            ],
+        ) as mock_reboot,
+        # Zero the exponential backoff so the retries don't sleep.
+        mock.patch.object(celery_tasks_module, 'SUPERVISOR_CMD_WAIT_MAX_S', 0),
+    ):
+        result = reboot_anthias.apply()
+    assert result.successful()
+    assert mock_reboot.call_count == 3
+
+
+def test_reboot_anthias_non_transport_error_propagates() -> None:
+    """Only transport/HTTP failures are retryable — anything else
+    (a TypeError-class bug, celery's SoftTimeLimitExceeded) must
+    escape immediately instead of being retried for the full window
+    and masked as 'supervisor didn't accept the command'."""
+    with (
+        mock.patch.object(
+            celery_tasks_module, 'is_balena_app', return_value=True
+        ),
+        mock.patch.object(
+            celery_tasks_module,
+            'reboot_via_balena_supervisor',
+            side_effect=TypeError('a real bug'),
+        ) as mock_reboot,
+        mock.patch.object(celery_tasks_module, 'SUPERVISOR_CMD_WAIT_MAX_S', 0),
+    ):
+        result = reboot_anthias.apply()
+    assert result.failed()
+    assert isinstance(result.result, TypeError)
+    mock_reboot.assert_called_once()
+
+
+def test_reboot_anthias_terminal_supervisor_failure_warns_not_raises() -> None:
+    """When the supervisor never comes back within the retry window the
+    task must log a warning and exit cleanly — an unhandled RetryError
+    here was a Sentry event per attempt fleet-wide (ANTHIAS-3F)."""
+    import requests as requests_module
+
+    with (
+        mock.patch.object(
+            celery_tasks_module, 'is_balena_app', return_value=True
+        ),
+        mock.patch.object(
+            celery_tasks_module,
+            'reboot_via_balena_supervisor',
+            side_effect=requests_module.exceptions.ConnectionError(),
+        ),
+        # Zero the budget so stop_after_delay trips right after the
+        # first attempt — no sleeping and no tight retry loop.
+        mock.patch.object(
+            celery_tasks_module, 'SUPERVISOR_CMD_RETRY_WINDOW_S', 0
+        ),
+        mock.patch.object(celery_tasks_module, 'SUPERVISOR_CMD_WAIT_MAX_S', 0),
+        mock.patch(
+            'anthias_server.celery_tasks.logging.warning'
+        ) as mock_warning,
+        mock.patch('anthias_server.celery_tasks.logging.error') as mock_error,
+    ):
+        result = reboot_anthias.apply()
+    assert result.successful()
+    mock_warning.assert_called_once()
+    mock_error.assert_not_called()
+
+
+def test_shutdown_anthias_terminal_supervisor_failure_warns_not_raises() -> (
+    None
+):
+    import requests as requests_module
+
+    with (
+        mock.patch.object(
+            celery_tasks_module, 'is_balena_app', return_value=True
+        ),
+        mock.patch.object(
+            celery_tasks_module,
+            'shutdown_via_balena_supervisor',
+            side_effect=requests_module.exceptions.ConnectionError(),
+        ),
+        mock.patch.object(
+            celery_tasks_module, 'SUPERVISOR_CMD_RETRY_WINDOW_S', 0
+        ),
+        mock.patch.object(celery_tasks_module, 'SUPERVISOR_CMD_WAIT_MAX_S', 0),
+        mock.patch(
+            'anthias_server.celery_tasks.logging.warning'
+        ) as mock_warning,
+    ):
+        result = shutdown_anthias.apply()
+    assert result.successful()
+    mock_warning.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # revalidate_asset_urls (periodic sweep)
 # ---------------------------------------------------------------------------
