@@ -10,11 +10,10 @@
  * fetch is idempotent and never accidentally committed.
  *
  * Requires the `gh` CLI to be installed and authenticated. Targets
- * the upstream `Screenly/Anthias` repo by default so contributors
- * working from a fork still get the canonical artifact (the upstream
- * is the only place marketing-screenshots.yaml runs on a schedule).
- * Override with `--repo <owner>/<repo>` to pull from a different
- * repo. Run from the `website/` directory:
+ * the `a10kiloham/Anthias` repo by default (where the
+ * marketing-screenshots.yaml workflow runs). Override with
+ * `--repo <owner>/<repo>` to pull from a different repo. Run from
+ * the `website/` directory:
  *
  *   bun run screenshots:fetch
  *
@@ -32,7 +31,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 const DEST = 'assets/images/screenshots'
-const DEFAULT_REPO = 'Screenly/Anthias'
+const DEFAULT_REPO = 'a10kiloham/Anthias'
 
 const args = Bun.argv.slice(2)
 let branch = 'master'

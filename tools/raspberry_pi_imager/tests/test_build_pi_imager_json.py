@@ -19,7 +19,7 @@ from tools.raspberry_pi_imager.build_pi_imager_json import (
 
 RELEASE_TAG = 'v0.20.0'
 BASE_RELEASE_URL = (
-    'https://github.com/Screenly/Anthias/releases/download/' + RELEASE_TAG
+    'https://github.com/a10kiloham/Anthias/releases/download/' + RELEASE_TAG
 )
 
 MOCK_RELEASE_ASSETS = {

@@ -7,7 +7,7 @@ from typing import Any
 
 import requests
 
-BASE_URL = 'https://api.github.com/repos/Screenly/Anthias'
+BASE_URL = 'https://api.github.com/repos/a10kiloham/Anthias'
 GITHUB_HEADERS = {
     'Accept': 'application/vnd.github+json',
     'X-GitHub-Api-Version': '2022-11-28',

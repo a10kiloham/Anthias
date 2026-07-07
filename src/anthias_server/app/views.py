@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 r = connect_to_redis()
 
 
-_ANTHIAS_REPO_URL = 'https://github.com/Screenly/Anthias'
+_ANTHIAS_REPO_URL = 'https://github.com/a10kiloham/Anthias'
 
 # Plain ``.<alnum>`` literal — anything else is rejected by
 # ``assets_upload`` so a hostile ``Content-Disposition: filename=``

@@ -85,7 +85,7 @@ def test_fetch_latest_release_tag_happy_path(
         assert github._fetch_latest_release_tag() == 'v2026.6.0'
     assert redis_data[github.LATEST_RELEASE_TAG_KEY] == 'v2026.6.0'
     url = mock_get.call_args.args[0]
-    assert url.endswith('/repos/Screenly/Anthias/releases/latest')
+    assert url.endswith('/repos/a10kiloham/Anthias/releases/latest')
 
 
 def test_fetch_latest_release_tag_request_exception(

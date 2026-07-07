@@ -20,13 +20,13 @@
 
     - question: Can I use Anthias commercially?
       answer: |
-        Yes. Anthias is dual-licensed under [GPLv2](https://github.com/Screenly/Anthias/blob/master/LICENSE) and a commercial license. You can deploy it commercially under GPLv2 — including in customer-facing storefronts and lobbies — as long as you comply with the GPL's copyleft terms when redistributing modified versions.
+        Yes. Anthias is dual-licensed under [GPLv2](https://github.com/a10kiloham/Anthias/blob/master/LICENSE) and a commercial license. You can deploy it commercially under GPLv2 — including in customer-facing storefronts and lobbies — as long as you comply with the GPL's copyleft terms when redistributing modified versions.
 
         If you need a non-copyleft license, professional support, or fleet-scale management, see [Screenly](https://www.screenly.io).
 
     - question: Is there support for Anthias?
       answer: |
-        Anthias is a community-supported project. You can get help on the [Anthias forum](https://forums.screenly.io) or file issues on [GitHub](https://github.com/Screenly/Anthias/issues). For professional support, SLAs, and managed infrastructure, consider [Screenly](https://www.screenly.io).
+        Anthias is a community-supported project. You can get help on the [Anthias forum](https://forums.screenly.io) or file issues on [GitHub](https://github.com/a10kiloham/Anthias/issues). For professional support, SLAs, and managed infrastructure, consider [Screenly](https://www.screenly.io).
 
 - group: Installation & updates
   items:
@@ -154,7 +154,7 @@
         * **No Anthias boot splash.** Most non-Pi boards don't display our splash — you'll see the kernel boot log scroll on the screen until Anthias starts and shows your first asset (usually a minute or two from power-on). Everything works fine; startup just looks less polished than on a Raspberry Pi.
         * **Tested boards.** Rock Pi 4, Rock 5, Orange Pi 5, and Banana Pi M5 are known to work well. Orange Pi Zero 3 (and other Allwinner H616 / H618 boards) currently have weaker mainline driver support and are best limited to images and web content.
 
-        See [issue #2849](https://github.com/Screenly/Anthias/issues/2849) for the roadmap on per-board hardware video acceleration.
+        See [issue #2849](https://github.com/a10kiloham/Anthias/issues/2849) for the roadmap on per-board hardware video acceleration.
 
     - question: Can I add transitions (fade / crossfade) between assets?
       answer: |

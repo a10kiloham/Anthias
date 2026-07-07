@@ -1,6 +1,6 @@
 [Unit]
 Description=Anthias Host Agent
-Documentation=https://github.com/Screenly/Anthias
+Documentation=https://github.com/a10kiloham/Anthias
 Requires=docker.service
 After=docker.service
 StartLimitIntervalSec=10

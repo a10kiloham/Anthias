@@ -24,7 +24,7 @@ assets:
   repository:
     type: "blob.asset"
     data:
-      url: "https://github.com/Screenly/Anthias/"
+      url: "https://github.com/a10kiloham/Anthias/"
   logo:
     type: "blob.asset"
     data:
