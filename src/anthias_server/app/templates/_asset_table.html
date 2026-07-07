@@ -45,7 +45,8 @@
           <th scope="col" style="width: 28%">Schedule window</th>
           <th scope="col" style="width: 10%">Duration</th>
           <th scope="col" style="width: 8%">Enabled</th>
-          <th scope="col" style="width: 14%" class="text-right">Actions</th>
+          {% comment %} Fixed rem width, not %: table-layout is fixed and the action group is five 2.25rem icon buttons + four 0.35rem gaps + 2×0.75rem cell padding = 14.15rem, so a % column only fits above a certain viewport and the last icon spills past the cell edge below it. {% endcomment %}
+          <th scope="col" style="width: 14.25rem" class="text-right">Actions</th>
         </tr>
       </thead>
       <tbody id="active-rows">
@@ -85,7 +86,8 @@
           <th scope="col" style="width: 28%">Schedule window</th>
           <th scope="col" style="width: 10%">Duration</th>
           <th scope="col" style="width: 8%">Enabled</th>
-          <th scope="col" style="width: 14%" class="text-right">Actions</th>
+          {% comment %} Fixed rem width, not %: table-layout is fixed and the action group is five 2.25rem icon buttons + four 0.35rem gaps + 2×0.75rem cell padding = 14.15rem, so a % column only fits above a certain viewport and the last icon spills past the cell edge below it. {% endcomment %}
+          <th scope="col" style="width: 14.25rem" class="text-right">Actions</th>
         </tr>
       </thead>
       <tbody>
