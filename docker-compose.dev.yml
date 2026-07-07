@@ -17,8 +17,14 @@ services:
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
       - ENVIRONMENT=development
+    # caddynet so the reverse proxy can reach uvicorn; anthiasnet so
+    # Channels / viewer pub-sub / Celery dispatch can reach redis
+    # (the server was caddynet-only for a while, which left it either
+    # unable to resolve `redis` or resolving another stack's redis on
+    # the shared proxy network).
     networks:
       - caddynet
+      - anthiasnet
     depends_on:
       redis:
         condition: service_healthy
@@ -37,8 +43,12 @@ services:
         condition: service_started
       redis:
         condition: service_healthy
+    # anthiasnet only — no inbound HTTP, and staying off the shared
+    # caddynet means a `redis` container in another stack on that
+    # network can never win the DNS lookup for our broker (that
+    # collision made kombu flap between the two servers and fail with
+    # the other stack's requirepass).
     networks:
-      - caddynet
       - anthiasnet
     command: >
       nice -n 19 ionice -c 3
@@ -72,5 +82,9 @@ volumes:
 networks:
   caddynet:
     external: true
+  # Plain bridge, not `internal: true`: celery needs egress for
+  # YouTube / remote-video downloads and internal networks block all
+  # outbound traffic. Redis stays unreachable from outside the stack
+  # regardless — it publishes no ports and only this network's
+  # containers can see it.
   anthiasnet:
-    internal: true
