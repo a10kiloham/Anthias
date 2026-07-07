@@ -148,6 +148,53 @@ class TestBeforeSendTransientNoise:
         hint = self._hint_for(AuthSettingsError('New passwords do not match!'))
         assert _sentry_before_send({'event_id': 'x'}, hint) is None
 
+    def test_drops_gaierror(self) -> None:
+        # DNS failing = the device is offline, a routine state for
+        # signage. A DNS-less box burned an event per attempted
+        # external call, mostly via asyncio's "Future exception was
+        # never retrieved" log (Sentry ANTHIAS-3G).
+        import socket
+
+        from anthias_server.django_project.settings import (
+            _sentry_before_send,
+        )
+
+        hint = self._hint_for(
+            socket.gaierror(-5, 'No address associated with hostname')
+        )
+        assert _sentry_before_send({'event_id': 'x'}, hint) is None
+
+    def test_drops_wrapped_gaierror(self) -> None:
+        # requests buries the gaierror several layers deep
+        # (urllib3 NameResolutionError -> requests.ConnectionError);
+        # the chain walk must still find it.
+        import socket
+
+        import requests
+
+        from anthias_server.django_project.settings import (
+            _sentry_before_send,
+        )
+
+        try:
+            try:
+                raise socket.gaierror(
+                    -5, 'No address associated with hostname'
+                )
+            except socket.gaierror as root:
+                raise requests.exceptions.ConnectionError(
+                    'resolution failed'
+                ) from root
+        except requests.exceptions.ConnectionError as wrapper:
+            hint = {
+                'exc_info': (
+                    type(wrapper),
+                    wrapper,
+                    wrapper.__traceback__,
+                )
+            }
+        assert _sentry_before_send({'event_id': 'x'}, hint) is None
+
     def test_keeps_ordinary_exceptions(self) -> None:
         from anthias_server.django_project.settings import (
             _sentry_before_send,
