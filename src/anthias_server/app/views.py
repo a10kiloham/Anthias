@@ -890,6 +890,26 @@ def assets_toggle(request: HttpRequest, asset_id: str) -> HttpResponse:
 
 @authorized
 @require_http_methods(['POST'])
+def assets_duplicate(request: HttpRequest, asset_id: str) -> HttpResponse:
+    from anthias_server.app.helpers import (
+        AssetDuplicationError,
+        duplicate_asset,
+    )
+    from anthias_server.app.models import Asset
+
+    toast: tuple[str, str] | None = None
+    asset = Asset.objects.filter(asset_id=asset_id).first()
+    if asset is not None:
+        try:
+            duplicate_asset(asset)
+            toast = ('success', 'Asset duplicated')
+        except AssetDuplicationError as exc:
+            toast = ('error', str(exc))
+    return _asset_table_response(request, toast=toast)
+
+
+@authorized
+@require_http_methods(['POST'])
 def assets_delete(request: HttpRequest, asset_id: str) -> HttpResponse:
     from anthias_server.app.helpers import delete_asset_with_file
     from anthias_server.app.models import Asset

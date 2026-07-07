@@ -1060,3 +1060,71 @@ def test_create_heic_image_does_not_dispatch_on_legacy_endpoints(
 
     assert response.status_code == status.HTTP_201_CREATED, response.data
     mock_dispatch.assert_not_called()
+
+
+@pytest.mark.django_db
+@mock.patch('anthias_server.app.helpers.ViewerPublisher')
+def test_v2_duplicate_asset_returns_201_with_independent_copy(
+    publisher_mock: Any, api_client: APIClient
+) -> None:
+    """POST /api/v2/assets/<id>/duplicate clones the row: fresh
+    asset_id, ``(copy)`` name suffix, slotted directly after the
+    source, and a viewer reload nudge so an active copy joins the
+    rotation immediately."""
+    publisher_instance = mock.MagicMock()
+    publisher_mock.get_instance.return_value = publisher_instance
+
+    asset = _create_asset(api_client, ASSET_CREATION_DATA, 'v2')
+
+    response = api_client.post(
+        reverse('api:asset_duplicate_v2', args=[asset['asset_id']])
+    )
+
+    assert response.status_code == status.HTTP_201_CREATED, response.data
+    assert response.data['asset_id'] != asset['asset_id']
+    assert response.data['name'] == 'Anthias (copy)'
+    assert response.data['uri'] == asset['uri']
+    assert response.data['play_order'] == asset['play_order'] + 1
+    assert len(_get_assets(api_client, 'v2')) == 2
+    publisher_instance.send_to_viewer.assert_called_with('reload')
+
+
+@pytest.mark.django_db
+def test_v2_duplicate_unknown_asset_returns_404(
+    api_client: APIClient,
+) -> None:
+    response = api_client.post(
+        reverse('api:asset_duplicate_v2', args=['no-such-asset'])
+    )
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+
+
+@pytest.mark.django_db
+def test_v2_duplicate_processing_asset_returns_409(
+    api_client: APIClient,
+) -> None:
+    """A row that is mid-transcode can't be safely cloned — its file
+    is still being written — so the endpoint refuses with 409."""
+    from django.utils import timezone as django_timezone
+
+    from anthias_server.app.models import Asset
+
+    now = django_timezone.now()
+    asset = Asset.objects.create(
+        name='Still transcoding',
+        uri='https://example.com/raw.mov',
+        mimetype='video',
+        duration=0,
+        is_enabled=False,
+        is_processing=True,
+        play_order=0,
+        start_date=now,
+        end_date=now,
+    )
+
+    response = api_client.post(
+        reverse('api:asset_duplicate_v2', args=[asset.asset_id])
+    )
+
+    assert response.status_code == status.HTTP_409_CONFLICT
+    assert Asset.objects.count() == 1

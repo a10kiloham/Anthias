@@ -2,6 +2,7 @@ from django.urls import URLPattern, URLResolver, path
 
 from anthias_server.api.views.v2 import (
     AssetContentViewV2,
+    AssetDuplicateViewV2,
     AssetListViewV2,
     AssetRecheckViewV2,
     AssetsControlViewV2,
@@ -56,6 +57,11 @@ def get_url_patterns() -> list[URLPattern | URLResolver]:
             'v2/assets/<str:asset_id>/content',
             AssetContentViewV2.as_view(),
             name='asset_content_v2',
+        ),
+        path(
+            'v2/assets/<str:asset_id>/duplicate',
+            AssetDuplicateViewV2.as_view(),
+            name='asset_duplicate_v2',
         ),
         path(
             'v2/assets/<str:asset_id>/recheck',

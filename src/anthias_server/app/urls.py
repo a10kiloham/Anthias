@@ -87,6 +87,11 @@ urlpatterns = [
         name='assets_toggle',
     ),
     path(
+        'assets/<str:asset_id>/duplicate/',
+        views.assets_duplicate,
+        name='assets_duplicate',
+    ),
+    path(
         'assets/<str:asset_id>/delete/',
         views.assets_delete,
         name='assets_delete',

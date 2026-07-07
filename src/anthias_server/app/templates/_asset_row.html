@@ -93,6 +93,22 @@
         class="app-btn app-btn-icon"
         title="Download"
       ><i class="ti ti-download"></i></a>
+      <form
+        method="post"
+        action="{% url 'anthias_app:assets_duplicate' asset_id=asset.asset_id %}"
+        hx-post="{% url 'anthias_app:assets_duplicate' asset_id=asset.asset_id %}"
+        hx-target="#asset-table"
+        hx-swap="outerHTML"
+        class="inline m-0"
+      >
+        {% csrf_token %}
+        <button
+          type="submit"
+          class="app-btn app-btn-icon"
+          title="Duplicate"
+          {% if asset.is_processing %}disabled{% endif %}
+        ><i class="ti ti-copy"></i></button>
+      </form>
       <button
         type="button"
         class="app-btn app-btn-icon"
