@@ -71,6 +71,242 @@ def test_file_asset(api_client: APIClient, cleanup_asset_dir: None) -> None:
 
 
 @pytest.mark.django_db
+def test_file_asset_disk_full_returns_507(
+    api_client: APIClient, cleanup_asset_dir: None
+) -> None:
+    """ENOSPC while writing the upload must come back as an actionable
+    507 with the shared disk-full message, not an unhandled 500
+    (Sentry ANTHIAS-3K)."""
+    import errno
+
+    image_path = os.path.join(
+        django_settings.BASE_DIR,
+        'src/anthias_server/app/static/img/standby.png',
+    )
+
+    with (
+        open(image_path, 'rb') as file_upload,
+        mock.patch(
+            'anthias_server.api.views.mixins.open',
+            side_effect=OSError(errno.ENOSPC, 'No space left on device'),
+            create=True,
+        ),
+    ):
+        response = api_client.post(
+            reverse('api:file_asset_v1'),
+            data={'file_upload': file_upload},
+        )
+
+    assert response.status_code == status.HTTP_507_INSUFFICIENT_STORAGE
+    assert 'disk is full' in response.data['detail']
+
+
+@pytest.mark.django_db
+def test_file_asset_disk_full_during_parse_returns_507(
+    api_client: APIClient, cleanup_asset_dir: None
+) -> None:
+    """The ANTHIAS-3K stack is ENOSPC during the multipart parse
+    (Django spooling the body to a temp file), surfaced when the view
+    accesses ``request.data``. Force the parser to raise and assert
+    the same 507 + shared message."""
+    import errno
+
+    from django.core.files.uploadedfile import SimpleUploadedFile
+    from django.http.multipartparser import MultiPartParser
+
+    with mock.patch.object(
+        MultiPartParser,
+        'parse',
+        side_effect=OSError(errno.ENOSPC, 'No space left on device'),
+    ):
+        response = api_client.post(
+            reverse('api:file_asset_v1'),
+            data={
+                'file_upload': SimpleUploadedFile(
+                    'photo.png', b'\x89PNG\r\n', content_type='image/png'
+                )
+            },
+        )
+
+    assert response.status_code == status.HTTP_507_INSUFFICIENT_STORAGE
+    assert 'disk is full' in response.data['detail']
+
+
+@pytest.mark.django_db
+def test_file_asset_disk_full_during_write_cleans_up_partial(
+    api_client: APIClient, cleanup_asset_dir: None
+) -> None:
+    """When the disk fills mid-write (open() succeeds, f.write() then
+    raises ENOSPC), the handler must remove the partial .tmp and still
+    return 507 — not leave a truncated file behind."""
+    import errno
+
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    write_fails = mock.mock_open()
+    write_fails.return_value.write.side_effect = OSError(
+        errno.ENOSPC, 'No space left on device'
+    )
+    with (
+        mock.patch(
+            'anthias_server.api.views.mixins.open', write_fails, create=True
+        ),
+        mock.patch('anthias_server.api.views.mixins.remove') as mock_remove,
+    ):
+        response = api_client.post(
+            reverse('api:file_asset_v1'),
+            data={
+                'file_upload': SimpleUploadedFile(
+                    'photo.png', b'\x89PNG\r\n', content_type='image/png'
+                )
+            },
+        )
+
+    assert response.status_code == status.HTTP_507_INSUFFICIENT_STORAGE
+    assert 'disk is full' in response.data['detail']
+    mock_remove.assert_called_once()
+
+
+@pytest.mark.django_db
+def test_file_asset_chunked_out_of_order_reassembles(
+    api_client: APIClient, cleanup_asset_dir: None
+) -> None:
+    """A resumable (Content-Range) upload must reassemble correctly
+    even when chunks arrive out of order. Append mode ignored the
+    seek() and pinned every write to EOF, corrupting the .tmp; r+b
+    honours the offset."""
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    url = reverse('api:file_asset_v1')
+    # Post the tail chunk first, then the head, to prove the offset —
+    # not arrival order — decides where bytes land.
+    tail = api_client.post(
+        url,
+        data={
+            'file_upload': SimpleUploadedFile(
+                'clip.png', b'BBBB', content_type='image/png'
+            )
+        },
+        headers={'Content-Range': 'bytes 4-7/8'},
+    )
+    head = api_client.post(
+        url,
+        data={
+            'file_upload': SimpleUploadedFile(
+                'clip.png', b'AAAA', content_type='image/png'
+            )
+        },
+        headers={'Content-Range': 'bytes 0-3/8'},
+    )
+
+    assert tail.status_code == status.HTTP_200_OK
+    assert head.status_code == status.HTTP_200_OK
+    assert head.data['uri'] == tail.data['uri']
+    with open(head.data['uri'], 'rb') as f:
+        assert f.read() == b'AAAABBBB'
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'header',
+    [
+        'garbage',
+        'bytes abc-def/8',
+        'bytes 0-3',
+        '0-3/8',
+        'bytes 0-3/*',
+        'bytes 5-3/8',
+        'bytes 0-8/8',
+    ],
+    ids=[
+        'non-range',
+        'non-numeric',
+        'no-total',
+        'no-unit',
+        'unknown-total',
+        'end-before-start',
+        'end-at-or-past-total',
+    ],
+)
+def test_file_asset_malformed_content_range_returns_400(
+    api_client: APIClient, cleanup_asset_dir: None, header: str
+) -> None:
+    """A client-controlled ``Content-Range`` header must be validated:
+    a syntactically malformed value or inconsistent numeric bounds
+    returns 400, not a 500 from a split()/int() crash."""
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    response = api_client.post(
+        reverse('api:file_asset_v1'),
+        data={
+            'file_upload': SimpleUploadedFile(
+                'clip.png', b'AAAA', content_type='image/png'
+            )
+        },
+        headers={'Content-Range': header},
+    )
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+
+@pytest.mark.django_db
+def test_file_asset_content_range_chunk_length_mismatch_returns_400(
+    api_client: APIClient, cleanup_asset_dir: None
+) -> None:
+    """The chunk body length must match the declared range; a mismatch
+    (here 4 bytes for a claimed 10-byte range) is a 400, not a silently
+    misaligned write."""
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    response = api_client.post(
+        reverse('api:file_asset_v1'),
+        data={
+            'file_upload': SimpleUploadedFile(
+                'clip.png', b'AAAA', content_type='image/png'
+            )
+        },
+        headers={'Content-Range': 'bytes 0-9/10'},
+    )
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+
+@pytest.mark.django_db
+def test_file_asset_content_range_truncates_stale_tmp(
+    api_client: APIClient, cleanup_asset_dir: None
+) -> None:
+    """The .tmp path is deterministic per filename, so a shorter new
+    upload must not inherit trailing bytes from a longer previous
+    attempt. Writing the final chunk truncates to the declared total."""
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    url = reverse('api:file_asset_v1')
+    # First upload: a 10-byte file in one chunk.
+    first = api_client.post(
+        url,
+        data={
+            'file_upload': SimpleUploadedFile(
+                'clip.png', b'XXXXXXXXXX', content_type='image/png'
+            )
+        },
+        headers={'Content-Range': 'bytes 0-9/10'},
+    )
+    # Second upload, same filename (=> same .tmp path): shorter content.
+    second = api_client.post(
+        url,
+        data={
+            'file_upload': SimpleUploadedFile(
+                'clip.png', b'AAAA', content_type='image/png'
+            )
+        },
+        headers={'Content-Range': 'bytes 0-3/4'},
+    )
+    assert first.status_code == status.HTTP_200_OK
+    assert second.status_code == status.HTTP_200_OK
+    assert second.data['uri'] == first.data['uri']
+    with open(second.data['uri'], 'rb') as f:
+        assert f.read() == b'AAAA'
+
+
+@pytest.mark.django_db
 def test_playlist_order(
     api_client: APIClient, cleanup_asset_dir: None
 ) -> None:
