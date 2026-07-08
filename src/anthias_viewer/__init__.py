@@ -4,9 +4,11 @@ import logging
 import os
 import subprocess
 import sys
+from collections import deque
 from collections.abc import Callable
 from os import getenv, path
 from signal import SIGALRM, signal
+from threading import Lock
 from time import monotonic, sleep, time
 from typing import Any
 from urllib.parse import urlparse, urlunparse
@@ -75,6 +77,11 @@ current_browser_url: str | None = None
 # viewer anyway; that resets the cache.
 _webview_supports_set_reload_interval: bool = True
 browser: Any = None
+# Bounded sink for the current AnthiasViewer's merged stdout+stderr. See
+# _BoundedWebviewOutput / _spawn_webview_once (issue #3138). Mirrors
+# ``browser``: replaced on every (re)spawn, so it always refers to the
+# live process's output.
+_webview_output: Any = None
 loop_is_stopped: bool = False
 # Set by the ``blank`` command: pauses the asset loop (via
 # loop_is_stopped) and signals the main thread to paint a black screen.
@@ -654,6 +661,83 @@ def _wait_for_wayland_socket(deadline: float) -> None:
     )
 
 
+# Upper bound on the AnthiasViewer output we retain in memory. sh
+# otherwise keeps the whole stdout+stderr stream for the life of the
+# background process (issue #3138); we keep only the most recent slice —
+# large enough that the startup handshake and any crash tail fall inside
+# the window, small enough to never pressure a 1-2 GB board.
+WEBVIEW_OUTPUT_BUFFER_CHARS = 64 * 1024
+
+
+class _BoundedWebviewOutput:
+    """``_out`` sink that retains only the tail of AnthiasViewer's output.
+
+    Passed as ``_out`` to the background ``sh`` command so sh streams each
+    chunk here instead of aggregating the entire merged stdout+stderr in
+    the viewer process's RAM for the whole session. Without it, a chatty
+    decoder — e.g. ffmpeg's AAC path spamming ``channel element 0.0
+    duplicate`` on every audio frame for certain files — grows the
+    viewer's RSS without bound until a low-memory board (the 2 GB Pi4 in
+    issue #3138) swaps itself to a standstill and the screen sits blank
+    for minutes between assets.
+
+    We keep the last ``maxlen`` characters: the handshake line is emitted
+    early (well inside the window) and a crash tail is the most recent
+    output, so both survive while everything older is dropped.
+
+    Retention is a deque of raw chunks, not a growing-then-sliced string:
+    a chatty decoder can call ``__call__`` per audio frame for the life of
+    the process, and ``buf += chunk`` + slice would re-copy ~``maxlen``
+    characters on *every* such call once the window is full — steady CPU
+    burn on a weak Pi, against the spirit of this fix. Appending a chunk
+    and dropping whole oldest chunks is amortized O(1); the join to a
+    single string happens only in ``text()``, which is read rarely (the
+    startup handshake poll, where the buffer is still small, and
+    ``WEBVIEW_DEBUG``). sh invokes ``__call__`` from its stdout reader
+    thread, so access is lock-guarded.
+    """
+
+    def __init__(self, maxlen: int = WEBVIEW_OUTPUT_BUFFER_CHARS) -> None:
+        self._maxlen = maxlen
+        self._chunks: deque[str] = deque()
+        self._size = 0
+        self._lock = Lock()
+
+    def __call__(self, chunk: str | bytes) -> None:
+        # sh decodes to ``str`` for an ``_out`` callback under the default
+        # encoding (verified with the shipped sh 2.3.0 on a Pi4), but
+        # coerce defensively so an ``_encoding=None`` / raw-bytes
+        # configuration can never turn ``str + bytes`` into a TypeError
+        # that would silently break the handshake scan.
+        if isinstance(chunk, bytes):
+            chunk = chunk.decode('utf-8', errors='replace')
+        # A single chunk larger than the window (a big unbuffered write
+        # from the child) can't add more than the tail we'd keep anyway,
+        # so slice it up front — bounds both the stored chunk and the
+        # transient at ``maxlen``.
+        if len(chunk) > self._maxlen:
+            chunk = chunk[-self._maxlen :]
+        with self._lock:
+            self._chunks.append(chunk)
+            self._size += len(chunk)
+            # Drop whole oldest chunks while the remainder still covers
+            # the window, so retained size stays within [maxlen,
+            # maxlen + newest-dropped-chunk) < 2x maxlen — without ever
+            # re-copying the kept data.
+            while (
+                self._chunks
+                and self._size - len(self._chunks[0]) >= self._maxlen
+            ):
+                self._size -= len(self._chunks.popleft())
+
+    def text(self) -> str:
+        with self._lock:
+            joined = ''.join(self._chunks)
+        # Trim to the exact tail: the front chunk may push the join a
+        # little over ``maxlen`` (see the drop condition above).
+        return joined[-self._maxlen :]
+
+
 def _spawn_webview_once(startup_timeout: float) -> Any:
     """Spawn AnthiasViewer once and block until it registers on D-Bus.
 
@@ -669,12 +753,25 @@ def _spawn_webview_once(startup_timeout: float) -> Any:
     socket and the handshake, so the socket wait can't pile on top of
     ``startup_timeout``.
     """
+    global _webview_output
     deadline = monotonic() + startup_timeout
     # On cage boards, don't race the Wayland socket — a spawn before
     # it exists dies instantly with "Failed to create wl_display" and
     # wastes a retry attempt (Sentry ANTHIAS-19). No-op elsewhere and
     # when the socket is already up (the common case).
     _wait_for_wayland_socket(deadline)
+    # Bounded ``_out`` sink instead of sh's default: sh would otherwise
+    # retain the process's entire stdout+stderr in RAM forever, and a
+    # chatty decoder then leaks the viewer to death on a low-memory board
+    # (issue #3138). With an ``_out`` handler sh stops aggregating
+    # ``.process.stdout`` (it stays empty), so the handshake scan and the
+    # failure message below read the sink instead.
+    #
+    # Publish the sink now, before the spawn: ``_webview_output`` then
+    # mirrors ``browser`` for the live attempt, so a WEBVIEW_DEBUG read
+    # during launch/retry can't surface a previous process's stale tail.
+    output = _BoundedWebviewOutput()
+    _webview_output = output
     try:
         # _bg_exc=False: with the default (True), sh re-raises the exit
         # error (e.g. SignalException_SIGABRT on a Qt init crash, or
@@ -687,6 +784,7 @@ def _spawn_webview_once(startup_timeout: float) -> Any:
             _bg=True,
             _bg_exc=False,
             _err_to_out=True,
+            _out=output,
             _env=_build_webview_env(),
         )
     except sh.CommandNotFound as exc:
@@ -698,15 +796,12 @@ def _spawn_webview_once(startup_timeout: float) -> Any:
     # so the whole attempt — socket wait plus handshake — is bounded by
     # ``startup_timeout`` rather than the two stacking.
     while monotonic() < deadline:
-        if BROWSER_HANDSHAKE_LINE in candidate.process.stdout.decode(
-            'utf-8', errors='replace'
-        ):
+        if BROWSER_HANDSHAKE_LINE in output.text():
             return candidate
         if not candidate.is_alive():
             raise WebviewLaunchError(
                 'AnthiasViewer exited before emitting D-Bus handshake; '
-                'stdout: '
-                + candidate.process.stdout.decode('utf-8', errors='replace')
+                'stdout: ' + output.text()
             )
         sleep(BROWSER_POLL_INTERVAL_SECONDS)
 
@@ -1058,8 +1153,8 @@ def view_image(uri: str) -> None:
         current_browser_url = uri
     logging.info('Current url is {0}'.format(current_browser_url))
 
-    if string_to_bool(getenv('WEBVIEW_DEBUG', '0')):
-        logging.info(browser.process.stdout)
+    if string_to_bool(getenv('WEBVIEW_DEBUG', '0')) and _webview_output:
+        logging.info(_webview_output.text())
 
 
 def view_video(uri: str, duration: int | str) -> None:
