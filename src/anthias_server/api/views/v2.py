@@ -75,6 +75,7 @@ from anthias_common import device_helper
 from anthias_server.lib import diagnostics
 from anthias_server.lib.auth import authorized
 from anthias_server.lib.github import is_up_to_date
+from anthias_server.lib.timezone import format_utc_offset
 from anthias_common.utils import (
     clamp_screen_rotation,
     connect_to_redis,
@@ -573,6 +574,7 @@ class DeviceSettingsViewV2(APIView):
                     settings['default_streaming_duration']
                 ),
                 'date_format': settings['date_format'],
+                'timezone': settings['timezone'],
                 'auth_backend': settings['auth_backend'],
                 'show_splash': settings['show_splash'],
                 'default_assets': settings['default_assets'],
@@ -649,6 +651,8 @@ class DeviceSettingsViewV2(APIView):
                 settings['audio_output'] = data['audio_output']
             if 'date_format' in data:
                 settings['date_format'] = data['date_format']
+            if 'timezone' in data:
+                settings['timezone'] = data['timezone']
             if 'show_splash' in data:
                 settings['show_splash'] = data['show_splash']
             if 'default_assets' in data:
@@ -898,6 +902,21 @@ class InfoViewV2(InfoViewMixin):
             'low_ram': virtual_memory.total < LOW_RAM_THRESHOLD_KB * 1024,
         }
 
+    def get_time(self) -> dict[str, str]:
+        # The device's active timezone + wall clock. The activation
+        # middleware has already set the request's timezone from the
+        # operator's setting, so localtime()/get_current_timezone_name()
+        # reflect it. Lets an external client detect a wrong device
+        # clock or an unexpected zone (issue #1755).
+        now_local = timezone.localtime(timezone.now())
+        return {
+            # Seconds precision (drop microseconds) to match the System
+            # Info clock seed and stay parseable by any JS Date.parse().
+            'iso': now_local.isoformat(timespec='seconds'),
+            'timezone': timezone.get_current_timezone_name(),
+            'offset': format_utc_offset(now_local),
+        }
+
     def get_ip_addresses(self) -> list[str]:
         # /api/v2/info is auth'd and not polled, so blocking on
         # get_node_ip()'s host-readiness loop is acceptable here —
@@ -945,6 +964,14 @@ class InfoViewV2(InfoViewMixin):
                     },
                     'mac_address': {'type': 'string'},
                     'host_user': {'type': 'string'},
+                    'time': {
+                        'type': 'object',
+                        'properties': {
+                            'iso': {'type': 'string'},
+                            'timezone': {'type': 'string'},
+                            'offset': {'type': 'string'},
+                        },
+                    },
                 },
             }
         },
@@ -972,6 +999,7 @@ class InfoViewV2(InfoViewMixin):
                 'ip_addresses': self.get_ip_addresses(),
                 'mac_address': get_node_mac_address(),
                 'host_user': getenv('HOST_USER'),
+                'time': self.get_time(),
             }
         )
 

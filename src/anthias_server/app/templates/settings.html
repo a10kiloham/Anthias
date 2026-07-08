@@ -41,7 +41,7 @@
       <header>
         <div>
           <h2>Display & playback</h2>
-          <p class="settings-section__lede">Default durations, audio, and date format.</p>
+          <p class="settings-section__lede">Defaults, audio, timezone, and display.</p>
         </div>
       </header>
 
@@ -74,6 +74,15 @@
             {% endfor %}
           </select>
           <label for="date_format">Date format</label>
+        </div>
+
+        <div class="app-floating">
+          <select class="app-select" id="timezone" name="timezone">
+            {% for value, label in timezone_options %}
+            <option value="{{ value }}" {% if timezone == value %}selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+          </select>
+          <label for="timezone">Timezone</label>
         </div>
 
         <div class="app-floating">
