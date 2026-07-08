@@ -1,4 +1,4 @@
-"""piSignage import provider — REST.
+"""piSignage import provider (REST).
 
 piSignage is hosted per-account on a subdomain (``<account>.pisignage.com``)
 and authenticates by exchanging credentials for a JWT at ``POST /session``,
@@ -126,7 +126,7 @@ class PiSignageProvider(ImportProvider):
         'Copy images and videos from a piSignage account into this player.'
     )
     token_help = (
-        'Enter your piSignage account as "subdomain:email:password" — the '
+        'Enter your piSignage account as "subdomain:email:password". The '
         'subdomain is the "<name>" in <name>.pisignage.com, followed by your '
         'login email (or username) and password. It is used only for this '
         'import and is never stored.'
