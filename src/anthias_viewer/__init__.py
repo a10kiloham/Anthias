@@ -259,6 +259,31 @@ def _build_webview_env() -> dict[str, str]:
     else:
         env.pop('ANTHIAS_PREFER_DARK_MODE', None)
 
+    # pi3-64 (Raspberry Pi 3, VideoCore IV / vc4, GLES2-only) can't
+    # present the QML VideoOutput RHI video path: the scene renders but
+    # the QQuickWidget FBO never reaches the eglfs scanout, so every
+    # video black-screens (issue #3084) while images and webpages —
+    # which composite through the widget backing store — render fine.
+    # Route ONLY this board to the C++ non-VideoOutput presenter: the
+    # GStreamer vc4 overlay-plane path (preferred, ANTHIAS_VIDEO_OVERLAY),
+    # falling back to the CPU-raster blit (QVideoFrame::toImage() →
+    # paintEvent, the same backing-store path images use). Pi 4 (V3D 4.2)
+    # and Pi 5 (V3D 7.x) keep the fast on-GPU VideoOutput path. Gated on the authoritative baked
+    # DEVICE_TYPE (get_device_type() returns 'pi3' on both Pi 3 streams,
+    # so the model string alone can't tell 64-bit from armhf — same
+    # reason media_player.force_mpv keys off DEVICE_TYPE). Pop a stale
+    # value so a re-imaged/re-typed device drops the flag on respawn.
+    if os.environ.get('DEVICE_TYPE') == 'pi3-64':
+        env['ANTHIAS_VIDEO_RASTER'] = '1'
+        # Prefer the hardware overlay-plane path (v4l2h264dec → ISP →
+        # kmssink on a vc4 overlay plane, HW-composited with the eglfs UI
+        # plane) for full-rate video; VideoView falls back to the
+        # CPU-raster blit if the DRM overlay resources can't be resolved.
+        env['ANTHIAS_VIDEO_OVERLAY'] = '1'
+    else:
+        env.pop('ANTHIAS_VIDEO_RASTER', None)
+        env.pop('ANTHIAS_VIDEO_OVERLAY', None)
+
     rotation = _rotation_value()
     if _is_wayland_board():
         return env
