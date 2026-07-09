@@ -2,6 +2,7 @@ import logging
 import os
 from collections.abc import Iterator
 from datetime import datetime, time, timedelta
+from datetime import timezone as dt_timezone
 from typing import Any
 
 import pytest
@@ -34,6 +35,7 @@ ASSET_X = {
     'is_processing': 0,
     'play_order': 1,
     'skip_asset_check': 0,
+    'skip_ssl_verify': 0,
     'play_days': _DEFAULT_PLAY_DAYS,
     'play_time_from': None,
     'play_time_to': None,
@@ -57,6 +59,7 @@ ASSET_Y = {
     'is_processing': 0,
     'play_order': 0,
     'skip_asset_check': 0,
+    'skip_ssl_verify': 0,
     'play_days': _DEFAULT_PLAY_DAYS,
     'play_time_from': None,
     'play_time_to': None,
@@ -78,6 +81,7 @@ ASSET_Z = {
     'is_processing': 0,
     'play_order': 2,
     'skip_asset_check': 0,
+    'skip_ssl_verify': 0,
     'play_days': _DEFAULT_PLAY_DAYS,
     'play_time_from': None,
     'play_time_to': None,
@@ -99,6 +103,7 @@ ASSET_TOMORROW = {
     'is_processing': 0,
     'play_order': 2,
     'skip_asset_check': 0,
+    'skip_ssl_verify': 0,
     'play_days': _DEFAULT_PLAY_DAYS,
     'play_time_from': None,
     'play_time_to': None,
@@ -165,6 +170,31 @@ def test_get_next_asset_should_be_y_and_x(
     expected_x = scheduler.get_next_asset()
 
     assert [expected_y, expected_x] == [ASSET_Y, ASSET_X]
+
+
+@pytest.mark.django_db
+def test_get_next_asset_missing_extra_asset_warns_and_falls_back(
+    restore_shuffle_setting: None,
+) -> None:
+    """An operator jump to a since-deleted / still-processing asset is
+    a benign race, not a bug — it must log at warning (not error, which
+    pages Sentry) and fall back to the playlist (Sentry ANTHIAS-3V)."""
+    from unittest import mock
+
+    _create_assets([ASSET_X, ASSET_Y])
+    scheduler = Scheduler()
+    scheduler.extra_asset = 'nonexistent-asset-id'
+
+    with (
+        mock.patch('anthias_viewer.scheduling.logging.warning') as m_warn,
+        mock.patch('anthias_viewer.scheduling.logging.error') as m_error,
+    ):
+        result = scheduler.get_next_asset()
+
+    m_warn.assert_called_once()
+    m_error.assert_not_called()
+    assert scheduler.extra_asset is None
+    assert result in (ASSET_X, ASSET_Y)
 
 
 @pytest.mark.django_db
@@ -331,6 +361,38 @@ def test_overnight_window_active_before_and_after_midnight() -> None:
     # Wed 02:30 — post-midnight, "yesterday" was Tue (not in days).
     with time_machine.travel(_aware(2026, 1, 7, 2, 30)):
         assert not _first_asset().is_active()
+
+
+@pytest.mark.django_db
+def test_play_time_window_follows_active_timezone() -> None:
+    """The core of the timezone feature end-to-end: the play-time window
+    is matched in the *active* timezone, so one fixed UTC instant is
+    inside or outside the window purely as a function of the
+    operator-selected zone. This is what makes an in-UI timezone
+    correct scheduling on balena, where the host is always UTC.
+    """
+    Asset.objects.create(
+        **_scheduled_asset(
+            play_time_from=time(9, 0),
+            play_time_to=time(17, 0),
+        ),
+    )
+    # 08:00 UTC on a Monday. Europe/Berlin (UTC+1) sees 09:00 — inside
+    # the 09:00-17:00 window; America/Chicago (UTC-6) sees 02:00 —
+    # outside it.
+    instant = datetime(2026, 1, 5, 8, 0, tzinfo=dt_timezone.utc)
+    with time_machine.travel(instant):
+        timezone.activate('Europe/Berlin')
+        try:
+            assert _first_asset().is_active()
+        finally:
+            timezone.deactivate()
+
+        timezone.activate('America/Chicago')
+        try:
+            assert not _first_asset().is_active()
+        finally:
+            timezone.deactivate()
 
 
 @pytest.mark.django_db

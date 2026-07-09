@@ -1,14 +1,19 @@
 # -*- coding: utf-8 -*-
 
+import json
 import logging
 import os
 import subprocess
 import sys
+from collections import deque
 from collections.abc import Callable
+from glob import glob
 from os import getenv, path
 from signal import SIGALRM, signal
-from time import monotonic, sleep
+from threading import Lock
+from time import monotonic, sleep, time
 from typing import Any
+from urllib.parse import urlparse, urlunparse
 
 import django
 import pydbus
@@ -44,7 +49,12 @@ django.setup()
 
 # Place imports that uses Django in this block.
 
+from django.utils import timezone  # noqa: E402
+
 from anthias_common.internal_auth import INTERNAL_AUTH_HEADER  # noqa: E402
+from anthias_server.django_project.settings import (  # noqa: E402
+    resolve_time_zone,
+)
 from anthias_common.internal_auth import internal_auth_token  # noqa: E402
 from anthias_common.utils import (  # noqa: E402
     clamp_screen_rotation,
@@ -53,7 +63,9 @@ from anthias_common.utils import (  # noqa: E402
     string_to_bool,
 )
 from anthias_server.app.models import Asset  # noqa: E402
+from anthias_server.app.models import clamp_duration  # noqa: E402
 from anthias_server.app.models import clamp_refresh_interval  # noqa: E402
+from anthias_server.app.models import normalize_asset_headers  # noqa: E402
 from anthias_viewer.messaging import ViewerSubscriber  # noqa: E402
 from anthias_viewer.scheduling import Scheduler  # noqa: E402
 
@@ -64,6 +76,11 @@ __license__ = 'Dual License: GPLv2 and Commercial License'
 
 
 current_browser_url: str | None = None
+# The per-asset "skip SSL verification" flag last sent to the webview,
+# tracked alongside ``current_browser_url`` so toggling the flag on the
+# currently-displayed asset (URI unchanged) still re-issues the load
+# with the new policy instead of being swallowed by the URI dedup.
+current_browser_skip_ssl: bool = False
 # Latched True->False on the first failure of ``setReloadInterval`` —
 # version skew between the running viewer and the AnthiasViewer
 # binary persists for the lifetime of the viewer process, so once we
@@ -72,7 +89,29 @@ current_browser_url: str | None = None
 # An operator who upgrades the webview package should restart the
 # viewer anyway; that resets the cache.
 _webview_supports_set_reload_interval: bool = True
+# Custom request headers currently applied to the webview (#2215). Held
+# so view_webpage can force a fresh load when only the headers change on
+# an asset whose URL is unchanged. Reset to {} on every (re)spawn along
+# with ``current_browser_url``.
+current_browser_headers: dict[str, str] = {}
+# Same version-skew latch as ``_webview_supports_set_reload_interval`` but
+# for the ``setRequestHeaders`` slot: an AnthiasViewer binary that
+# predates it raises UnknownMethod once, after which we stop paying the
+# D-Bus round-trip until the viewer restarts.
+_webview_supports_set_request_headers: bool = True
+# Version-skew latch for the ``skipSslVerify`` argument added to the
+# ``loadPage`` / ``loadImage`` slots in this release. An AnthiasViewer
+# binary that predates it exposes only the 1-arg slots, so the 2-arg
+# call fails; once that's confirmed we fall back to the legacy 1-arg
+# call and skip the doomed 2-arg attempt. Reset on every (re)spawn (a
+# respawn may pick up a newer binary that supports it).
+_webview_supports_ssl_arg: bool = True
 browser: Any = None
+# Bounded sink for the current AnthiasViewer's merged stdout+stderr. See
+# _BoundedWebviewOutput / _spawn_webview_once (issue #3138). Mirrors
+# ``browser``: replaced on every (re)spawn, so it always refers to the
+# live process's output.
+_webview_output: Any = None
 loop_is_stopped: bool = False
 # Set by the ``blank`` command: pauses the asset loop (via
 # loop_is_stopped) and signals the main thread to paint a black screen.
@@ -111,6 +150,22 @@ _last_applied_dark_mode: bool = False
 # sets this flag and the main thread consumes it at the top of
 # asset_loop via _consume_pending_rotation_bounce().
 _rotation_bounce_pending: bool = False
+
+# Monotonic timestamp of when the Wayland output watchdog first observed
+# the "wedge" state — cage running with zero wl_outputs while the kernel
+# reports a connector *connected*. None whenever the display is healthy
+# (cage owns an output) or genuinely headless (nothing connected). Once
+# the wedge persists past WAYLAND_OUTPUT_GRACE_S the watchdog exits
+# non-zero so Docker recreates the container and cage re-enumerates DRM.
+# See _wayland_output_watchdog().
+_headless_wedge_since: float | None = None
+
+# Grace window for the Wayland output self-heal watchdog. Cage binds a
+# connected display within ~1-2s of process start, so 60s is comfortably
+# long enough to never fire on a display that's merely slow to sync (HDMI
+# handshake / AVR passthrough) while still recovering a headless-boot
+# wedge within a single restart.
+WAYLAND_OUTPUT_GRACE_S = 60
 
 
 def _rotation_value() -> int:
@@ -215,6 +270,31 @@ def _build_webview_env() -> dict[str, str]:
         env['ANTHIAS_PREFER_DARK_MODE'] = '1'
     else:
         env.pop('ANTHIAS_PREFER_DARK_MODE', None)
+
+    # pi3-64 (Raspberry Pi 3, VideoCore IV / vc4, GLES2-only) can't
+    # present the QML VideoOutput RHI video path: the scene renders but
+    # the QQuickWidget FBO never reaches the eglfs scanout, so every
+    # video black-screens (issue #3084) while images and webpages —
+    # which composite through the widget backing store — render fine.
+    # Route ONLY this board to the C++ non-VideoOutput presenter: the
+    # GStreamer vc4 overlay-plane path (preferred, ANTHIAS_VIDEO_OVERLAY),
+    # falling back to the CPU-raster blit (QVideoFrame::toImage() →
+    # paintEvent, the same backing-store path images use). Pi 4 (V3D 4.2)
+    # and Pi 5 (V3D 7.x) keep the fast on-GPU VideoOutput path. Gated on the authoritative baked
+    # DEVICE_TYPE (get_device_type() returns 'pi3' on both Pi 3 streams,
+    # so the model string alone can't tell 64-bit from armhf — same
+    # reason media_player.force_mpv keys off DEVICE_TYPE). Pop a stale
+    # value so a re-imaged/re-typed device drops the flag on respawn.
+    if os.environ.get('DEVICE_TYPE') == 'pi3-64':
+        env['ANTHIAS_VIDEO_RASTER'] = '1'
+        # Prefer the hardware overlay-plane path (v4l2h264dec → ISP →
+        # kmssink on a vc4 overlay plane, HW-composited with the eglfs UI
+        # plane) for full-rate video; VideoView falls back to the
+        # CPU-raster blit if the DRM overlay resources can't be resolved.
+        env['ANTHIAS_VIDEO_OVERLAY'] = '1'
+    else:
+        env.pop('ANTHIAS_VIDEO_RASTER', None)
+        env.pop('ANTHIAS_VIDEO_OVERLAY', None)
 
     rotation = _rotation_value()
     if _is_wayland_board():
@@ -652,6 +732,83 @@ def _wait_for_wayland_socket(deadline: float) -> None:
     )
 
 
+# Upper bound on the AnthiasViewer output we retain in memory. sh
+# otherwise keeps the whole stdout+stderr stream for the life of the
+# background process (issue #3138); we keep only the most recent slice —
+# large enough that the startup handshake and any crash tail fall inside
+# the window, small enough to never pressure a 1-2 GB board.
+WEBVIEW_OUTPUT_BUFFER_CHARS = 64 * 1024
+
+
+class _BoundedWebviewOutput:
+    """``_out`` sink that retains only the tail of AnthiasViewer's output.
+
+    Passed as ``_out`` to the background ``sh`` command so sh streams each
+    chunk here instead of aggregating the entire merged stdout+stderr in
+    the viewer process's RAM for the whole session. Without it, a chatty
+    decoder — e.g. ffmpeg's AAC path spamming ``channel element 0.0
+    duplicate`` on every audio frame for certain files — grows the
+    viewer's RSS without bound until a low-memory board (the 2 GB Pi4 in
+    issue #3138) swaps itself to a standstill and the screen sits blank
+    for minutes between assets.
+
+    We keep the last ``maxlen`` characters: the handshake line is emitted
+    early (well inside the window) and a crash tail is the most recent
+    output, so both survive while everything older is dropped.
+
+    Retention is a deque of raw chunks, not a growing-then-sliced string:
+    a chatty decoder can call ``__call__`` per audio frame for the life of
+    the process, and ``buf += chunk`` + slice would re-copy ~``maxlen``
+    characters on *every* such call once the window is full — steady CPU
+    burn on a weak Pi, against the spirit of this fix. Appending a chunk
+    and dropping whole oldest chunks is amortized O(1); the join to a
+    single string happens only in ``text()``, which is read rarely (the
+    startup handshake poll, where the buffer is still small, and
+    ``WEBVIEW_DEBUG``). sh invokes ``__call__`` from its stdout reader
+    thread, so access is lock-guarded.
+    """
+
+    def __init__(self, maxlen: int = WEBVIEW_OUTPUT_BUFFER_CHARS) -> None:
+        self._maxlen = maxlen
+        self._chunks: deque[str] = deque()
+        self._size = 0
+        self._lock = Lock()
+
+    def __call__(self, chunk: str | bytes) -> None:
+        # sh decodes to ``str`` for an ``_out`` callback under the default
+        # encoding (verified with the shipped sh 2.3.0 on a Pi4), but
+        # coerce defensively so an ``_encoding=None`` / raw-bytes
+        # configuration can never turn ``str + bytes`` into a TypeError
+        # that would silently break the handshake scan.
+        if isinstance(chunk, bytes):
+            chunk = chunk.decode('utf-8', errors='replace')
+        # A single chunk larger than the window (a big unbuffered write
+        # from the child) can't add more than the tail we'd keep anyway,
+        # so slice it up front — bounds both the stored chunk and the
+        # transient at ``maxlen``.
+        if len(chunk) > self._maxlen:
+            chunk = chunk[-self._maxlen :]
+        with self._lock:
+            self._chunks.append(chunk)
+            self._size += len(chunk)
+            # Drop whole oldest chunks while the remainder still covers
+            # the window, so retained size stays within [maxlen,
+            # maxlen + newest-dropped-chunk) < 2x maxlen — without ever
+            # re-copying the kept data.
+            while (
+                self._chunks
+                and self._size - len(self._chunks[0]) >= self._maxlen
+            ):
+                self._size -= len(self._chunks.popleft())
+
+    def text(self) -> str:
+        with self._lock:
+            joined = ''.join(self._chunks)
+        # Trim to the exact tail: the front chunk may push the join a
+        # little over ``maxlen`` (see the drop condition above).
+        return joined[-self._maxlen :]
+
+
 def _spawn_webview_once(startup_timeout: float) -> Any:
     """Spawn AnthiasViewer once and block until it registers on D-Bus.
 
@@ -667,12 +824,25 @@ def _spawn_webview_once(startup_timeout: float) -> Any:
     socket and the handshake, so the socket wait can't pile on top of
     ``startup_timeout``.
     """
+    global _webview_output
     deadline = monotonic() + startup_timeout
     # On cage boards, don't race the Wayland socket — a spawn before
     # it exists dies instantly with "Failed to create wl_display" and
     # wastes a retry attempt (Sentry ANTHIAS-19). No-op elsewhere and
     # when the socket is already up (the common case).
     _wait_for_wayland_socket(deadline)
+    # Bounded ``_out`` sink instead of sh's default: sh would otherwise
+    # retain the process's entire stdout+stderr in RAM forever, and a
+    # chatty decoder then leaks the viewer to death on a low-memory board
+    # (issue #3138). With an ``_out`` handler sh stops aggregating
+    # ``.process.stdout`` (it stays empty), so the handshake scan and the
+    # failure message below read the sink instead.
+    #
+    # Publish the sink now, before the spawn: ``_webview_output`` then
+    # mirrors ``browser`` for the live attempt, so a WEBVIEW_DEBUG read
+    # during launch/retry can't surface a previous process's stale tail.
+    output = _BoundedWebviewOutput()
+    _webview_output = output
     try:
         # _bg_exc=False: with the default (True), sh re-raises the exit
         # error (e.g. SignalException_SIGABRT on a Qt init crash, or
@@ -685,6 +855,7 @@ def _spawn_webview_once(startup_timeout: float) -> Any:
             _bg=True,
             _bg_exc=False,
             _err_to_out=True,
+            _out=output,
             _env=_build_webview_env(),
         )
     except sh.CommandNotFound as exc:
@@ -696,15 +867,12 @@ def _spawn_webview_once(startup_timeout: float) -> Any:
     # so the whole attempt — socket wait plus handshake — is bounded by
     # ``startup_timeout`` rather than the two stacking.
     while monotonic() < deadline:
-        if BROWSER_HANDSHAKE_LINE in candidate.process.stdout.decode(
-            'utf-8', errors='replace'
-        ):
+        if BROWSER_HANDSHAKE_LINE in output.text():
             return candidate
         if not candidate.is_alive():
             raise WebviewLaunchError(
                 'AnthiasViewer exited before emitting D-Bus handshake; '
-                'stdout: '
-                + candidate.process.stdout.decode('utf-8', errors='replace')
+                'stdout: ' + output.text()
             )
         sleep(BROWSER_POLL_INTERVAL_SECONDS)
 
@@ -730,8 +898,9 @@ def load_browser(
     persistent failure can't freeze the asset_loop thread for minutes.
     """
     global browser, _webview_supports_set_reload_interval
-    global _last_applied_rotation, current_browser_url
-    global _last_applied_dark_mode
+    global _webview_supports_set_request_headers, _webview_supports_ssl_arg
+    global _last_applied_rotation, current_browser_url, current_browser_headers
+    global _last_applied_dark_mode, current_browser_skip_ssl
     logging.info('Loading browser...')
 
     # Latch the dark-mode preference the spawned process is about to be
@@ -765,6 +934,11 @@ def load_browser(
     # case. Resetting on every launch keeps the latch tied to the
     # actual running process, not the viewer's lifetime.
     _webview_supports_set_reload_interval = True
+    # Same re-probe for the custom-headers slot (#2215): a webview
+    # restart may bring up a binary that now supports setRequestHeaders.
+    _webview_supports_set_request_headers = True
+    # And the same re-probe for the loadPage/loadImage skipSslVerify arg.
+    _webview_supports_ssl_arg = True
 
     # Apply screen rotation *before* the webview starts so it picks up
     # the rotated geometry on first frame: the wlroots compositor
@@ -800,6 +974,14 @@ def load_browser(
     # unchanged URL, e.g. a single-asset playlist) never gets the
     # loadImage/loadPage re-sent.
     current_browser_url = None
+    # Likewise drop the applied-headers cache so the next view_webpage
+    # re-sends them to the fresh process (whose interceptor starts empty).
+    current_browser_headers = {}
+    # And drop the skip-SSL cache: a fresh webview defaults to verifying
+    # certificates, so the next view_image/view_webpage must re-assert
+    # the flag rather than assume the previous process's policy carried
+    # over.
+    current_browser_skip_ssl = False
 
     # Retry the spawn with capped exponential backoff so a board that
     # intermittently crashes during Qt/WebEngine init self-heals on a
@@ -928,7 +1110,149 @@ def _send_to_webview(send: Callable[[], Any]) -> None:
     send()
 
 
-def view_webpage(uri: str, reload_interval_s: int = 0) -> None:
+def _load_via_webview(
+    load_with_skip: Callable[[], Any],
+    load_without_skip: Callable[[], Any],
+) -> None:
+    """Issue a ``loadPage`` / ``loadImage`` that tolerates a
+    version-skewed webview.
+
+    The ``skipSslVerify`` parameter was added to the loadPage/loadImage
+    D-Bus slots in this release. A webview process still running the
+    previous binary (fleet rollout mid-flight: the viewer container has
+    rotated to a newer image but the separate webview process hasn't
+    restarted yet) exposes only the 1-arg slots, so the 2-arg call
+    fails — as ``UnknownMethod`` from QtDBus, or as a pydbus argument
+    marshalling error, depending on when the proxy was introspected.
+
+    Rather than pattern-match the exception (fragile across pydbus/Qt
+    versions), confirm the skew empirically: if the legacy 1-arg call
+    (``load_without_skip``) succeeds where the 2-arg one failed, it was
+    a skew — latch the capability off so the rest of the process skips
+    the doomed 2-arg attempt, and let the asset display (it loses only
+    the per-asset SSL-skip, which that older webview couldn't honour
+    anyway). If the fallback *also* fails, the extra argument wasn't the
+    problem, so re-raise the original error. A webview-gone error is
+    left to ``_send_to_webview``'s respawn-and-retry. The latch is reset
+    on every (re)spawn in ``load_browser``, mirroring the
+    ``setReloadInterval`` / ``setRequestHeaders`` handling.
+    """
+    global _webview_supports_ssl_arg
+    if _webview_supports_ssl_arg:
+        try:
+            _send_to_webview(load_with_skip)
+            return
+        except Exception as exc:
+            if _is_webview_gone_error(exc):
+                raise
+            try:
+                _send_to_webview(load_without_skip)
+            except Exception:
+                # The 1-arg call failed too — not a signature skew.
+                # Re-raise the original 2-arg failure. ``from None`` drops
+                # the fallback exception from the context so the traceback
+                # points at the real cause instead of a confusing "during
+                # handling of the above exception" chain, while ``exc``
+                # keeps its own original traceback.
+                raise exc from None
+            _webview_supports_ssl_arg = False
+            logging.warning(
+                'webview predates the loadPage/loadImage skipSslVerify '
+                'argument (version skew?); per-asset SSL-skip disabled '
+                'until the webview restarts: %s',
+                exc,
+            )
+            return
+    _send_to_webview(load_without_skip)
+
+
+def _cache_busted_url(uri: str) -> str:
+    """Append a unique query parameter so a ``nocache`` webpage is
+    refetched fresh on every rotation.
+
+    Two things otherwise serve stale content for a ``nocache`` asset:
+    QtWebEngine's in-memory HTTP cache (which honours the response's
+    own cache-control headers, so a page that ships a long max-age is
+    reused for the whole session), and view_webpage's unchanged-URL
+    short-circuit (which skips the loadPage D-Bus call entirely when the
+    asset comes back around in the loop). A distinct URL per display
+    defeats both. This restores the per-asset nocache behaviour (refs
+    #11) that the Uzbl→webview migration silently dropped.
+
+    The token is wall-clock milliseconds, matching the original
+    implementation; the key is namespaced so it can't clobber a query
+    parameter the page itself relies on. The existing query string is
+    appended to verbatim — NOT decoded and re-encoded — so a signed or
+    pre-encoded URL (presigned S3, dashboard auth tokens, ``%20`` vs
+    ``+`` distinctions) reaches the origin byte-for-byte as stored.
+    """
+    parts = urlparse(uri)
+    token = f'_anthias_nc={int(time() * 1000)}'
+    new_query = f'{parts.query}&{token}' if parts.query else token
+    return urlunparse(parts._replace(query=new_query))
+
+
+def _apply_request_headers(headers: dict[str, str]) -> bool:
+    """Push the current webpage asset's custom request headers to the
+    webview over D-Bus (#2215). Returns whether the headers are now in
+    effect on the webview.
+
+    The payload is a JSON object string rather than a D-Bus ``a{sv}`` map
+    — passing JSON keeps the marshaling trivial across pydbus versions
+    and matches how the C++ side (``setRequestHeaders``) parses it. Sent
+    on every webpage tick (cheap, idempotent); the C++ interceptor only
+    attaches them to same-origin requests (scheme+host+port).
+
+    Version-skew tolerant, mirroring ``setReloadInterval``: an older
+    AnthiasViewer that predates the slot raises UnknownMethod, which
+    latches the capability off for this viewer process so we don't flood
+    journald or keep paying the round-trip.
+
+    Returns ``True`` when the call succeeded *or* the slot is
+    unsupported (nothing left to retry), and ``False`` on a transient
+    failure. The caller keys navigation off this: on ``False`` it must
+    NOT issue ``loadPage``, because the C++ side still holds the previous
+    asset's staged headers and would scope them to the new asset's origin
+    (a cross-asset credential leak). It instead defers and retries next
+    tick, leaving the URL/header mismatch in place. Observed on real
+    hardware: the very first ``setRequestHeaders`` can lose the race
+    against a just-spawned webview's D-Bus registration.
+    """
+    global _webview_supports_set_request_headers
+    if not _webview_supports_set_request_headers:
+        return True
+    payload = json.dumps(headers or {})
+    try:
+        browser_bus.setRequestHeaders(payload)
+        return True
+    except Exception as exc:
+        message = str(exc)
+        method_missing = (
+            'UnknownMethod' in message or 'no such method' in message.lower()
+        )
+        if method_missing:
+            _webview_supports_set_request_headers = False
+            logging.warning(
+                'setRequestHeaders not supported by webview (version '
+                'skew?); custom headers disabled until viewer restart: %s',
+                exc,
+            )
+            return True
+        logging.debug(
+            'Transient setRequestHeaders failure (will retry next '
+            'rotation): %s',
+            exc,
+        )
+        return False
+
+
+def view_webpage(
+    uri: str,
+    reload_interval_s: int = 0,
+    nocache: bool = False,
+    headers: dict[str, str] | None = None,
+    skip_ssl_verify: bool = False,
+) -> None:
     """Display a webpage and arm its per-asset auto-refresh timer.
 
     ``reload_interval_s`` mirrors ``Asset.metadata['refresh_interval_s']``:
@@ -939,8 +1263,19 @@ def view_webpage(uri: str, reload_interval_s: int = 0) -> None:
     when the URL is unchanged from the previous tick — so an edit that
     only flips the interval (no URI change) takes effect on the next
     asset_loop iteration.
+
+    ``nocache`` mirrors ``Asset.nocache``: when set, the URL is
+    cache-busted (see _cache_busted_url) so the page is fetched fresh
+    each time the asset is shown rather than served from QtWebEngine's
+    HTTP cache or skipped by the unchanged-URL short-circuit below.
     """
-    global current_browser_url
+    global current_browser_url, current_browser_headers
+    global current_browser_skip_ssl
+
+    headers = headers or {}
+
+    if nocache:
+        uri = _cache_busted_url(uri)
 
     if browser is None or not browser.is_alive():
         # Mid-playback respawn on the asset_loop thread: small, short
@@ -951,13 +1286,51 @@ def view_webpage(uri: str, reload_interval_s: int = 0) -> None:
             backoff_cap=BROWSER_SPAWN_INLINE_BACKOFF_CAP_SECONDS,
             startup_timeout=BROWSER_SPAWN_INLINE_TIMEOUT_SECONDS,
         )
+    # Hand the per-asset headers to the webview BEFORE loadPage so the
+    # C++ interceptor has them when the navigation fires. Always sent
+    # (empty {} for header-less assets) so switching away from a
+    # header-carrying asset clears the previous asset's headers.
+    headers_applied = _apply_request_headers(headers)
     # ``!=`` (value comparison): an ``is not`` identity check would
     # only short-circuit when the asset_loop happens to pass the same
     # str object on consecutive ticks, which a JSON-reconstructed URL
-    # would defeat.
-    if current_browser_url != uri:
-        _send_to_webview(lambda: browser_bus.loadPage(uri))
-        current_browser_url = uri
+    # would defeat. Reload when the headers or the skip-SSL flag change
+    # too — a header-only edit must still refetch so the new headers
+    # reach the main document (not just later same-origin XHR), and
+    # flipping skip-SSL on the current page must re-load immediately.
+    if (
+        current_browser_url != uri
+        or current_browser_headers != headers
+        or current_browser_skip_ssl != skip_ssl_verify
+    ):
+        if headers_applied:
+            _load_via_webview(
+                lambda: browser_bus.loadPage(uri, skip_ssl_verify),
+                lambda: browser_bus.loadPage(uri),
+            )
+            current_browser_url = uri
+            # Store a copy, not the caller's dict: aliasing it would let a
+            # later in-place mutation of that dict silently change the
+            # cached value, making the next ``!=`` compare equal and skip
+            # a needed reload. The asset_loop currently hands us a fresh
+            # dict each tick, but the copy keeps that a non-assumption.
+            current_browser_headers = dict(headers)
+            current_browser_skip_ssl = skip_ssl_verify
+        else:
+            # setRequestHeaders failed transiently, so the webview still
+            # holds the PREVIOUS asset's staged headers. Issuing loadPage
+            # now would make the C++ interceptor scope those stale headers
+            # to THIS asset's origin — a cross-asset credential leak (e.g.
+            # the prior asset's Authorization reaching the next asset's
+            # host). Defer navigation and leave current_browser_url /
+            # current_browser_headers / current_browser_skip_ssl stale so
+            # the next tick retries once the D-Bus call succeeds. A
+            # single-asset playlist self-heals the same way (the mismatch
+            # persists until the send lands).
+            logging.debug(
+                'Deferring loadPage until request headers apply '
+                '(transient setRequestHeaders failure)'
+            )
     # ``setReloadInterval`` is a new D-Bus method. A viewer running
     # against an older AnthiasViewer (version skew across a fleet
     # rollout, where the viewer container has rotated to a newer image
@@ -999,8 +1372,8 @@ def view_webpage(uri: str, reload_interval_s: int = 0) -> None:
     logging.info('Current url is {0}'.format(current_browser_url))
 
 
-def view_image(uri: str) -> None:
-    global current_browser_url
+def view_image(uri: str, skip_ssl_verify: bool = False) -> None:
+    global current_browser_url, current_browser_skip_ssl
 
     if browser is None or not browser.is_alive():
         # Mid-playback respawn on the asset_loop thread: small, short
@@ -1014,14 +1387,22 @@ def view_image(uri: str) -> None:
     # Value comparison (matches view_webpage): an ``is not`` identity
     # check would only short-circuit when the asset_loop happens to
     # pass the same str object on consecutive ticks, which a JSON-
-    # reconstructed URL would defeat.
-    if current_browser_url != uri:
-        _send_to_webview(lambda: browser_bus.loadImage(uri))
+    # reconstructed URL would defeat. The skip-SSL flag is part of the
+    # key so flipping it on the current asset re-fetches immediately.
+    if (
+        current_browser_url != uri
+        or current_browser_skip_ssl != skip_ssl_verify
+    ):
+        _load_via_webview(
+            lambda: browser_bus.loadImage(uri, skip_ssl_verify),
+            lambda: browser_bus.loadImage(uri),
+        )
         current_browser_url = uri
+        current_browser_skip_ssl = skip_ssl_verify
     logging.info('Current url is {0}'.format(current_browser_url))
 
-    if string_to_bool(getenv('WEBVIEW_DEBUG', '0')):
-        logging.info(browser.process.stdout)
+    if string_to_bool(getenv('WEBVIEW_DEBUG', '0')) and _webview_output:
+        logging.info(_webview_output.text())
 
 
 def view_video(uri: str, duration: int | str) -> None:
@@ -1058,6 +1439,14 @@ def load_settings() -> None:
     logging.getLogger().setLevel(
         logging.DEBUG if settings['debug_logging'] else logging.INFO
     )
+    # Activate the operator-selected timezone so the scheduler's
+    # timezone.localtime() day-of-week / time-of-day windowing matches
+    # the server. Called at startup and on every `reload`, so a Settings
+    # change reschedules without restarting the viewer.
+    try:
+        timezone.activate(resolve_time_zone())
+    except Exception:
+        timezone.deactivate()
 
 
 def _handle_reload() -> None:
@@ -1227,6 +1616,181 @@ def _retry_wayland_rotation_if_pending() -> None:
         _last_applied_rotation = rotation
 
 
+def _kernel_has_bindable_display() -> bool:
+    """True when the kernel exposes a display the compositor could bind.
+
+    A DRM connector is *bindable* when its ``status`` is anything other
+    than ``disconnected`` (or empty/unreadable) AND it has a non-empty
+    ``modes`` list — a display is attached and EDID was read, so cage has
+    a mode to drive. Both are kernel DRM sysfs files under
+    ``/sys/class/drm/<connector>/`` (the viewer container shares the host
+    sysfs, so they're visible in-container).
+
+    Status is matched as "not disconnected" rather than "== connected"
+    on purpose: some HDMI bridges report ``unknown`` for a real display,
+    and bin/start_viewer.sh's own ``eglfs_has_display`` already treats
+    ``unknown`` as present. Keying off ``connected`` alone would miss
+    those and prevent the watchdog from ever self-healing. The mode-list
+    check is what actually gates bindability, so the looser status match
+    is safe.
+
+    The mode-list check is load-bearing, not belt-and-suspenders: a
+    connector can be present with an *empty* mode list — HPD asserted but
+    EDID unread, e.g. a marginally-seated HDMI cable. That is NOT
+    recoverable by restarting: cage can't conjure a mode the kernel never
+    read, so restarting on a bare-connected/empty-modes connector would
+    loop forever. Requiring modes means the watchdog only restarts for a
+    display cage genuinely *should* be able to bind (a properly-connected
+    monitor exposes its EDID modes), which is exactly the headless-boot
+    race the fix targets — and leaves a half-connected cable, and the
+    ``Writeback`` connector (``unknown`` status, always empty modes),
+    alone.
+    """
+    for status_path in glob('/sys/class/drm/*/status'):
+        try:
+            with open(status_path) as status_file:
+                status = status_file.read().strip()
+        except OSError:
+            continue
+        if status in ('disconnected', ''):
+            continue
+        modes_path = path.join(path.dirname(status_path), 'modes')
+        try:
+            with open(modes_path) as modes_file:
+                if modes_file.read().strip():
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def _cage_output_probe() -> str:
+    """Probe whether cage currently owns any output.
+
+    Returns one of:
+      * ``'has-output'`` — cage lists at least one connector (bound,
+        enabled or not).
+      * ``'no-output'`` — wlr-randr ran cleanly and listed nothing, i.e.
+        cage genuinely has zero outputs.
+      * ``'unknown'`` — wlr-randr itself could not be run: missing binary,
+        nonzero exit, or the 5s timeout (e.g. under sustained QtWebEngine
+        GPU load). The caller MUST treat this as "can't tell", never as
+        "no output" — escalating a tooling failure to a container restart
+        would blank a healthy, displaying board.
+
+    Deliberately separate from ``_wlr_output_names``, which collapses both
+    the ``'no-output'`` and ``'unknown'`` cases to ``[]``. That's fine for
+    the rotation/power callers (they only ever degrade to a no-op) but
+    wrong for the watchdog, which restarts the container on the
+    difference.
+    """
+    try:
+        result = subprocess.run(
+            ['wlr-randr'],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError) as exc:
+        logging.debug('wlr-randr unavailable for output probe: %s', exc)
+        return 'unknown'
+    if result.returncode != 0:
+        logging.debug(
+            'wlr-randr output probe exit %d: %s',
+            result.returncode,
+            result.stderr,
+        )
+        return 'unknown'
+    for line in result.stdout.splitlines():
+        # A connector block's first line starts at column 0; indented
+        # lines are that connector's properties (see _wlr_output_names).
+        if line and not line[0].isspace():
+            return 'has-output'
+    return 'no-output'
+
+
+def _wayland_output_watchdog() -> None:
+    """Self-heal a headless-boot display wedge on Wayland (cage) boards.
+
+    Cage enumerates DRM connectors once at startup. Boot it with no
+    connected+enabled output (display off / unplugged / slow to sync)
+    and it binds zero wl_outputs — then never recovers when the display
+    later appears, because the viewer container has no udev to deliver
+    the hotplug uevent to wlroots. Validated on the Pi 5 testbed: after
+    a headless boot the kernel reports HDMI ``connected`` (with EDID
+    modes) but cage still has no output and the screen stays black until
+    the container is restarted.
+
+    eglfs/linuxfb boards get this recovery for free — Qt exits non-zero
+    when there's no framebuffer and Docker's ``restart: always`` policy
+    recreates the process, which re-enumerates the display. Cage does
+    NOT exit on zero output; it runs headless forever. So replicate the
+    eglfs behaviour explicitly: when a Wayland board has no wl_output
+    while the kernel exposes a *bindable* display (connector connected
+    AND EDID modes present), and that state persists past
+    WAYLAND_OUTPUT_GRACE_S, exit non-zero so the container restarts and
+    cage re-enumerates the now-present display.
+
+    Gating on a *bindable* display keeps two cases from restart-looping:
+    a deliberately headless unit (nothing plugged in), and a
+    marginally-connected cable that asserts hotplug but never delivers
+    EDID (connected, no modes) — cage can't bind a mode the kernel never
+    read, so restarting is futile. A third case is handled by
+    ``_cage_output_probe``: if wlr-randr itself can't be run (missing /
+    nonzero / 5s timeout under GPU load) we get ``'unknown'`` and do
+    nothing, so a tooling failure on a healthy board can't be mistaken
+    for a wedge. The persistence window on top means a transient hiccup
+    or cage's brief socket-setup race at startup can't trigger a spurious
+    exit — any healthy (or unknown) reading in between clears the timer.
+    """
+    global _headless_wedge_since
+    if not _is_wayland_board():
+        return
+
+    # Cheap sysfs check first: unless the kernel exposes a display cage
+    # genuinely should be able to bind (connector present + EDID modes),
+    # there is nothing to recover — a headless unit or a half-connected
+    # cable (no modes) is left alone. Doing this before the wlr-randr
+    # probe means a genuinely headless board never spawns wlr-randr on
+    # the asset_loop hot path (nor risks its up-to-5s block per tick); the
+    # subprocess only runs when a display is actually attached.
+    if not _kernel_has_bindable_display():
+        _headless_wedge_since = None
+        return
+
+    # A display is present — now check whether cage actually bound it.
+    # Only a *definitive* "cage lists zero outputs" reading is a wedge.
+    # 'has-output' is healthy; 'unknown' means wlr-randr itself failed —
+    # treat that as "can't tell" and degrade to a no-op rather than
+    # restarting a display that is probably fine (the rotation/power
+    # paths degrade the same way; only this watchdog acts on the state).
+    if _cage_output_probe() != 'no-output':
+        _headless_wedge_since = None
+        return
+
+    # Wedge: a bindable display is present but cage never bound it. Start
+    # (or continue) the grace timer; exit once it's clear cage was never
+    # going to bind the output on its own.
+    now = monotonic()
+    if _headless_wedge_since is None:
+        _headless_wedge_since = now
+        logging.warning(
+            'Bindable display present but cage has no wl_output; will '
+            'restart to re-enumerate if this persists past %ss.',
+            WAYLAND_OUTPUT_GRACE_S,
+        )
+        return
+    if now - _headless_wedge_since >= WAYLAND_OUTPUT_GRACE_S:
+        logging.error(
+            'Cage has had no wl_output for %.0fs while a display is '
+            'connected (headless-boot wedge). Exiting so the container '
+            'restarts and re-enumerates the display.',
+            now - _headless_wedge_since,
+        )
+        sys.exit(1)
+
+
 def _consume_pending_rotation_bounce() -> None:
     """Main-thread half of the linuxfb rotation handoff.
 
@@ -1387,6 +1951,12 @@ def asset_loop(scheduler: Any) -> None:
     # Cheap early-return when nothing's pending.
     _retry_wayland_rotation_if_pending()
 
+    # Self-heal a headless-boot display wedge (Wayland/cage): if cage
+    # came up with no output but a display is now connected, restart so
+    # it re-enumerates the display. Cheap no-op on healthy/non-Wayland
+    # boards. See _wayland_output_watchdog().
+    _wayland_output_watchdog()
+
     asset = scheduler.get_next_asset()
 
     if asset is None:
@@ -1407,12 +1977,29 @@ def asset_loop(scheduler: Any) -> None:
 
     elif _asset_is_displayable(asset):
         name, mime, uri = asset['name'], asset['mimetype'], asset['uri']
+        # Both waits below feed this into ``threading.Event.wait``,
+        # where an out-of-range timeout raises OverflowError and
+        # crash-loops the whole viewer (Sentry ANTHIAS-3E). The API
+        # rejects such values on write, but a pre-existing row must
+        # not take the screen down.
+        duration = clamp_duration(asset['duration'])
         logging.info('Showing asset %s (%s)', name, mime)
         logging.debug('Asset URI %s', uri)
         watchdog()
 
+        # Effective SSL policy for this asset: the C++ webview should
+        # skip certificate verification when the operator disabled it
+        # device-wide (settings['verify_ssl'] off) OR opted this asset
+        # out (Asset.skip_ssl_verify). Only images and web pages route
+        # through the webview's cert-verifying stacks
+        # (QNetworkAccessManager / QWebEngine); video plays via FFmpeg,
+        # which doesn't verify self-signed certs, so it needs no flag.
+        skip_ssl = (not settings['verify_ssl']) or bool(
+            asset.get('skip_ssl_verify')
+        )
+
         if 'image' in mime:
-            view_image(uri)
+            view_image(uri, skip_ssl_verify=skip_ssl)
         elif 'web' in mime:
             # Per-asset auto-refresh — feature #2813. ``metadata`` is a
             # JSONField (defaults to {}); the column was historically
@@ -1427,18 +2014,28 @@ def asset_loop(scheduler: Any) -> None:
             interval = clamp_refresh_interval(
                 metadata.get('refresh_interval_s')
             )
-            view_webpage(uri, reload_interval_s=interval)
+            # Per-asset custom request headers (#2215). Sanitised on read
+            # for the same reason as the interval: a hand-crafted DB row
+            # could hold junk, and the C++ interceptor trusts what it's
+            # handed, so this is the last gate before the wire.
+            headers = normalize_asset_headers(metadata.get('headers'))
+            view_webpage(
+                uri,
+                reload_interval_s=interval,
+                nocache=bool(asset.get('nocache')),
+                headers=headers,
+                skip_ssl_verify=skip_ssl,
+            )
         elif 'video' in mime or 'streaming' in mime:
             # ``'video' or 'streaming' in mime`` parses as ``'video'
             # or ('streaming' in mime)`` — the truthy literal short-
             # circuits and the branch runs for every mimetype, making
             # the ``else: Unknown MimeType`` arm below unreachable.
-            view_video(uri, asset['duration'])
+            view_video(uri, duration)
         else:
             logging.error('Unknown MimeType %s', mime)
 
         if 'image' in mime or 'web' in mime:
-            duration = int(asset['duration'])
             logging.info('Sleeping for %s', duration)
             skip_event = get_skip_event()
             skip_event.clear()

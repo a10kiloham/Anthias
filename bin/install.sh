@@ -472,10 +472,20 @@ function run_ansible_playbook() {
 
     cd "${ANTHIAS_REPO_DIR}/ansible"
 
-    # If the user doesn't have NOPASSWD sudo yet (first install), Ansible
-    # needs --ask-become-pass to elevate. The blanket NOPASSWD rule is
-    # written by modify_permissions later in this script.
-    if [ ! -f "/etc/sudoers.d/010_${USER}-nopasswd" ]; then
+    # If the user can't elevate without a password, Ansible needs
+    # --ask-become-pass. Probe the actual sudo capability instead of
+    # looking for our own sudoers file (the blanket NOPASSWD rule that
+    # modify_permissions writes later): stock Raspberry Pi OS already
+    # grants the first user passwordless sudo via
+    # /etc/sudoers.d/010_pi-nopasswd — a fixed filename whatever the
+    # username — so a filename check misfires there and leaves Ansible
+    # prompting for a password that unattended runs can never type.
+    # `sudo -K` first drops any cached credential so a password typed
+    # for an earlier apt call can't masquerade as passwordless sudo;
+    # without it the playbook outlives the sudo timestamp and dies
+    # mid-run with "Missing sudo password" instead.
+    sudo -K
+    if ! sudo -n true 2>/dev/null; then
         ANSIBLE_PLAYBOOK_ARGS+=("--ask-become-pass")
         echo "Note: Ansible may prompt for your sudo password below."
         echo
@@ -499,6 +509,40 @@ function run_ansible_playbook() {
     sudo -E -u "${USER}" \
         "${INSTALLER_VENV}/bin/ansible-playbook" \
         site.yml "${ANSIBLE_PLAYBOOK_ARGS[@]}"
+}
+
+function stop_docker_stack() {
+    # Free the RAM held by the previous-version stack (server, viewer,
+    # webview, celery, redis) before the memory-intensive host work in
+    # the Ansible play: the apt dist-upgrade and, right after it,
+    # `swapoff --all`. With the stack resident, swapoff faults all swap
+    # back into RAM at once and the OOM-killer aborts the upgrade on
+    # memory-tight boards (issue #3165). Taking the stack down here also
+    # de-risks the dist-upgrade itself. upgrade_docker_containers brings
+    # everything back up (`up -d`) once the host work is done, and the
+    # install ends in a reboot regardless.
+    #
+    # No-op on a fresh install: there is no rendered compose file and
+    # nothing is running yet.
+    local compose_file="${ANTHIAS_REPO_DIR}/docker-compose.yml"
+    if [ ! -f "${compose_file}" ]; then
+        return 0
+    fi
+
+    display_section "Stop Docker Containers (free memory for the upgrade)"
+
+    local compose_files=(-f "${compose_file}")
+    local ssl_override="${ANTHIAS_REPO_DIR}/docker-compose.ssl.override.yml"
+    if [ -f "${ssl_override}" ]; then
+        compose_files+=(-f "${ssl_override}")
+    fi
+
+    # Best-effort: a leftover/mismatched compose file from an older
+    # release must not abort the upgrade, so tolerate a non-zero exit.
+    # --remove-orphans also sweeps containers from services since renamed
+    # or removed from the compose file.
+    sudo docker compose "${compose_files[@]}" down --remove-orphans \
+        || true
 }
 
 function upgrade_docker_containers() {
@@ -719,6 +763,7 @@ function main() {
     post_clone_migrate_legacy_paths
     install_ansible
     provision_host_agent_venv
+    stop_docker_stack
     run_ansible_playbook
 
     upgrade_docker_containers

@@ -17,9 +17,11 @@ from anthias_common.utils import (
     url_fails,
 )
 from anthias_common.youtube import is_youtube_url, youtube_destination_path
+from anthias_server.app.models import DURATION_S_MAX, clamp_duration
 from anthias_server.settings import settings
 
 from . import (
+    DURATION_RANGE_ERROR,
     get_unique_name,
     validate_uri,
 )
@@ -155,7 +157,15 @@ class CreateAssetSerializerV1_1(Serializer[dict[str, Any]]):
                             )
                         }
                     )
-                asset['duration'] = int(video_duration.total_seconds())
+                # Clamp (not reject): the file itself is playable,
+                # only a corrupted container header can advertise an
+                # out-of-range length — and that must not put an
+                # over-cap value in the DB (Sentry ANTHIAS-3E).
+                asset['duration'] = clamp_duration(
+                    video_duration.total_seconds()
+                )
+            elif duration_int < 0 or duration_int > DURATION_S_MAX:
+                raise ValidationError({'duration': DURATION_RANGE_ERROR})
             else:
                 asset['duration'] = duration_int
         elif not is_youtube:
@@ -172,6 +182,8 @@ class CreateAssetSerializerV1_1(Serializer[dict[str, Any]]):
                 raise ValidationError(
                     {'duration': 'A valid integer is required.'}
                 )
+            if not 0 <= asset['duration'] <= DURATION_S_MAX:
+                raise ValidationError({'duration': DURATION_RANGE_ERROR})
 
         asset['skip_asset_check'] = int(data.get('skip_asset_check', 0))
 

@@ -1,7 +1,10 @@
 import logging
+import os
+import re
 import tarfile
 import uuid
 from base64 import b64encode
+from contextlib import suppress
 from inspect import cleandoc
 from mimetypes import guess_extension, guess_type
 from os import path, remove, statvfs
@@ -31,12 +34,24 @@ from anthias_server.celery_tasks import reboot_anthias, shutdown_anthias
 from anthias_server.lib import backup_helper, diagnostics
 from anthias_server.lib.auth import authorized
 from anthias_server.lib.github import is_up_to_date
-from anthias_common.utils import connect_to_redis
+from anthias_common.utils import (
+    DISK_FULL_ERROR,
+    connect_to_redis,
+    is_disk_full,
+)
 from anthias_server.settings import ViewerPublisher, settings
 
 logger = logging.getLogger(__name__)
 
 r = connect_to_redis()
+
+# A resumable upload's temp file is named ``<upload_id>.tmp``. The id is
+# echoed back by the client on every chunk, so it lands in a filesystem
+# path — require the 32-lowercase-hex-char shape of the ids we mint
+# (``uuid4().hex``) and reject anything else. This is a path-traversal
+# guard, not a UUID-version check: 32 hex chars simply can't contain a
+# ``/`` or ``..`` to escape the asset dir.
+UPLOAD_ID_RE = re.compile(r'[0-9a-f]{32}')
 
 
 class DeleteAssetViewMixin:
@@ -117,16 +132,28 @@ class RecoverViewMixin(APIView):
         try:
             publisher.send_to_viewer('stop')
 
+            # Stream the upload to disk in chunks — ``file_upload.read()``
+            # pulls the whole archive into RAM, and a backup is every
+            # image + video asset on the device, so a multi-GB restore
+            # OOM-kills the worker on a 1 GB Pi. The HTML recover view
+            # (settings_recover) already streams; this brings the API
+            # path in line.
             with open(location, 'wb') as f:
-                f.write(file_upload.read())
+                for chunk in file_upload.chunks():
+                    f.write(chunk)
 
             try:
                 backup_helper.recover(location)
             except (
                 backup_helper.BackupRecoverError,
                 tarfile.TarError,
-            ):
-                logger.exception('Backup recovery failed')
+            ) as exc:
+                # Operator uploaded something that isn't a valid Anthias
+                # backup (wrong file, truncated, not gzip). That's input
+                # validation, not a bug — the 400 below already tells
+                # them. Log at warning so it doesn't reach the Sentry
+                # logging integration as an error (Sentry ANTHIAS-3W).
+                logger.warning('Backup recovery failed: %s', exc)
                 raise ValidationError(
                     {'backup_upload': 'Invalid backup archive.'}
                 )
@@ -221,6 +248,20 @@ class DisplayPowerViewMixin(APIView):
 class FileAssetViewMixin(APIView):
     @extend_schema(
         summary='Upload file asset',
+        parameters=[
+            OpenApiParameter(
+                name='X-Upload-Id',
+                location=OpenApiParameter.HEADER,
+                type=OpenApiTypes.STR,
+                required=False,
+                description=(
+                    'Opaque upload session id returned as ``upload_id`` on '
+                    'the first chunk of a resumable (Content-Range) upload. '
+                    'Echo it on every subsequent chunk so they reassemble '
+                    'into the same file. Omit it to start a new upload.'
+                ),
+            ),
+        ],
         request={
             'multipart/form-data': {
                 'type': 'object',
@@ -235,13 +276,25 @@ class FileAssetViewMixin(APIView):
                 'properties': {
                     'uri': {'type': 'string'},
                     'ext': {'type': 'string'},
+                    'upload_id': {'type': 'string'},
                 },
             }
         },
     )
     @authorized
     def post(self, request: Request) -> Response:
-        file_upload = request.data.get('file_upload')
+        # ``request.data`` triggers the (lazy) multipart parse, which
+        # spools the body to a temp file — on a full disk that write
+        # is where ENOSPC actually surfaces (Sentry ANTHIAS-3K).
+        try:
+            file_upload = request.data.get('file_upload')
+        except OSError as exc:
+            if not is_disk_full(exc):
+                raise
+            return Response(
+                {'detail': DISK_FULL_ERROR},
+                status=status.HTTP_507_INSUFFICIENT_STORAGE,
+            )
         if file_upload is None:
             raise ValidationError({'file_upload': 'No file uploaded.'})
         filename = file_upload.name
@@ -252,25 +305,129 @@ class FileAssetViewMixin(APIView):
                 {'file_upload': 'Invalid file type. Expected image or video.'}
             )
 
-        file_path = (
-            path.join(
-                settings['assetdir'],
-                uuid.uuid5(uuid.NAMESPACE_URL, filename).hex,
-            )
-            + '.tmp'
-        )
+        has_range = 'Content-Range' in request.headers
 
-        if 'Content-Range' in request.headers:
-            range_str = request.headers['Content-Range']
-            start_bytes = int(range_str.split(' ')[1].split('-')[0])
-            with open(file_path, 'ab') as f:
-                f.seek(start_bytes)
-                f.write(file_upload.read())
+        # Stage the upload at a per-request temp path. The id is random
+        # (uuid4) and never derived from the filename: a filename-derived
+        # path is shared by every upload of that name, so two concurrent
+        # same-name uploads would interleave into one corrupt file and a
+        # stale ``.tmp`` from an earlier interrupted attempt would bleed
+        # into a later one (issue #3135). A resumable (Content-Range)
+        # upload gets one isolated file per session: the client echoes the
+        # ``upload_id`` we return on the first chunk back via ``X-Upload-Id``
+        # so every chunk lands in the same file.
+        #
+        # ``X-Upload-Id`` is only honoured alongside ``Content-Range``: a
+        # single-shot upload takes the ``open('wb')`` path below, so an
+        # echoed id there would let one request truncate another session's
+        # in-progress ``.tmp``. Without a range we always mint a fresh id.
+        upload_id = request.headers.get('X-Upload-Id') if has_range else None
+        if upload_id is None:
+            upload_id = uuid.uuid4().hex
         else:
-            with open(file_path, 'wb') as f:
-                f.write(file_upload.read())
+            # Normalise case (the id we mint is lowercase hex) before the
+            # traversal guard so an upper-cased echo doesn't 400.
+            upload_id = upload_id.strip().lower()
+            if not UPLOAD_ID_RE.fullmatch(upload_id):
+                raise ValidationError({'X-Upload-Id': 'Malformed upload id.'})
 
-        return Response({'uri': file_path, 'ext': guess_extension(file_type)})
+        file_path = path.join(settings['assetdir'], upload_id) + '.tmp'
+
+        start_bytes = 0
+        end_bytes = 0
+        total_bytes = 0
+        data = file_upload.read()
+        if has_range:
+            # ``Content-Range`` is client-controlled; parse it strictly
+            # and 400 on anything malformed rather than letting a bad
+            # header raise ValueError/IndexError and surface as a 500.
+            # A known numeric total is required (``*`` is rejected): the
+            # end-of-upload truncation below relies on it to drop stale
+            # trailing bytes, so an unknown total would reopen the
+            # corruption window it exists to close. Our uploader always
+            # knows the file size.
+            match = re.fullmatch(
+                r'bytes (\d+)-(\d+)/(\d+)',
+                request.headers['Content-Range'].strip(),
+            )
+            if match is None:
+                raise ValidationError(
+                    {'Content-Range': 'Malformed Content-Range header.'}
+                )
+            start_bytes = int(match.group(1))
+            end_bytes = int(match.group(2))
+            total_bytes = int(match.group(3))
+            # Reject inconsistent numeric semantics: end before start, an
+            # end at/after the (0-indexed) total, or a chunk body whose
+            # length doesn't match the declared range. Any of these would
+            # otherwise silently write a misaligned/short chunk and
+            # corrupt the reassembled asset.
+            if end_bytes < start_bytes or end_bytes >= total_bytes:
+                raise ValidationError(
+                    {'Content-Range': 'Invalid Content-Range bounds.'}
+                )
+            if len(data) != end_bytes - start_bytes + 1:
+                raise ValidationError(
+                    {
+                        'Content-Range': (
+                            'Chunk length does not match the declared range.'
+                        )
+                    }
+                )
+
+        try:
+            if has_range:
+                # ``os.open`` with ``O_CREAT`` and no ``O_TRUNC``: create
+                # the file on the first chunk, otherwise open the
+                # in-progress upload for random-access writes without
+                # discarding the bytes already written. This closes the
+                # ``isfile()``-then-``open('wb')`` race where two chunks
+                # arriving together could both see "no file" and clobber
+                # each other. ``r+b`` (not append) so ``seek()`` decides
+                # the offset and an out-of-order chunk lands where the
+                # range says. ``0o666`` (masked by the process umask) and
+                # ``O_CLOEXEC`` match what the builtin ``open()`` on the
+                # non-range path below does, so permissions stay
+                # umask-controlled and the fd doesn't leak into forked
+                # subprocesses.
+                fd = os.open(
+                    file_path,
+                    os.O_RDWR | os.O_CREAT | os.O_CLOEXEC,
+                    0o666,
+                )
+                with os.fdopen(fd, 'r+b') as f:
+                    f.seek(start_bytes)
+                    f.write(data)
+                    # On the final chunk, truncate to the declared total
+                    # so a resumed session that shrank can't keep trailing
+                    # bytes from a longer earlier attempt. Order-
+                    # independent: the file ends up exactly ``total_bytes``
+                    # long whenever the last byte is written, regardless
+                    # of chunk arrival order.
+                    if end_bytes + 1 == total_bytes:
+                        f.truncate(total_bytes)
+            else:
+                with open(file_path, 'wb') as f:
+                    f.write(data)
+        except OSError as exc:
+            if not is_disk_full(exc):
+                raise
+            # Don't leave a truncated .tmp squatting on the last free
+            # bytes of an already-full disk.
+            with suppress(OSError):
+                remove(file_path)
+            return Response(
+                {'detail': DISK_FULL_ERROR},
+                status=status.HTTP_507_INSUFFICIENT_STORAGE,
+            )
+
+        return Response(
+            {
+                'uri': file_path,
+                'ext': guess_extension(file_type),
+                'upload_id': upload_id,
+            }
+        )
 
 
 class AssetContentViewMixin(APIView):
