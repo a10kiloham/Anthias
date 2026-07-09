@@ -20,7 +20,7 @@ from django.urls import reverse
 from django.utils import timezone
 
 from anthias_server.app import page_context
-from anthias_server.app.models import Asset
+from anthias_server.app.models import DURATION_S_MAX, Asset
 from anthias_server.app.templatetags.asset_filters import to_json
 
 
@@ -86,6 +86,9 @@ def test_system_info_renders(client: Client) -> None:
     # are environment-dependent.
     for label in ('Load Average', 'Disk', 'Memory', 'Uptime'):
         assert label in body
+    # The device clock card + its seed-from-server ticking hook.
+    assert 'Device time' in body
+    assert 'id="device-clock"' in body
 
 
 @pytest.mark.django_db
@@ -107,12 +110,19 @@ def test_settings_renders(client: Client) -> None:
         'Default duration',
         'Audio output',
         'Date format',
+        'Timezone',
         'Authentication',
         'Show splash screen',
         'Backup',
         'System controls',
     ):
         assert label in body
+    # The timezone dropdown is populated from the IANA list, with the
+    # real id as the option value and a humanised (underscore-free)
+    # label shown to the operator.
+    assert 'name="timezone"' in body
+    assert 'value="America/New_York"' in body
+    assert 'America/New York' in body
 
 
 @pytest.mark.django_db
@@ -1064,6 +1074,74 @@ def test_settings_save_screen_rotation(
 
 
 @pytest.mark.django_db
+def test_settings_save_timezone_valid(client: Client) -> None:
+    """A valid IANA zone posted from the HTML form is persisted."""
+    from anthias_server.settings import settings
+
+    original = settings['timezone']
+    try:
+        with mock.patch(
+            'anthias_server.settings.ViewerPublisher.send_to_viewer',
+            return_value=None,
+        ):
+            response = client.post(
+                reverse('anthias_app:settings_save'),
+                data={
+                    'player_name': 'Test',
+                    'default_duration': '10',
+                    'default_streaming_duration': '300',
+                    'audio_output': 'hdmi',
+                    'date_format': 'mm/dd/yyyy',
+                    'auth_backend': '',
+                    'timezone': 'Europe/Stockholm',
+                },
+            )
+        assert response.status_code in (200, 302)
+        assert settings['timezone'] == 'Europe/Stockholm'
+    finally:
+        # Persisted to the shared conf; the activation middleware would
+        # otherwise apply it to every later test's request. Restore.
+        settings['timezone'] = original
+        settings.save()
+
+
+@pytest.mark.django_db
+def test_settings_save_timezone_invalid_rejected(client: Client) -> None:
+    """A bad zone is rejected up front and never written — a value that
+    would crash-loop the settings module can't be persisted."""
+    from anthias_server.settings import settings
+
+    original = settings['timezone']
+    settings['timezone'] = 'Europe/Stockholm'
+    settings.save()
+
+    try:
+        with mock.patch(
+            'anthias_server.settings.ViewerPublisher.send_to_viewer',
+            return_value=None,
+        ) as publish_mock:
+            response = client.post(
+                reverse('anthias_app:settings_save'),
+                data={
+                    'player_name': 'Test',
+                    'default_duration': '10',
+                    'default_streaming_duration': '300',
+                    'audio_output': 'hdmi',
+                    'date_format': 'mm/dd/yyyy',
+                    'auth_backend': '',
+                    'timezone': 'Mars/Phobos',
+                },
+            )
+        assert response.status_code in (200, 302)
+        # Prior value untouched, and no reload was signalled.
+        assert settings['timezone'] == 'Europe/Stockholm'
+        publish_mock.assert_not_called()
+    finally:
+        settings['timezone'] = original
+        settings.save()
+
+
+@pytest.mark.django_db
 @mock.patch(
     'anthias_server.app.views.reboot_anthias.apply_async',
     side_effect=(lambda: None),
@@ -1299,6 +1377,33 @@ def test_assets_update_clamps_oversize_refresh_interval(
         )
     asset.refresh_from_db()
     assert asset.metadata.get('refresh_interval_s') == 86400
+
+
+@pytest.mark.django_db
+def test_assets_update_clamps_oversize_duration(
+    client: Client, asset: Asset
+) -> None:
+    """Same clamp-not-400 policy as the refresh interval above. The
+    posted value is the real one from Sentry ANTHIAS-3E: an operator
+    typed 9999999999999 to mean "forever", and the stored row
+    crash-looped the viewer's ``Event.wait`` on OverflowError."""
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        client.post(
+            reverse('anthias_app:assets_update', args=[asset.asset_id]),
+            data={
+                'name': asset.name,
+                'mimetype': 'webpage',
+                'duration': '9999999999999',
+                'start_date': '2026-01-01T00:00',
+                'end_date': '2027-01-01T00:00',
+                'refresh_interval_s': '',
+            },
+        )
+    asset.refresh_from_db()
+    assert asset.duration == DURATION_S_MAX
 
 
 @pytest.mark.django_db
@@ -2059,6 +2164,136 @@ def test_assets_bulk_update_days(
 
 
 @pytest.mark.django_db
+def test_assets_bulk_update_nocache_sets_flag(
+    client: Client, bulk_assets: list[Asset]
+) -> None:
+    """Ticking the No cache group with the On radio sets nocache on
+    every selected asset, videos included (#3137)."""
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        client.post(
+            reverse('anthias_app:assets_bulk_update'),
+            data={
+                'ids': _bulk_ids_csv(bulk_assets),
+                'apply_nocache': 'true',
+                'nocache': 'true',
+            },
+        )
+    for a in bulk_assets:
+        a.refresh_from_db()
+        assert a.nocache is True
+
+
+@pytest.mark.django_db
+def test_assets_bulk_update_nocache_off_clears_flag(
+    client: Client, bulk_assets: list[Asset]
+) -> None:
+    """The group can clear as well as set: the Off radio POSTs
+    nocache=false and turns the flag off on every selected asset (#3137).
+    """
+    Asset.objects.filter(
+        asset_id__in=[a.asset_id for a in bulk_assets]
+    ).update(nocache=True)
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        client.post(
+            reverse('anthias_app:assets_bulk_update'),
+            data={
+                'ids': _bulk_ids_csv(bulk_assets),
+                'apply_nocache': 'true',
+                'nocache': 'false',
+            },
+        )
+    for a in bulk_assets:
+        a.refresh_from_db()
+        assert a.nocache is False
+
+
+@pytest.mark.django_db
+def test_assets_bulk_update_skip_asset_check_sets_flag(
+    client: Client, bulk_assets: list[Asset]
+) -> None:
+    """Ticking the Skip asset check group with the On radio sets
+    skip_asset_check on every selected asset (#3137)."""
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        client.post(
+            reverse('anthias_app:assets_bulk_update'),
+            data={
+                'ids': _bulk_ids_csv(bulk_assets),
+                'apply_skip_asset_check': 'true',
+                'skip_asset_check': 'true',
+            },
+        )
+    for a in bulk_assets:
+        a.refresh_from_db()
+        assert a.skip_asset_check is True
+
+
+@pytest.mark.django_db
+def test_assets_bulk_update_flag_untouched_when_group_off(
+    client: Client, bulk_assets: list[Asset]
+) -> None:
+    """A flag value POSTed without its apply_* toggle is ignored — an
+    unticked group never overwrites the stored flag (#3137)."""
+    Asset.objects.filter(
+        asset_id__in=[a.asset_id for a in bulk_assets]
+    ).update(nocache=True, skip_asset_check=True)
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        client.post(
+            reverse('anthias_app:assets_bulk_update'),
+            data={
+                'ids': _bulk_ids_csv(bulk_assets),
+                # Duration group is the only one ticked; the stray flag
+                # values below must be ignored.
+                'apply_duration': 'true',
+                'duration': '42',
+                'nocache': 'false',
+                'skip_asset_check': 'false',
+            },
+        )
+    for a in bulk_assets:
+        a.refresh_from_db()
+        assert a.nocache is True
+        assert a.skip_asset_check is True
+
+
+@pytest.mark.django_db
+def test_assets_bulk_update_flag_only_counts_all_matched(
+    client: Client, bulk_assets: list[Asset]
+) -> None:
+    """A flag-only edit touches every matched row (videos included), so
+    the success toast reports the full selection count, not the
+    non-video subset the duration rule uses (#3137)."""
+    import json as _json
+
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        response = client.post(
+            reverse('anthias_app:assets_bulk_update'),
+            data={
+                'ids': _bulk_ids_csv(bulk_assets),
+                'apply_nocache': 'true',
+                'nocache': 'true',
+            },
+            HTTP_HX_REQUEST='true',
+        )
+    trigger = _json.loads(response['HX-Trigger'])
+    assert trigger['toast']['message'] == '3 assets updated'
+
+
+@pytest.mark.django_db
 def test_assets_bulk_update_no_flags_is_noop(
     client: Client, bulk_assets: list[Asset]
 ) -> None:
@@ -2255,6 +2490,145 @@ def test_assets_upload_rejects_unknown_extension(client: Client) -> None:
     )
     assert response.status_code in (200, 302)
     assert not Asset.objects.filter(name='random.bin').exists()
+
+
+@pytest.mark.django_db
+def test_assets_upload_disk_full_shows_toast_not_500(client: Client) -> None:
+    """ENOSPC while copying the upload into assetdir must surface as
+    the disk-full toast on the table partial, with no row persisted
+    — not an unhandled 500 (Sentry ANTHIAS-3K)."""
+    import errno
+
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    with mock.patch(
+        'anthias_server.app.views.open',
+        side_effect=OSError(errno.ENOSPC, 'No space left on device'),
+        create=True,
+    ):
+        response = client.post(
+            reverse('anthias_app:assets_upload'),
+            data={
+                'file_upload': SimpleUploadedFile(
+                    'photo.png', b'\x89PNG\r\n', content_type='image/png'
+                ),
+            },
+            headers={'HX-Request': 'true'},
+        )
+    assert response.status_code == 200
+    assert 'disk is full' in response.headers.get('HX-Trigger', '')
+    assert Asset.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_assets_upload_disk_full_during_parse_shows_toast(
+    client: Client,
+) -> None:
+    """The reported Sentry stack (ANTHIAS-3K) is ENOSPC during the
+    multipart *parse* — Django spooling the request body to a temp
+    file, surfaced when the view first accesses ``request.FILES``.
+    Force the parser itself to raise and assert the same graceful
+    toast, with no row persisted."""
+    import errno
+
+    from django.core.files.uploadedfile import SimpleUploadedFile
+    from django.http.multipartparser import MultiPartParser
+
+    with mock.patch.object(
+        MultiPartParser,
+        'parse',
+        side_effect=OSError(errno.ENOSPC, 'No space left on device'),
+    ):
+        response = client.post(
+            reverse('anthias_app:assets_upload'),
+            data={
+                'file_upload': SimpleUploadedFile(
+                    'photo.png', b'\x89PNG\r\n', content_type='image/png'
+                ),
+            },
+            headers={'HX-Request': 'true'},
+        )
+    assert response.status_code == 200
+    assert 'disk is full' in response.headers.get('HX-Trigger', '')
+    assert Asset.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_assets_upload_disk_full_during_write_cleans_up_partial(
+    client: Client,
+) -> None:
+    """When the disk fills mid-write (open() succeeds, f.write() then
+    raises ENOSPC), the view must remove the partially-written file so
+    a truncated asset doesn't squat on the last free bytes — and still
+    show the toast with no row persisted."""
+    import errno
+
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    write_fails = mock.mock_open()
+    write_fails.return_value.write.side_effect = OSError(
+        errno.ENOSPC, 'No space left on device'
+    )
+    with (
+        mock.patch('anthias_server.app.views.open', write_fails, create=True),
+        mock.patch('anthias_server.app.views.remove') as mock_remove,
+    ):
+        response = client.post(
+            reverse('anthias_app:assets_upload'),
+            data={
+                'file_upload': SimpleUploadedFile(
+                    'photo.png', b'\x89PNG\r\n', content_type='image/png'
+                ),
+            },
+            headers={'HX-Request': 'true'},
+        )
+    assert response.status_code == 200
+    assert 'disk is full' in response.headers.get('HX-Trigger', '')
+    assert Asset.objects.count() == 0
+    mock_remove.assert_called_once()
+
+
+@pytest.mark.django_db
+def test_settings_recover_invalid_archive_warns_not_error(
+    client: Client,
+) -> None:
+    """A bad / non-backup upload to the HTML recover view is operator
+    input, not a bug — it must log at warning (not logger.exception,
+    which pages Sentry) and show the error message (Sentry
+    ANTHIAS-3W)."""
+    import tarfile
+
+    from django.contrib.messages import get_messages
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    with (
+        mock.patch('anthias_server.app.views.ViewerPublisher'),
+        mock.patch(
+            'anthias_server.app.views.open', mock.mock_open(), create=True
+        ),
+        mock.patch('anthias_server.app.views.path.isfile', return_value=False),
+        mock.patch(
+            'anthias_server.app.views.backup_helper.recover',
+            side_effect=tarfile.ReadError('not a gzip file'),
+        ),
+        mock.patch('anthias_server.app.views.logger') as mock_logger,
+    ):
+        response = client.post(
+            reverse('anthias_app:settings_recover'),
+            data={
+                'backup_upload': SimpleUploadedFile(
+                    'backup.tar.gz',
+                    b'\n\nnot a real gzip',
+                    content_type='application/x-tar',
+                )
+            },
+        )
+
+    assert response.status_code in (200, 302)
+    messages = [str(m) for m in get_messages(response.wsgi_request)]
+    assert 'Invalid backup archive.' in messages
+    mock_logger.warning.assert_called_once()
+    mock_logger.exception.assert_not_called()
 
 
 @pytest.mark.django_db

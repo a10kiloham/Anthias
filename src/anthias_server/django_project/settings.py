@@ -9,8 +9,10 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
 import asyncio
+import configparser
 import platform
 import secrets
+import socket
 import sys
 import zoneinfo
 from collections.abc import Iterator
@@ -24,6 +26,7 @@ from sentry_sdk.integrations.logging import ignore_logger
 from sentry_sdk.types import Event, Hint
 
 from anthias_common.version import get_anthias_release
+from anthias_server.settings import CONFIG_DIR, CONFIG_FILE
 from anthias_server.settings import settings as device_settings
 
 # django_stubs_ext.monkeypatch() makes Django generic classes
@@ -99,7 +102,7 @@ def _exception_chain(exc: BaseException | None) -> Iterator[BaseException]:
 def _sentry_before_send(event: Event, hint: Hint) -> Event | None:
     """Drop events that report expected transient states, not bugs.
 
-    Two classes of noise, both observed fleet-wide on day one:
+    The classes of noise dropped here, each observed fleet-wide:
 
       * ``redis.exceptions.ConnectionError`` AND
         ``redis.exceptions.TimeoutError`` (plus subclasses and
@@ -130,6 +133,23 @@ def _sentry_before_send(event: Event, hint: Hint) -> Event | None:
         never reaches the logging integration in the first place; this
         is the backstop for any other path that logs it as an error
         (Sentry ANTHIAS-3D).
+      * ``socket.gaierror`` — DNS resolution failing because the
+        device is offline (captive network, upstream outage, no
+        uplink at all). Being offline is a routine operating state
+        for a signage device, and a DNS-less box otherwise burns an
+        event per attempted external call — 253/day from a single
+        pi3-64, mostly via asyncio's "Future exception was never
+        retrieved" error log (Sentry ANTHIAS-3G). Chain-checked like
+        the redis errors because requests wraps it several layers
+        deep (urllib3 ``NameResolutionError`` →
+        ``requests.ConnectionError``).
+      * yt-dlp ``DownloadError`` — a YouTube/remote-video download that
+        failed (network timeout, geo-block, private/deleted video, bad
+        URL). None of these are Anthias bugs, and the download task's
+        ``on_failure`` already records ``metadata.error_message`` so the
+        asset renders a "Failed" pill with the reason — the operator
+        gets the feedback without a Sentry page (Sentry ANTHIAS-3T).
+        Matched by name+module so we don't import yt_dlp here.
     """
     # Imported lazily — this runs only when an event is about to send,
     # well after Django is configured, and avoids an import cycle at
@@ -151,6 +171,14 @@ def _sentry_before_send(event: Event, hint: Hint) -> Event | None:
             return None
         if isinstance(exc, AuthSettingsError):
             return None
+        if isinstance(exc, socket.gaierror):
+            return None
+        exc_cls = type(exc)
+        if exc_cls.__name__ == 'DownloadError' and (
+            exc_cls.__module__ == 'yt_dlp'
+            or exc_cls.__module__.startswith('yt_dlp.')
+        ):
+            return None
     return event
 
 
@@ -166,6 +194,25 @@ def _sentry_before_send(event: Event, hint: Hint) -> Event | None:
 ignore_logger('celery.worker.consumer.consumer')
 ignore_logger('celery.beat')
 ignore_logger('celery.backends.redis')
+# The async result backend logs "Retry limit exceeded while trying to
+# reconnect to the Celery result store backend. The Celery application
+# must be restarted." at a fatal level when redis stays unreachable
+# past its reconnect budget — the same transient-redis outage as the
+# loggers above, just from the result-backend's polling side. It self-
+# heals once redis returns (celery re-establishes on the next result
+# fetch); a persistent outage still surfaces via the watchdog restart
+# loop. (Sentry ANTHIAS-3X.)
+ignore_logger('celery.backends.asynchronous')
+# A device exposed to the internet gets a steady drip of background
+# scanners and bots hitting it with a bogus/spoofed Host header
+# ("Invalid HTTP_HOST header: '141.212.44.121/..'"). Django rejects the
+# request with a 400 and logs it at ERROR to ``django.security.
+# DisallowedHost``, which the logging integration then turns into a
+# Sentry event. It is neither an Anthias bug nor actionable — the
+# request never reaches a view — so silence the logger, exactly as
+# Django's own docs suggest for this well-known noise source. (Sentry
+# ANTHIAS-2A.)
+ignore_logger('django.security.DisallowedHost')
 
 
 def get_sentry_release() -> str | None:
@@ -373,6 +420,10 @@ MIDDLEWARE = [
     # — Sentry ANTHIAS-Y). See anthias_server/lib/whitenoise.py.
     'anthias_server.lib.whitenoise.ResilientWhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
+    # Re-resolve + activate the operator-selected timezone per request
+    # so a Settings change is live without a restart. After sessions so
+    # request teardown order is predictable; before the view runs.
+    'anthias_server.lib.timezone.TimezoneActivationMiddleware',
     'django.middleware.common.CommonMiddleware',
     'anthias_server.lib.csrf.SameHostOriginCsrfMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
@@ -513,36 +564,100 @@ USE_I18N = True
 USE_TZ = True
 
 
+def is_valid_time_zone(
+    time_zone: str,
+    zoneinfo_root: Path = Path('/usr/share/zoneinfo'),
+) -> bool:
+    """True if ``time_zone`` is a zone Django will accept at startup.
+
+    Validate the same way Django does in django.conf.Settings.__init__
+    — a zoneinfo lookup PLUS the /usr/share/zoneinfo file check.
+    Validating with a bundled database alone (the old pytz check) is
+    not enough: it accepts names like ``US/Central`` that the image's
+    tzdata may not ship on disk, and Django then raises ValueError at
+    startup, crash-looping every Django process on the device.
+    """
+    try:
+        zoneinfo.ZoneInfo(time_zone)
+    except (ValueError, zoneinfo.ZoneInfoNotFoundError):
+        return False
+    if (
+        zoneinfo_root.exists()
+        and not zoneinfo_root.joinpath(*time_zone.split('/')).exists()
+    ):
+        return False
+    return True
+
+
 def get_host_time_zone(
     timezone_file: str = '/etc/timezone',
     zoneinfo_root: Path = Path('/usr/share/zoneinfo'),
 ) -> str:
     """Read the host's /etc/timezone, falling back to UTC.
 
-    /etc/timezone is bind-mounted from the host, so its value is
-    whatever the host distro wrote there. Validate it the same way
-    Django does in django.conf.Settings.__init__ — a zoneinfo lookup
-    PLUS the /usr/share/zoneinfo file check. Validating with a bundled
-    database alone (the old pytz check) is not enough: it accepts
-    names like `US/Central` that the image's tzdata may not ship on
-    disk, and Django then raises ValueError at startup, crash-looping
-    every Django process on the device.
+    /etc/timezone is bind-mounted from the host on docker-compose
+    installs, so its value is whatever the host distro wrote there.
+    On balena it is not mounted, so this is the container image's own
+    zone (UTC) — the reason the in-app override below matters most
+    there. An invalid value falls back to UTC, never crash-loops.
     """
     try:
         with open(timezone_file, 'r') as f:
             time_zone = f.read().strip()
-        zoneinfo.ZoneInfo(time_zone)
-        if (
-            zoneinfo_root.exists()
-            and not zoneinfo_root.joinpath(*time_zone.split('/')).exists()
-        ):
-            raise zoneinfo.ZoneInfoNotFoundError(time_zone)
-        return time_zone
-    except (OSError, ValueError, zoneinfo.ZoneInfoNotFoundError):
+    except OSError:
         return 'UTC'
+    return time_zone if is_valid_time_zone(time_zone, zoneinfo_root) else 'UTC'
 
 
-TIME_ZONE = get_host_time_zone()
+def get_configured_time_zone(
+    config_file: str | None = None,
+    zoneinfo_root: Path = Path('/usr/share/zoneinfo'),
+) -> str | None:
+    """Operator-selected timezone from anthias.conf, or None.
+
+    Parsed directly with configparser rather than via AnthiasSettings
+    so this stays import-safe during Django settings evaluation (no
+    dependency on the device-settings object). ``None`` (empty/absent)
+    lets resolve_time_zone() fall through to TZ env -> /etc/timezone ->
+    UTC; an invalid value is ignored so a bad hand-edit can never
+    crash-loop Django.
+    """
+    if config_file is None:
+        home = getenv('HOME')
+        if not home:
+            return None
+        # Reuse the same constants AnthiasSettings uses so the config
+        # location can never drift between the two.
+        config_file = str(Path(home) / CONFIG_DIR / CONFIG_FILE)
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(config_file)
+        time_zone = parser.get('main', 'timezone', fallback='').strip()
+    except (configparser.Error, OSError):
+        return None
+    if not time_zone:
+        return None
+    return time_zone if is_valid_time_zone(time_zone, zoneinfo_root) else None
+
+
+def resolve_time_zone() -> str:
+    """Effective Anthias timezone.
+
+    Precedence: anthias.conf ``[main] timezone`` (the in-UI setting) ->
+    ``TZ`` env var (respects a balena dashboard TZ variable) ->
+    host /etc/timezone -> UTC. Every candidate is validated, so no
+    rung can wedge Django at startup.
+    """
+    configured = get_configured_time_zone()
+    if configured:
+        return configured
+    tz_env = (getenv('TZ') or '').strip()
+    if tz_env and is_valid_time_zone(tz_env):
+        return tz_env
+    return get_host_time_zone()
+
+
+TIME_ZONE = resolve_time_zone()
 
 
 # Static files (CSS, JavaScript, Images)

@@ -7,7 +7,9 @@ surfaces stay in lockstep without going through the HTTP API.
 """
 
 from datetime import timedelta
+import functools
 import os
+import zoneinfo
 from os import getenv, statvfs
 from typing import Any
 
@@ -24,6 +26,7 @@ from anthias_common.utils import (
 )
 from anthias_server.lib import diagnostics
 from anthias_server.lib.github import is_up_to_date
+from anthias_server.lib.timezone import format_utc_offset
 from anthias_server.settings import settings
 
 _redis = connect_to_redis()
@@ -116,6 +119,11 @@ def system_info() -> dict[str, Any]:
             severity = 'ok'
         return {'value': value, 'pct': pct, 'severity': severity}
 
+    # Snapshot the local instant once so iso/offset can't straddle a
+    # second boundary, and resolve the active zone name a single time.
+    now_local = timezone.localtime(timezone.now())
+    tz_name = timezone.get_current_timezone_name()
+
     return {
         'loadavg': load_15m,
         'load': {
@@ -169,6 +177,23 @@ def system_info() -> dict[str, Any]:
             'hours': round(uptime.seconds / 3600, 2),
             'human': timesince(timezone.now() - uptime, depth=2),
         },
+        # The device's own wall clock + active timezone, so an operator
+        # can confirm what "now" the scheduler is using (issue #1755).
+        # Seeded from the server instant (``iso``) rather than the
+        # browser's clock — the whole point is to reveal a *wrong*
+        # device clock, which trusting the browser would mask. The
+        # offset is formatted +HH:MM for readability.
+        'device_time': {
+            # Seconds precision: microseconds from isoformat() aren't
+            # parsed by every JS Date.parse() engine, and a NaN seed
+            # would leave the live clock never starting.
+            'iso': now_local.isoformat(timespec='seconds'),
+            # Raw IANA id for the JS Intl formatter (data-timezone)...
+            'timezone': tz_name,
+            # ...and a humanised version for the visible sub-label.
+            'timezone_label': tz_name.replace('_', ' '),
+            'offset': format_utc_offset(now_local),
+        },
         'display_power': _redis.get('display_power'),
         'resolution': _resolved_resolution(),
         'device_model': device_model,
@@ -192,6 +217,24 @@ _DATE_FORMAT_OPTIONS = (
     ('dd.mm.yyyy', 'day.month.year'),
     ('yyyy.mm.dd', 'year.month.day'),
 )
+
+
+@functools.lru_cache(maxsize=1)
+def _timezone_options() -> tuple[tuple[str, str], ...]:
+    """(value, label) pairs for the Settings timezone dropdown.
+
+    Leading blank entry ("System default") defers to
+    resolve_time_zone() — TZ env, then /etc/timezone, then UTC. The
+    rest is the sorted IANA zone list; on balena the host is always
+    UTC, so this dropdown is the only way to schedule/display in local
+    time there. Cached — the set is fixed for the life of the process.
+    """
+    # Value stays the real IANA id (what Django/Intl need); the label
+    # humanises the underscore so options read "America/New York".
+    zones = sorted(zoneinfo.available_timezones())
+    return (('', 'System default'),) + tuple(
+        (z, z.replace('_', ' ')) for z in zones
+    )
 
 
 def device_settings() -> dict[str, Any]:
@@ -227,6 +270,7 @@ def device_settings() -> dict[str, Any]:
         'default_streaming_duration': settings['default_streaming_duration'],
         'audio_output': settings['audio_output'],
         'date_format': settings['date_format'],
+        'timezone': settings['timezone'],
         'auth_backend': settings['auth_backend'],
         'username': operator_username(),
         'show_splash': settings['show_splash'],
@@ -235,6 +279,7 @@ def device_settings() -> dict[str, Any]:
         'use_24_hour_clock': settings['use_24_hour_clock'],
         'debug_logging': settings['debug_logging'],
         'prefer_dark_mode': settings['prefer_dark_mode'],
+        'verify_ssl': settings['verify_ssl'],
         # Clamp on the read side so a stale conf value (e.g. an
         # old 45 from a hand-edit) doesn't leave the dropdown with no
         # ``selected`` option — the template's {% if screen_rotation
@@ -248,6 +293,7 @@ def device_settings() -> dict[str, Any]:
         # on that revision (matches the React audio-output dropdown).
         'is_pi5': 'Raspberry Pi 5' in device_model,
         'date_format_options': _DATE_FORMAT_OPTIONS,
+        'timezone_options': _timezone_options(),
         # Render-time gate for the experimental CEC display-power
         # buttons; cec_available() only stats device nodes, so it's
         # cheap enough to call on every settings render.

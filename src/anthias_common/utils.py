@@ -1,9 +1,11 @@
+import errno
 import json
 import logging
 import os
 import random
 import re
 import string
+import warnings
 from datetime import datetime, timedelta
 from os import getenv, utime
 from platform import machine
@@ -16,6 +18,7 @@ import pytz
 import redis
 import requests
 import sh
+import urllib3
 from tenacity import (
     RetryError,
     Retrying,
@@ -49,6 +52,25 @@ def clamp_screen_rotation(value: Any) -> int:
     except (TypeError, ValueError):
         return 0
     return rotation if rotation in SCREEN_ROTATION_CHOICES else 0
+
+
+# Operator-facing message for ENOSPC during an upload — shared by the
+# HTML upload toast and the API's 507 response so the wording can't
+# drift between surfaces (Sentry ANTHIAS-3K).
+DISK_FULL_ERROR = (
+    'The device disk is full. Free up space — for example by deleting '
+    'unused assets — and try again.'
+)
+
+
+def is_disk_full(exc: OSError) -> bool:
+    """True when ``exc`` is ENOSPC — the device disk is full.
+
+    Upload paths turn this into an actionable operator message
+    instead of a 500: a full disk is a device-capacity condition,
+    not a code bug (Sentry ANTHIAS-3K).
+    """
+    return exc.errno == errno.ENOSPC
 
 
 def string_to_bool(string: Any) -> bool:
@@ -143,12 +165,22 @@ def get_balena_device_info(
     )
 
 
-def shutdown_via_balena_supervisor() -> requests.Response:
-    return get_balena_supervisor_api_response(method='post', action='shutdown')
+def shutdown_via_balena_supervisor(
+    *,
+    timeout: float | tuple[float, float] | None = None,
+) -> requests.Response:
+    return get_balena_supervisor_api_response(
+        method='post', action='shutdown', timeout=timeout
+    )
 
 
-def reboot_via_balena_supervisor() -> requests.Response:
-    return get_balena_supervisor_api_response(method='post', action='reboot')
+def reboot_via_balena_supervisor(
+    *,
+    timeout: float | tuple[float, float] | None = None,
+) -> requests.Response:
+    return get_balena_supervisor_api_response(
+        method='post', action='reboot', timeout=timeout
+    )
 
 
 def get_balena_supervisor_version() -> str:
@@ -545,9 +577,16 @@ def json_dump(obj: Any) -> str:
     return json.dumps(obj, default=handler)
 
 
-def url_fails(url: str) -> bool:
+def url_fails(url: str, verify_ssl: bool | None = None) -> bool:
     """
     If it is streaming
+
+    ``verify_ssl`` controls TLS certificate verification for the HTTP(S)
+    reachability probe. ``None`` (the default) reads the device-wide
+    ``verify_ssl`` setting, preserving the behaviour of existing
+    callers. Callers that know a per-asset override (``Asset.
+    skip_ssl_verify``) pass the already-composed effective flag so a
+    trusted self-signed host isn't wrongly marked unreachable.
     """
     # Note: no private/LAN-address filtering here. Serving signage from
     # a LAN host (an intranet dashboard, a sibling Docker container, a
@@ -583,13 +622,21 @@ def url_fails(url: str) -> bool:
     Try HEAD and GET for URL availability check.
     """
 
-    # Use Certifi module and set to True as default so users stop
-    # seeing InsecureRequestWarning in logs.
+    verify_flag = settings['verify_ssl'] if verify_ssl is None else verify_ssl
     verify: str | bool
-    if settings['verify_ssl']:
+    if verify_flag:
+        # Pin verification to the certifi CA bundle so a stale system
+        # trust store can't spuriously fail an otherwise-valid origin.
         verify = certifi.where()
     else:
-        verify = True
+        # verify_ssl is off — the operator has opted into trusting
+        # self-signed / untrusted-CA hosts (e.g. an intranet media
+        # server). Pass verify=False so requests skips certificate
+        # validation; anything else (True, or a certifi bundle path)
+        # still validates and would wrongly mark such a host
+        # unreachable, defeating the setting. Regressed to `True` in
+        # 2019 (commit c1dd61ce); restored here.
+        verify = False
 
     headers = {
         'User-Agent': 'Mozilla/5.0 (X11; Linux armv7l) AppleWebKit/538.15 (KHTML, like Gecko) Version/8.0 Safari/538.15'  # noqa: E501
@@ -598,25 +645,47 @@ def url_fails(url: str) -> bool:
         if not validate_url(url):
             return False
 
-        if requests.head(
-            url,
-            allow_redirects=True,
-            headers=headers,
-            timeout=10,
-            verify=verify,
-        ).ok:
-            return False
+        with warnings.catch_warnings():
+            if verify is False:
+                # The operator explicitly disabled verification; silence
+                # the InsecureRequestWarning urllib3 raises per request so
+                # a reachability sweep doesn't spam the logs. Scoped to
+                # this block rather than a process-global
+                # disable_warnings() so it can't leak to other requests
+                # elsewhere in the process — catch_warnings restores the
+                # prior filter state on exit.
+                warnings.simplefilter(
+                    'ignore', urllib3.exceptions.InsecureRequestWarning
+                )
 
-        if requests.get(
-            url,
-            allow_redirects=True,
-            headers=headers,
-            timeout=10,
-            verify=verify,
-        ).ok:
-            return False
+            if requests.head(
+                url,
+                allow_redirects=True,
+                headers=headers,
+                timeout=10,
+                verify=verify,
+            ).ok:
+                return False
 
-    except (requests.ConnectionError, requests.exceptions.Timeout):
+            if requests.get(
+                url,
+                allow_redirects=True,
+                headers=headers,
+                timeout=10,
+                verify=verify,
+            ).ok:
+                return False
+
+    except requests.exceptions.RequestException:
+        # Any requests-level failure means we could not confirm the URL
+        # is reachable, so fall through to the ``True`` (unreachable)
+        # verdict rather than letting the exception escape and 500 a
+        # caller like asset creation — the probe's contract is a boolean.
+        # Covers DNS / refused connections (ConnectionError), TLS
+        # handshake / untrusted-cert failures (SSLError, a
+        # ConnectionError subclass), slow origins (Timeout), and redirect
+        # loops (TooManyRedirects, which ``allow_redirects=True`` can hit
+        # and which is *not* a ConnectionError) alike.
         pass
 
     return True

@@ -35,11 +35,16 @@ interface AssetEdit {
   is_enabled: boolean
   nocache: boolean
   skip_asset_check: boolean
+  skip_ssl_verify: boolean
   start_date_local: string
   end_date_local: string
   play_days_list: number[]
   play_time_from: string | null
   play_time_to: string | null
+  metadata?: {
+    refresh_interval_s?: number
+    headers?: Record<string, string>
+  } | null
 }
 
 type UploadState = null | 'sending' | 'processing'

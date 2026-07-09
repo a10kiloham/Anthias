@@ -148,6 +148,98 @@ class TestBeforeSendTransientNoise:
         hint = self._hint_for(AuthSettingsError('New passwords do not match!'))
         assert _sentry_before_send({'event_id': 'x'}, hint) is None
 
+    def test_drops_gaierror(self) -> None:
+        # DNS failing = the device is offline, a routine state for
+        # signage. A DNS-less box burned an event per attempted
+        # external call, mostly via asyncio's "Future exception was
+        # never retrieved" log (Sentry ANTHIAS-3G).
+        import socket
+
+        from anthias_server.django_project.settings import (
+            _sentry_before_send,
+        )
+
+        hint = self._hint_for(
+            socket.gaierror(-5, 'No address associated with hostname')
+        )
+        assert _sentry_before_send({'event_id': 'x'}, hint) is None
+
+    def test_drops_wrapped_gaierror(self) -> None:
+        # requests buries the gaierror several layers deep
+        # (urllib3 NameResolutionError -> requests.ConnectionError);
+        # the chain walk must still find it.
+        import socket
+
+        import requests
+
+        from anthias_server.django_project.settings import (
+            _sentry_before_send,
+        )
+
+        try:
+            try:
+                raise socket.gaierror(
+                    -5, 'No address associated with hostname'
+                )
+            except socket.gaierror as root:
+                raise requests.exceptions.ConnectionError(
+                    'resolution failed'
+                ) from root
+        except requests.exceptions.ConnectionError as wrapper:
+            hint = {
+                'exc_info': (
+                    type(wrapper),
+                    wrapper,
+                    wrapper.__traceback__,
+                )
+            }
+        assert _sentry_before_send({'event_id': 'x'}, hint) is None
+
+    def test_drops_yt_dlp_download_error(self) -> None:
+        # A yt-dlp DownloadError (network timeout, geo-block, private/
+        # deleted video, bad URL) is operator-facing, not a bug — the
+        # download task's on_failure records error_message so the asset
+        # shows a "Failed" pill (Sentry ANTHIAS-3T). Synthesise the
+        # class so the test doesn't depend on importing yt_dlp.
+        from anthias_server.django_project.settings import (
+            _sentry_before_send,
+        )
+
+        download_error_cls = type(
+            'DownloadError', (Exception,), {'__module__': 'yt_dlp.utils'}
+        )
+        hint = self._hint_for(download_error_cls('read timed out'))
+        assert _sentry_before_send({'event_id': 'x'}, hint) is None
+
+    def test_keeps_non_ytdlp_download_error(self) -> None:
+        # The drop is scoped to yt_dlp by module — a same-named
+        # DownloadError from anywhere else must NOT be swallowed.
+        from anthias_server.django_project.settings import (
+            _sentry_before_send,
+        )
+
+        other_cls = type(
+            'DownloadError', (Exception,), {'__module__': 'some.other.pkg'}
+        )
+        event: Event = {'event_id': 'x'}
+        hint = self._hint_for(other_cls('a real bug'))
+        assert _sentry_before_send(event, hint) == event
+
+    def test_keeps_lookalike_module_download_error(self) -> None:
+        # The module match is exact/prefix-scoped so a look-alike
+        # package (yt_dlp2, yt_dlp_fake) can't smuggle its own
+        # DownloadError through the drop.
+        from anthias_server.django_project.settings import (
+            _sentry_before_send,
+        )
+
+        lookalike_cls = type(
+            'DownloadError', (Exception,), {'__module__': 'yt_dlp2.utils'}
+        )
+        event: Event = {'event_id': 'x'}
+        hint = self._hint_for(lookalike_cls('not really yt-dlp'))
+        assert _sentry_before_send(event, hint) == event
+
     def test_keeps_ordinary_exceptions(self) -> None:
         from anthias_server.django_project.settings import (
             _sentry_before_send,
@@ -181,6 +273,21 @@ class TestBeforeSendTransientNoise:
         # ("Connection to Redis lost: Retry (4/20)") at ERROR
         # (Sentry ANTHIAS-2E).
         assert 'celery.backends.redis' in _IGNORED_LOGGERS
+        # The async result backend logs "Retry limit exceeded while
+        # trying to reconnect to the Celery result store backend" at a
+        # fatal level on a sustained redis outage (Sentry ANTHIAS-3X).
+        assert 'celery.backends.asynchronous' in _IGNORED_LOGGERS
+
+    def test_disallowed_host_logger_is_ignored(self) -> None:
+        # An internet-exposed device gets scanned with bogus/spoofed
+        # Host headers; Django rejects each with a 400 and logs it at
+        # ERROR to django.security.DisallowedHost, which the logging
+        # integration would otherwise turn into a Sentry event. It is
+        # non-actionable background-scanner noise (Sentry ANTHIAS-2A).
+        import anthias_server.django_project.settings  # noqa: F401
+        from sentry_sdk.integrations.logging import _IGNORED_LOGGERS
+
+        assert 'django.security.DisallowedHost' in _IGNORED_LOGGERS
 
 
 class TestGetBoardModel:

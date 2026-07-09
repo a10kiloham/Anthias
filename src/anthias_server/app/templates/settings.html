@@ -41,7 +41,7 @@
       <header>
         <div>
           <h2>Display & playback</h2>
-          <p class="settings-section__lede">Default durations, audio, and date format.</p>
+          <p class="settings-section__lede">Defaults, audio, timezone, and display.</p>
         </div>
       </header>
 
@@ -77,6 +77,15 @@
         </div>
 
         <div class="app-floating">
+          <select class="app-select" id="timezone" name="timezone">
+            {% for value, label in timezone_options %}
+            <option value="{{ value }}" {% if timezone == value %}selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+          </select>
+          <label for="timezone">Timezone</label>
+        </div>
+
+        <div class="app-floating">
           <select class="app-select" id="screen_rotation" name="screen_rotation">
             <option value="0" {% if screen_rotation == 0 %}selected{% endif %}>Landscape (0°)</option>
             <option value="90" {% if screen_rotation == 90 %}selected{% endif %}>Portrait (90°)</option>
@@ -94,6 +103,7 @@
         {% include "_settings_toggle.html" with name="prefer_dark_mode" label="Prefer dark mode" hint="Ask web page assets to render in dark mode where they support it." checked=prefer_dark_mode %}
         {% include "_settings_toggle.html" with name="use_24_hour_clock" label="Use 24-hour clock" hint="Display times in 24-hour format across the UI." checked=use_24_hour_clock %}
         {% include "_settings_toggle.html" with name="debug_logging" label="Debug logging" hint="Verbose viewer logs. Leave off unless you're chasing a problem." checked=debug_logging %}
+        {% include "_settings_toggle.html" with name="verify_ssl" label="Verify SSL certificates" hint="Keep on. Turn off only to allow media or web pages served over HTTPS with a self-signed or untrusted certificate (e.g. an intranet host). Disables certificate checks device-wide." checked=verify_ssl %}
       </div>
     </section>
 
@@ -164,6 +174,35 @@
       </div>
     </header>
   </section>
+
+  {% comment %}
+    Import content: one card per registered provider. The list comes from
+    the import-provider registry via the settings view, so a new provider
+    appears here with no template edit.
+  {% endcomment %}
+  {% if import_providers %}
+  <section class="settings-section mt-4">
+    <header>
+      <div>
+        <h2>Import content</h2>
+        <p class="settings-section__lede">Bring media in from another digital signage platform.</p>
+      </div>
+    </header>
+    {% for provider in import_providers %}
+    <div class="settings-section__row">
+      <div>
+        <strong>{{ provider.label }}</strong>
+        <p class="settings-section__lede">{{ provider.description }}</p>
+      </div>
+      <div class="settings-section__actions">
+        <a href="{% url 'anthias_app:import_content' provider.key %}" class="app-btn app-btn-outline-dark">
+          <i class="ti ti-download"></i><span>Import from {{ provider.label }}</span>
+        </a>
+      </div>
+    </div>
+    {% endfor %}
+  </section>
+  {% endif %}
 
   {# ===== Backup & restore ===== #}
   <section class="settings-section mt-4">
