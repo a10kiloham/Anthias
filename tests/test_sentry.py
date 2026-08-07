@@ -240,6 +240,31 @@ class TestBeforeSendTransientNoise:
         hint = self._hint_for(lookalike_cls('not really yt-dlp'))
         assert _sentry_before_send(event, hint) == event
 
+    def test_drops_short_content_length_runtime_error(self) -> None:
+        # A client that hangs up while Django's ASGI handler is still
+        # streaming a static file raises a bare RuntimeError with this
+        # message — a broken pipe, not a truncated file (Sentry
+        # ANTHIAS-37).
+        from anthias_server.django_project.settings import (
+            _sentry_before_send,
+        )
+
+        hint = self._hint_for(
+            RuntimeError('Response content shorter than Content-Length')
+        )
+        assert _sentry_before_send({'event_id': 'x'}, hint) is None
+
+    def test_keeps_unrelated_runtime_error(self) -> None:
+        # The drop is scoped to the client-disconnect message — any
+        # other RuntimeError is a real bug and must NOT be swallowed.
+        from anthias_server.django_project.settings import (
+            _sentry_before_send,
+        )
+
+        event: Event = {'event_id': 'x'}
+        hint = self._hint_for(RuntimeError('something actually broke'))
+        assert _sentry_before_send(event, hint) == event
+
     def test_keeps_ordinary_exceptions(self) -> None:
         from anthias_server.django_project.settings import (
             _sentry_before_send,
@@ -262,8 +287,9 @@ class TestBeforeSendTransientNoise:
         # logs each attempt at ERROR; the logger is silenced at init.
         # The ignore_logger call happens at settings-module import —
         # import it explicitly so this test passes in isolation too.
-        import anthias_server.django_project.settings  # noqa: F401
         from sentry_sdk.integrations.logging import _IGNORED_LOGGERS
+
+        import anthias_server.django_project.settings  # noqa: F401
 
         assert 'celery.worker.consumer.consumer' in _IGNORED_LOGGERS
         # The embedded beat scheduler retries broker connections the
@@ -284,8 +310,9 @@ class TestBeforeSendTransientNoise:
         # ERROR to django.security.DisallowedHost, which the logging
         # integration would otherwise turn into a Sentry event. It is
         # non-actionable background-scanner noise (Sentry ANTHIAS-2A).
-        import anthias_server.django_project.settings  # noqa: F401
         from sentry_sdk.integrations.logging import _IGNORED_LOGGERS
+
+        import anthias_server.django_project.settings  # noqa: F401
 
         assert 'django.security.DisallowedHost' in _IGNORED_LOGGERS
 
