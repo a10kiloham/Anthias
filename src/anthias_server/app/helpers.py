@@ -12,7 +12,10 @@ from django.shortcuts import render
 from django.utils import timezone
 
 from anthias_common.utils import get_video_duration
-from anthias_server.app.models import Asset
+from anthias_server.app.models import (
+    Asset,
+    mirror_play_order_to_default_playlist,
+)
 from anthias_server.app.page_context import navbar as _navbar_context
 from anthias_server.settings import ViewerPublisher, settings
 
@@ -196,6 +199,12 @@ def duplicate_asset(asset: Asset) -> Asset:
         last_reachability_check=asset.last_reachability_check,
         metadata=dict(asset.metadata or {}),
     )
+
+    # The shift-and-insert above rewrote play_order for every enabled
+    # follower; re-sync the Default playlist's item positions so the
+    # evaluators (which read item positions, not play_order) see the
+    # copy directly after its source.
+    mirror_play_order_to_default_playlist()
 
     # Wake the viewer so an active copy joins the rotation now rather
     # than on the next DB-mtime poll.

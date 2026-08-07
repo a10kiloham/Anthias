@@ -1,8 +1,8 @@
 import json
 import re
 import uuid
-from datetime import datetime
-from typing import Any
+from datetime import datetime, time
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from django.db import models
 from django.utils import timezone
@@ -202,7 +202,104 @@ def _default_play_days() -> str:
     return json.dumps(ALL_DAYS)
 
 
-class Asset(models.Model):
+# Defensive bound on playlist nesting depth at expansion time. The API
+# and UI enforce the tree shape (no self-ancestor) at edit time, but a
+# hand-edited or migrated row must never be able to hang the viewer in
+# an unbounded recursion. Subtrees past the cap are dropped and logged.
+MAX_PLAYLIST_DEPTH = 8
+
+
+class PlayWindowMixin(models.Model):
+    """Day-of-week / time-of-day window shared by ``Asset`` and
+    ``Playlist``.
+
+    Expects the concrete model to define ``play_days`` (JSON text),
+    ``play_time_from`` and ``play_time_to``.
+    """
+
+    if TYPE_CHECKING:
+        # The concrete models declare the actual columns; these stubs
+        # give the mixin's methods something to type-check against.
+        play_days: Any
+        play_time_from: time | None
+        play_time_to: time | None
+
+    class Meta:
+        abstract = True
+
+    def get_play_days(self) -> list[int]:
+        """Parse play_days into a sorted, deduped list of ints 1-7.
+
+        Falls back to all days if the value is missing, malformed JSON,
+        not a list, empty, or contains anything outside the 1-7 range.
+        The API validates on write, but admin / direct DB edits could
+        otherwise leave a row with junk in this column. Normalising on
+        read also keeps API responses consistent (sorted, no dupes).
+        """
+        if isinstance(self.play_days, list):
+            value = self.play_days
+        else:
+            try:
+                value = json.loads(self.play_days)
+            except (TypeError, json.JSONDecodeError):
+                return list(ALL_DAYS)
+
+        if not isinstance(value, list):
+            return list(ALL_DAYS)
+        if not all(isinstance(d, int) and 1 <= d <= 7 for d in value):
+            return list(ALL_DAYS)
+
+        deduped = sorted(set(value))
+        if not deduped:
+            return list(ALL_DAYS)
+        return deduped
+
+    def has_window_filter(self) -> bool:
+        """True if any day-of-week or time-of-day filter is set.
+
+        A time-of-day filter only applies when both endpoints are set —
+        _matches_play_window() treats a partial window as no filter — so
+        report it that way here too. Otherwise a stray single-endpoint
+        value (rejected by the v2 API but possible via admin / direct DB
+        edits) would force the windowed deadline cap on every tick
+        without actually filtering anything.
+        """
+        if self.play_time_from is not None and self.play_time_to is not None:
+            return True
+        return self.get_play_days() != list(ALL_DAYS)
+
+    def _matches_play_window(self, now_local: datetime) -> bool:
+        """Day-of-week and time-of-day filter, evaluated in local time.
+
+        Overnight windows (play_time_from > play_time_to) wrap past
+        midnight; play_days refers to the **start** day of such a
+        window. With no window fields set this is a no-op (returns
+        True), so unscheduled rows behave as before.
+        """
+        weekday = now_local.isoweekday()
+        days = self.get_play_days()
+
+        if self.play_time_from is None or self.play_time_to is None:
+            return weekday in days
+
+        current_time = now_local.time()
+
+        if self.play_time_from <= self.play_time_to:
+            if weekday not in days:
+                return False
+            return self.play_time_from <= current_time < self.play_time_to
+
+        # Overnight: window is [play_time_from, 24:00) on day D plus
+        # [00:00, play_time_to) on day D+1. play_days lists the D side.
+        if current_time >= self.play_time_from:
+            return weekday in days
+        if current_time < self.play_time_to:
+            yesterday = weekday - 1 if weekday > 1 else 7
+            return yesterday in days
+        return False
+
+
+class Asset(PlayWindowMixin):
     asset_id = models.TextField(
         primary_key=True, default=generate_asset_id, editable=False
     )
@@ -247,47 +344,6 @@ class Asset(models.Model):
     def __str__(self) -> str:
         return str(self.name)
 
-    def get_play_days(self) -> list[int]:
-        """Parse play_days into a sorted, deduped list of ints 1-7.
-
-        Falls back to all days if the value is missing, malformed JSON,
-        not a list, empty, or contains anything outside the 1-7 range.
-        The API validates on write, but admin / direct DB edits could
-        otherwise leave a row with junk in this column. Normalising on
-        read also keeps API responses consistent (sorted, no dupes).
-        """
-        if isinstance(self.play_days, list):
-            value = self.play_days
-        else:
-            try:
-                value = json.loads(self.play_days)
-            except (TypeError, json.JSONDecodeError):
-                return list(ALL_DAYS)
-
-        if not isinstance(value, list):
-            return list(ALL_DAYS)
-        if not all(isinstance(d, int) and 1 <= d <= 7 for d in value):
-            return list(ALL_DAYS)
-
-        deduped = sorted(set(value))
-        if not deduped:
-            return list(ALL_DAYS)
-        return deduped
-
-    def has_window_filter(self) -> bool:
-        """True if this asset has any day-of-week or time-of-day filter set.
-
-        A time-of-day filter only applies when both endpoints are set —
-        _matches_play_window() treats a partial window as no filter — so
-        report it that way here too. Otherwise a stray single-endpoint
-        value (rejected by the v2 API but possible via admin / direct DB
-        edits) would force the windowed deadline cap on every tick
-        without actually filtering anything.
-        """
-        if self.play_time_from is not None and self.play_time_to is not None:
-            return True
-        return self.get_play_days() != list(ALL_DAYS)
-
     def is_active(self, now: datetime | None = None) -> bool:
         if not (self.is_enabled and self.start_date and self.end_date):
             return False
@@ -297,32 +353,237 @@ class Asset(models.Model):
             return False
         return self._matches_play_window(timezone.localtime(now))
 
-    def _matches_play_window(self, now_local: datetime) -> bool:
-        """Day-of-week and time-of-day filter, evaluated in local time.
 
-        Overnight windows (play_time_from > play_time_to) wrap past
-        midnight; play_days refers to the **start** day of such a
-        window. With no window fields set this is a no-op (returns
-        True), so unscheduled assets behave as before.
+class Playlist(PlayWindowMixin):
+    """A named, orderable, schedulable container of playlist items.
+
+    Scheduling fields use the same vocabulary as ``Asset`` with one
+    deliberate difference: ``start_date`` / ``end_date`` are optional,
+    and an unset bound means "unbounded" (an asset must carry both
+    dates to play; a playlist without dates is always date-eligible).
+    An occurrence plays iff its asset is active AND every ancestor
+    playlist admits ``now``.
+
+    ``repeat=True`` (the default) loops the playlist's content forever —
+    exactly the pre-playlist behaviour. ``repeat=False`` plays each
+    occurrence under this playlist once per activation window; the
+    viewer's Scheduler owns that runtime state (it is per-device
+    play-state, not configuration).
+    """
+
+    playlist_id = models.TextField(
+        primary_key=True, default=generate_asset_id, editable=False
+    )
+    name = models.TextField()
+    is_enabled = models.BooleanField(default=True)
+    repeat = models.BooleanField(default=True)
+    # Exactly one playlist carries is_default=True: the landing target
+    # for every write path that doesn't name a playlist (v1/v1.1/v1.2
+    # creates, the HTML add-asset form, app installs, default assets).
+    # It cannot be deleted or nested via the API/UI.
+    is_default = models.BooleanField(default=False)
+    # Orders root playlists relative to each other; the flattener walks
+    # roots by (position, playlist_id). Ignored for nested playlists,
+    # whose order among siblings is their PlaylistItem's position.
+    position = models.IntegerField(default=0)
+    start_date = models.DateTimeField(blank=True, null=True)
+    end_date = models.DateTimeField(blank=True, null=True)
+    play_days = models.TextField(default=_default_play_days)
+    play_time_from = models.TimeField(blank=True, null=True)
+    play_time_to = models.TimeField(blank=True, null=True)
+
+    class Meta:
+        db_table = 'playlists'
+
+    def __str__(self) -> str:
+        return str(self.name)
+
+    def admits(self, now: datetime | None = None) -> bool:
+        """Does this playlist's own window admit ``now``?
+
+        The playlist-local half of activeness — is_enabled, optional
+        date bounds, day/time window. Ancestors are ANDed in by the
+        expansion walk in ``playlist_eval``, not here.
         """
-        weekday = now_local.isoweekday()
-        days = self.get_play_days()
+        if not self.is_enabled:
+            return False
+        if now is None:
+            now = timezone.now()
+        if self.start_date and now <= self.start_date:
+            return False
+        if self.end_date and now >= self.end_date:
+            return False
+        return self._matches_play_window(timezone.localtime(now))
 
-        if self.play_time_from is None or self.play_time_to is None:
-            return weekday in days
 
-        current_time = now_local.time()
+class PlaylistItem(models.Model):
+    """One slot in a playlist: either an asset occurrence or a nested
+    playlist. Exactly one of ``asset`` / ``child_playlist`` is set
+    (DB-enforced by the check constraint below).
 
-        if self.play_time_from <= self.play_time_to:
-            if weekday not in days:
-                return False
-            return self.play_time_from <= current_time < self.play_time_to
+    Asset items are deliberately NOT unique per (playlist, asset): the
+    same asset may appear in several playlists and more than once in
+    one — each row is an independent occurrence. Child-playlist items
+    ARE unique across the whole table (``child_playlist`` is a
+    OneToOneField), which is what enforces the tree shape: a playlist
+    has at most one parent.
+    """
 
-        # Overnight: window is [play_time_from, 24:00) on day D plus
-        # [00:00, play_time_to) on day D+1. play_days lists the D side.
-        if current_time >= self.play_time_from:
-            return weekday in days
-        if current_time < self.play_time_to:
-            yesterday = weekday - 1 if weekday > 1 else 7
-            return yesterday in days
-        return False
+    playlist = models.ForeignKey(
+        Playlist, related_name='items', on_delete=models.CASCADE
+    )
+    asset = models.ForeignKey(
+        Asset,
+        related_name='playlist_items',
+        on_delete=models.CASCADE,
+        blank=True,
+        null=True,
+    )
+    child_playlist = models.OneToOneField(
+        Playlist,
+        related_name='parent_item',
+        on_delete=models.CASCADE,
+        blank=True,
+        null=True,
+    )
+    position = models.IntegerField(default=0)
+
+    class Meta:
+        db_table = 'playlist_items'
+        ordering: ClassVar[list[str]] = ['position', 'id']
+        constraints: ClassVar[list[models.BaseConstraint]] = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(asset__isnull=False, child_playlist__isnull=True)
+                    | models.Q(
+                        asset__isnull=True, child_playlist__isnull=False
+                    )
+                ),
+                name='playlist_item_exactly_one_target',
+            ),
+        ]
+
+    def __str__(self) -> str:
+        target = self.asset or self.child_playlist
+        return f'{self.playlist_id}[{self.position}] -> {target}'
+
+
+def get_default_playlist() -> Playlist:
+    """The Default playlist — the landing target for every write path
+    that doesn't name a playlist.
+
+    Created by the 0009 backfill migration; the get_or_create is a
+    belt-and-braces guard for a hand-edited DB where the row was
+    deleted (an asset outside any playlist silently never plays, so
+    this must never be allowed to fail).
+    """
+    playlist, _ = Playlist.objects.get_or_create(
+        is_default=True,
+        defaults={'name': 'Default'},
+    )
+    return playlist
+
+
+def playlist_is_self_or_ancestor(candidate: Playlist, of: Playlist) -> bool:
+    """True if ``candidate`` is ``of`` itself or an ancestor of it.
+
+    The edit-time cycle gate for the tree model: nesting ``candidate``
+    under ``of`` is illegal exactly when this returns True. Walks the
+    single-parent chain (``parent_item`` reverse OneToOne), bounded by
+    MAX_PLAYLIST_DEPTH so even a corrupted DB can't loop it forever —
+    an over-deep walk reports True (refuse the edit) rather than
+    risking a false "safe".
+    """
+    node: Playlist | None = of
+    for _ in range(MAX_PLAYLIST_DEPTH + 1):
+        if node is None:
+            return False
+        if node.playlist_id == candidate.playlist_id:
+            return True
+        # RelatedObjectDoesNotExist subclasses AttributeError, so
+        # getattr-with-default cleanly maps "no parent" to None.
+        parent_item = getattr(node, 'parent_item', None)
+        node = parent_item.playlist if parent_item else None
+    return True
+
+
+def mirror_play_order_to_default_playlist() -> None:
+    """Re-sort the Default playlist's asset items to match
+    ``Asset.play_order``.
+
+    ``play_order`` is still what every legacy write surface speaks —
+    the v1/v1.1/v1.2/v2 serializers, ``POST /assets/order``, the
+    home-page drag reorder, ``duplicate_asset()``'s shift-and-insert —
+    while the playlist evaluators read order from item positions. This
+    is the single reconciliation point: asset items are permuted among
+    their **existing** position slots by (play_order, current order),
+    so nested-playlist items keep their exact positions and other
+    playlists are never touched. Named playlists are ordered through
+    the v2 playlist endpoints and have no play_order coupling.
+    """
+    items = list(
+        PlaylistItem.objects.filter(
+            playlist=get_default_playlist()
+        ).select_related('asset')
+    )
+    listed = [
+        (index, item)
+        for index, item in enumerate(items)
+        if item.asset is not None
+    ]
+    slots = [item.position for _, item in listed]
+    listed.sort(
+        key=lambda pair: (
+            pair[1].asset.play_order if pair[1].asset else 0,
+            pair[0],
+        )
+    )
+    changed = []
+    for (_, item), position in zip(listed, slots):
+        if item.position != position:
+            item.position = position
+            changed.append(item)
+    if changed:
+        PlaylistItem.objects.bulk_update(changed, ['position'])
+
+
+def _append_asset_to_default_playlist(
+    sender: object, instance: Asset, created: bool, **kwargs: object
+) -> None:
+    """post_save hook: a brand-new asset with no playlist membership
+    lands in the Default playlist at its ``play_order``.
+
+    A signal rather than per-call-site plumbing because asset creation
+    is scattered across the v1/v1.1/v1.2/v2 APIs, the HTML add form,
+    app installs, sample-asset seeding, duplication and the content
+    importers — and a single missed site would strand an asset outside
+    every playlist, where it silently never plays (feasibility doc,
+    risk 4). The item's position seeds from ``play_order`` (ties break
+    by item id, i.e. creation order) so legacy creators that place a
+    row via play_order keep working; the mirror helper above keeps the
+    two in step on every subsequent reorder. Callers that DO target a
+    specific playlist create their ``PlaylistItem`` explicitly and are
+    skipped here only if they did so inside ``Asset.save()``; created
+    rows can simply be moved afterwards.
+    """
+    del sender, kwargs
+    if created and not PlaylistItem.objects.filter(asset=instance).exists():
+        PlaylistItem.objects.create(
+            playlist=get_default_playlist(),
+            asset=instance,
+            position=instance.play_order or 0,
+        )
+    # Any save can carry a play_order edit (Django admin, the v1/v1.1
+    # update serializers write instance.play_order and call save()
+    # directly, without going through save_active_assets_ordering), so
+    # re-sync unconditionally — the mirror is a no-op when order
+    # already matches, and playlist evaluation must never read a stale
+    # position after a legacy write.
+    mirror_play_order_to_default_playlist()
+
+
+models.signals.post_save.connect(
+    _append_asset_to_default_playlist,
+    sender=Asset,
+    dispatch_uid='append_asset_to_default_playlist',
+)
