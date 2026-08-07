@@ -777,9 +777,7 @@ def test_assets_duplicate_creates_independent_copy(
         return_value=None,
     ):
         response = client.post(
-            reverse(
-                'anthias_app:assets_duplicate', args=[asset.asset_id]
-            )
+            reverse('anthias_app:assets_duplicate', args=[asset.asset_id])
         )
 
     assert response.status_code in (200, 302)
@@ -868,6 +866,7 @@ def test_assets_duplicate_hardlinks_local_file(
             reverse('anthias_app:assets_duplicate', args=[asset.asset_id])
         )
         copy = Asset.objects.exclude(asset_id=asset.asset_id).get()
+        assert copy.uri is not None
         assert copy.uri != asset.uri
         assert copy.uri.startswith(str(assetdir))
 
@@ -922,6 +921,7 @@ def test_assets_duplicate_falls_back_to_copy_without_hardlinks(
         )
 
     copy = Asset.objects.exclude(asset_id=asset.asset_id).get()
+    assert copy.uri is not None
     with open(copy.uri, 'rb') as f:
         assert f.read() == b'png-payload'
 

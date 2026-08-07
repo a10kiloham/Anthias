@@ -153,9 +153,7 @@ def duplicate_asset(asset: Asset) -> Asset:
     new_uri = asset.uri
     if asset.uri and asset.uri.startswith(settings['assetdir']):
         ext = path.splitext(asset.uri)[1]
-        new_uri = path.join(
-            settings['assetdir'], f'{uuid.uuid4().hex}{ext}'
-        )
+        new_uri = path.join(settings['assetdir'], f'{uuid.uuid4().hex}{ext}')
         try:
             link(asset.uri, new_uri)
         except OSError:
