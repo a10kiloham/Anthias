@@ -3,6 +3,10 @@
 
 {% block title %}{% if player_name %}{{ player_name }} · {% endif %}Playlists{% endblock %}
 
+{% block extra_head %}
+<script src="{% static 'dist/js/playlists.js' %}" defer></script>
+{% endblock %}
+
 {% block main %}
 <div class="app-container">
   <div class="page-header-bar">

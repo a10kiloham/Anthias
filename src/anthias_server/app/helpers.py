@@ -1,12 +1,10 @@
 import logging
-import shutil
 import uuid
-from os import getenv, link, path, remove
+from os import getenv, path, remove
 from typing import Any
 
 import yaml
 from django.conf import settings as django_settings
-from django.db.models import F
 from django.http import HttpRequest, HttpResponse
 from django.shortcuts import render
 from django.utils import timezone
@@ -14,7 +12,9 @@ from django.utils import timezone
 from anthias_common.utils import get_video_duration
 from anthias_server.app.models import (
     Asset,
-    mirror_play_order_to_default_playlist,
+    Playlist,
+    PlaylistItem,
+    get_default_playlist,
 )
 from anthias_server.app.page_context import navbar as _navbar_context
 from anthias_server.settings import ViewerPublisher, settings
@@ -127,90 +127,61 @@ def remove_default_assets() -> None:
 
 
 class AssetDuplicationError(Exception):
-    """Raised when an asset can't be cloned (still processing, or its
-    on-disk file couldn't be linked/copied)."""
+    """Raised when an asset can't be scheduled again (still
+    processing)."""
 
 
-def duplicate_asset(asset: Asset) -> Asset:
-    """Clone ``asset`` as an independent playlist entry placed right
-    after the source, and return the new row.
+def schedule_asset_occurrence(asset: Asset) -> PlaylistItem:
+    """Add another occurrence of ``asset`` to the Default playlist,
+    directly after the asset's last occurrence there (appended at the
+    end if it has none), and return the new item.
 
-    The playlist has no item entity — the ``Asset`` row *is* the
-    playlist slot — so scheduling the same media twice means cloning
-    the row under a fresh ``asset_id``. Copies are fully independent
-    afterwards: each can carry its own duration, play window, or date
-    range, and editing one never touches the other.
-
-    When the source's file lives in ``assetdir``, the copy gets its
-    own directory entry via a hardlink (same inode, ~zero disk cost;
-    falls back to a real copy on filesystems without hardlinks). Every
-    row keeps exclusive ownership of its ``uri`` path, so
-    ``delete_asset_with_file()`` and the ``cleanup()`` orphan sweep
-    need no refcounting — the data is freed when the last link goes.
+    Supersedes the pre-playlist ``duplicate_asset()`` row clone: back
+    then the ``Asset`` row *was* the playlist slot, so scheduling the
+    same media twice meant cloning the row and hardlinking its file.
+    With first-class playlists the same asset can hold any number of
+    slots, so "duplicate" is now just another ``PlaylistItem`` — zero
+    file duplication, no hardlink/orphan-sweep machinery, and edits to
+    the asset apply to every occurrence at once.
 
     Shared by the v2 API duplicate endpoint and the HTML row action.
     """
     if asset.is_processing:
         raise AssetDuplicationError('Asset is still processing')
 
-    new_uri = asset.uri
-    if asset.uri and asset.uri.startswith(settings['assetdir']):
-        ext = path.splitext(asset.uri)[1]
-        new_uri = path.join(settings['assetdir'], f'{uuid.uuid4().hex}{ext}')
-        try:
-            link(asset.uri, new_uri)
-        except OSError:
-            try:
-                shutil.copy2(asset.uri, new_uri)
-            except OSError as exc:
-                logger.warning(
-                    'Failed to clone asset file %s: %s', asset.uri, exc
-                )
-                raise AssetDuplicationError(
-                    'Could not copy the asset file'
-                ) from exc
-
-    # Slot the copy directly after the source: shift everything below
-    # it down one. Only enabled rows carry a meaningful play_order (the
-    # home page and the viewer both order the active list by it), so a
-    # disabled source just reuses its play_order verbatim.
-    if asset.is_enabled:
-        Asset.objects.filter(
-            is_enabled=True, play_order__gt=asset.play_order
-        ).update(play_order=F('play_order') + 1)
-
-    duplicate = Asset.objects.create(
-        name=f'{asset.name} (copy)' if asset.name else None,
-        uri=new_uri,
-        md5=asset.md5,
-        start_date=asset.start_date,
-        end_date=asset.end_date,
-        duration=asset.duration,
-        mimetype=asset.mimetype,
-        is_enabled=asset.is_enabled,
-        is_processing=False,
-        nocache=asset.nocache,
-        play_order=asset.play_order + 1,
-        skip_asset_check=asset.skip_asset_check,
-        play_days=asset.play_days,
-        play_time_from=asset.play_time_from,
-        play_time_to=asset.play_time_to,
-        is_reachable=asset.is_reachable,
-        last_reachability_check=asset.last_reachability_check,
-        metadata=dict(asset.metadata or {}),
+    default = get_default_playlist()
+    items = list(default.items.order_by('position', 'id'))
+    last_occurrence_index = None
+    for index, item in enumerate(items):
+        if item.asset_id == asset.asset_id:
+            last_occurrence_index = index
+    insert_at = (
+        last_occurrence_index + 1
+        if last_occurrence_index is not None
+        else len(items)
     )
 
-    # The shift-and-insert above rewrote play_order for every enabled
-    # follower; re-sync the Default playlist's item positions so the
-    # evaluators (which read item positions, not play_order) see the
-    # copy directly after its source.
-    mirror_play_order_to_default_playlist()
+    # Renumber around the insertion point rather than shifting with an
+    # F() expression: mirror-seeded positions can carry ties, and a
+    # blind +1 shift on a tie would leave the new item's ordering to
+    # the id tiebreak instead of "directly after the source".
+    new_item = PlaylistItem.objects.create(
+        playlist=default, asset=asset, position=insert_at
+    )
+    changed = []
+    for index, item in enumerate(items):
+        target = index if index < insert_at else index + 1
+        if item.position != target:
+            item.position = target
+            changed.append(item)
+    if changed:
+        PlaylistItem.objects.bulk_update(changed, ['position'])
 
-    # Wake the viewer so an active copy joins the rotation now rather
-    # than on the next DB-mtime poll.
+    # Wake the viewer so the new occurrence joins the rotation now
+    # rather than on the next DB-mtime poll.
     ViewerPublisher.get_instance().send_to_viewer('reload')
 
-    return duplicate
+    return new_item
 
 
 def delete_asset_with_file(asset: Asset, *, nudge_viewer: bool = True) -> None:
@@ -250,3 +221,31 @@ def delete_asset_with_file(asset: Asset, *, nudge_viewer: bool = True) -> None:
     # asset is still active and advances if not.
     if nudge_viewer:
         ViewerPublisher.get_instance().send_to_viewer('reload')
+
+
+def reorder_playlist_items(playlist: Playlist, ordered_ids: list[int]) -> None:
+    """Persist an item ordering for one playlist.
+
+    ``ordered_ids`` is the desired order; every id must belong to this
+    playlist (ValueError otherwise). Items not listed keep their
+    relative order after the listed ones — so a partial list (e.g. a
+    tbody that only contains asset rows) can't silently drop slots.
+    Shared by the v2 ``POST /v2/playlists/<id>/order`` endpoint and
+    the /playlists drag-reorder form endpoint.
+    """
+    items = {item.id: item for item in playlist.items.all()}
+    unknown = [i for i in ordered_ids if i not in items]
+    if unknown:
+        raise ValueError(f'Unknown item ids for this playlist: {unknown}')
+
+    remainder = [item for item in items.values() if item.id not in ordered_ids]
+    reordered = [items[i] for i in ordered_ids] + sorted(
+        remainder, key=lambda item: (item.position, item.id)
+    )
+    changed = []
+    for position, item in enumerate(reordered):
+        if item.position != position:
+            item.position = position
+            changed.append(item)
+    if changed:
+        PlaylistItem.objects.bulk_update(changed, ['position'])

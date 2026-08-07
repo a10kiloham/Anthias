@@ -971,7 +971,7 @@ def assets_toggle(request: HttpRequest, asset_id: str) -> HttpResponse:
 def assets_duplicate(request: HttpRequest, asset_id: str) -> HttpResponse:
     from anthias_server.app.helpers import (
         AssetDuplicationError,
-        duplicate_asset,
+        schedule_asset_occurrence,
     )
     from anthias_server.app.models import Asset
 
@@ -979,8 +979,8 @@ def assets_duplicate(request: HttpRequest, asset_id: str) -> HttpResponse:
     asset = Asset.objects.filter(asset_id=asset_id).first()
     if asset is not None:
         try:
-            duplicate_asset(asset)
-            toast = ('success', 'Asset duplicated')
+            schedule_asset_occurrence(asset)
+            toast = ('success', 'Asset scheduled again')
         except AssetDuplicationError as exc:
             toast = ('error', str(exc))
     return _asset_table_response(request, toast=toast)
@@ -2302,5 +2302,33 @@ def playlist_move_item(
             changed.append(sibling)
     if changed:
         PlaylistItem.objects.bulk_update(changed, ['position'])
+    ViewerPublisher.get_instance().send_to_viewer('reload')
+    return _playlists_response(request)
+
+
+@authorized
+@require_http_methods(['POST'])
+def playlist_order(request: HttpRequest, playlist_id: str) -> HttpResponse:
+    """Persist a drag-reorder for one playlist's items — same comma-csv
+    body contract as ``assets_order``, but the ids are PlaylistItem
+    pks scoped to this playlist."""
+    from anthias_server.app.helpers import reorder_playlist_items
+    from anthias_server.app.models import Playlist
+
+    playlist = Playlist.objects.filter(playlist_id=playlist_id).first()
+    if playlist is None:
+        return _playlists_response(request)
+
+    try:
+        ordered_ids = [
+            int(chunk)
+            for chunk in request.POST.get('ids', '').split(',')
+            if chunk.strip()
+        ]
+        reorder_playlist_items(playlist, ordered_ids)
+    except ValueError:
+        return _playlists_response(
+            request, toast=('error', 'Could not save the new order')
+        )
     ViewerPublisher.get_instance().send_to_viewer('reload')
     return _playlists_response(request)

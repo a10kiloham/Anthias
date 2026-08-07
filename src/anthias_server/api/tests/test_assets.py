@@ -1436,13 +1436,18 @@ def test_create_heic_image_does_not_dispatch_on_legacy_endpoints(
 
 @pytest.mark.django_db
 @mock.patch('anthias_server.app.helpers.ViewerPublisher')
-def test_v2_duplicate_asset_returns_201_with_independent_copy(
+def test_v2_duplicate_asset_adds_occurrence_and_returns_201(
     publisher_mock: Any, api_client: APIClient
 ) -> None:
-    """POST /api/v2/assets/<id>/duplicate clones the row: fresh
-    asset_id, ``(copy)`` name suffix, slotted directly after the
-    source, and a viewer reload nudge so an active copy joins the
-    rotation immediately."""
+    """POST /api/v2/assets/<id>/duplicate schedules the asset again:
+    one more Default-playlist occurrence directly after its existing
+    one, no new Asset row, and a viewer reload nudge so the extra slot
+    joins the rotation immediately. Returns the (unchanged) asset."""
+    from anthias_server.app.models import (
+        PlaylistItem,
+        get_default_playlist,
+    )
+
     publisher_instance = mock.MagicMock()
     publisher_mock.get_instance.return_value = publisher_instance
 
@@ -1453,11 +1458,14 @@ def test_v2_duplicate_asset_returns_201_with_independent_copy(
     )
 
     assert response.status_code == status.HTTP_201_CREATED, response.data
-    assert response.data['asset_id'] != asset['asset_id']
-    assert response.data['name'] == 'Anthias (copy)'
-    assert response.data['uri'] == asset['uri']
-    assert response.data['play_order'] == asset['play_order'] + 1
-    assert len(_get_assets(api_client, 'v2')) == 2
+    assert response.data['asset_id'] == asset['asset_id']
+    assert len(_get_assets(api_client, 'v2')) == 1
+    assert (
+        PlaylistItem.objects.filter(
+            playlist=get_default_playlist(), asset_id=asset['asset_id']
+        ).count()
+        == 2
+    )
     publisher_instance.send_to_viewer.assert_called_with('reload')
 
 
@@ -1475,8 +1483,8 @@ def test_v2_duplicate_unknown_asset_returns_404(
 def test_v2_duplicate_processing_asset_returns_409(
     api_client: APIClient,
 ) -> None:
-    """A row that is mid-transcode can't be safely cloned — its file
-    is still being written — so the endpoint refuses with 409."""
+    """A mid-transcode asset shouldn't gain extra playlist slots while
+    its file is still being written — the endpoint refuses with 409."""
     from django.utils import timezone as django_timezone
 
     from anthias_server.app.models import Asset

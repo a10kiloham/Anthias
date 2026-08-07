@@ -513,8 +513,8 @@ def mirror_play_order_to_default_playlist() -> None:
 
     ``play_order`` is still what every legacy write surface speaks —
     the v1/v1.1/v1.2/v2 serializers, ``POST /assets/order``, the
-    home-page drag reorder, ``duplicate_asset()``'s shift-and-insert —
-    while the playlist evaluators read order from item positions. This
+    home-page drag reorder — while the playlist evaluators read order
+    from item positions. This
     is the single reconciliation point: asset items are permuted among
     their **existing** position slots by (play_order, current order),
     so nested-playlist items keep their exact positions and other
