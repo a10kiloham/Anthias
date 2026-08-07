@@ -1,20 +1,29 @@
 import logging
 import secrets
-from datetime import datetime, timedelta
+from datetime import datetime
 from os import path
 from typing import Any
 
 from django.utils import timezone
 
 from anthias_server.app.models import Asset
+from anthias_server.app.playlist_eval import (
+    WINDOWED_DEADLINE_CAP_SECONDS,
+    evaluate_playlist,
+)
 from anthias_server.settings import settings
 
-logger = logging.getLogger(__name__)
+# The windowed-cap constant now lives in playlist_eval (single copy for
+# both evaluators) but stays importable from here for its existing
+# consumers (tests, and any operator tooling poking the viewer).
+__all__ = [
+    'WINDOWED_DEADLINE_CAP_SECONDS',
+    'Scheduler',
+    'generate_asset_list',
+    'get_specific_asset',
+]
 
-# Re-evaluate windowed playlists at most this often. Day-of-week and
-# time-of-day boundaries don't show up in start_date/end_date, so we
-# need a polling cap to ensure transitions are picked up.
-WINDOWED_DEADLINE_CAP_SECONDS = 60
+logger = logging.getLogger(__name__)
 
 _sysrandom = secrets.SystemRandom()
 
@@ -38,83 +47,26 @@ def _asset_to_dict(asset: Asset) -> dict[str, Any]:
 def generate_asset_list() -> tuple[list[dict[str, Any]], datetime | None]:
     """Build the playlist plus a deadline for the next re-evaluation.
 
-    Active assets are filtered by Asset.is_active() (which now applies
-    day-of-week and time-of-day windows on top of the existing date
-    range and is_enabled checks). is_active() is evaluated once per
-    asset against a shared `now` so the playlist filter and deadline
-    computation always agree on activeness.
-
-    Deadline is the soonest of:
-      - any inactive asset's start_date,
-      - any active asset's end_date,
-      - now + WINDOWED_DEADLINE_CAP_SECONDS, if any asset has a window
-        filter (those transitions don't show up in date columns).
+    Filtering and deadline computation live in the shared
+    ``anthias_server.app.playlist_eval`` module (one copy for this
+    live path and the ``GET /api/v2/viewer/playlist`` shim); this
+    wrapper converts the rows to the plain dicts the viewer consumes
+    and applies the device shuffle setting.
     """
     logger.info('Generating asset-list...')
-    now = timezone.now()
 
-    candidates = list(
-        Asset.objects.filter(
-            is_enabled=True,
-            start_date__isnull=False,
-            end_date__isnull=False,
-        ).order_by('play_order')
-    )
-
-    active_flags = [a.is_active(now=now) for a in candidates]
-    playlist = [
-        _asset_to_dict(a) for a, ok in zip(candidates, active_flags) if ok
-    ]
+    active_assets, deadline = evaluate_playlist(timezone.now())
+    playlist = [_asset_to_dict(a) for a in active_assets]
 
     if settings['shuffle_playlist']:
         _sysrandom.shuffle(playlist)
 
-    deadline = _compute_deadline(candidates, active_flags, now)
     logger.debug(
         'generate_asset_list: %d assets, deadline %s',
         len(playlist),
         deadline,
     )
     return playlist, deadline
-
-
-def _compute_deadline(
-    assets: list[Asset],
-    active_flags: list[bool],
-    now: datetime,
-) -> datetime | None:
-    """Soonest future moment when the playlist might need re-evaluating.
-
-    Past boundaries are dropped so a long-ago start_date on an asset
-    that's currently inactive (e.g. blocked by its play_days filter)
-    doesn't pin the deadline to "always overdue" and cause
-    refresh_playlist() to fire on every tick.
-    """
-    candidates: list[datetime] = []
-    has_windowed = False
-
-    for asset, is_active in zip(assets, active_flags):
-        boundary = asset.end_date if is_active else asset.start_date
-        if boundary and boundary > now:
-            candidates.append(boundary)
-        # Cap only matters while the asset is in its date range — the
-        # day/time window can't change activeness before start_date or
-        # after end_date, so future/expired windowed assets should rely
-        # on their date boundary alone, not periodic polling.
-        if (
-            asset.has_window_filter()
-            and asset.start_date is not None
-            and asset.end_date is not None
-            and asset.start_date < now < asset.end_date
-        ):
-            has_windowed = True
-
-    if has_windowed:
-        candidates.append(
-            now + timedelta(seconds=WINDOWED_DEADLINE_CAP_SECONDS)
-        )
-
-    return min(candidates) if candidates else None
 
 
 class Scheduler:

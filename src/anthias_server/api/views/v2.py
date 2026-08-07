@@ -68,6 +68,7 @@ from anthias_server.app.helpers import (
     remove_default_assets,
 )
 from anthias_server.app.models import Asset
+from anthias_server.app.playlist_eval import evaluate_playlist
 from anthias_server.lib import diagnostics
 from anthias_server.lib.auth import (
     AuthSettingsError,
@@ -738,14 +739,6 @@ class DeviceSettingsViewV2(APIView):
             )
 
 
-# Re-evaluate windowed playlists at most this often. Day-of-week and
-# time-of-day boundaries don't show up in start_date/end_date, so we
-# need a polling cap to ensure transitions are picked up. Mirrors
-# ``anthias_viewer.scheduling.WINDOWED_DEADLINE_CAP_SECONDS``; once
-# the C++ viewer consumes /api/v2/viewer/playlist (Phase 3 of GH
-# #2906) the Python copy can be deleted.
-_VIEWER_WINDOWED_DEADLINE_CAP_S = 60
-
 _viewer_sysrandom = secrets.SystemRandom()
 
 
@@ -756,63 +749,16 @@ def _evaluate_viewer_playlist(
     Asset rows (so ``AssetSerializerV2`` can serialise them) instead
     of plain dicts.
 
-    Active filter and deadline computation share a single ``now`` so
-    a row can't be filtered as active here while its end_date is
-    skipped as past in the deadline pass — the two would otherwise
-    disagree across a midnight tick.
+    Filtering and deadline computation are the shared
+    ``playlist_eval.evaluate_playlist`` (one copy for this shim and
+    the live Python-viewer path); only the shuffle is applied here.
     """
-    candidates = list(
-        Asset.objects.filter(
-            is_enabled=True,
-            start_date__isnull=False,
-            end_date__isnull=False,
-        ).order_by('play_order')
-    )
-
-    active_flags = [a.is_active(now=now) for a in candidates]
-    active_assets = [a for a, ok in zip(candidates, active_flags) if ok]
+    active_assets, deadline = evaluate_playlist(now)
 
     if settings['shuffle_playlist']:
         _viewer_sysrandom.shuffle(active_assets)
 
-    deadline = _compute_viewer_deadline(candidates, active_flags, now)
     return active_assets, deadline
-
-
-def _compute_viewer_deadline(
-    assets: list[Asset],
-    active_flags: list[bool],
-    now: datetime,
-) -> datetime | None:
-    """Soonest future moment when the playlist might need refetching.
-
-    Mirrors ``anthias_viewer.scheduling._compute_deadline``: past
-    boundaries are dropped so a long-ago start_date on a window-
-    blocked asset doesn't pin the deadline to "always overdue", and
-    the windowed cap only applies while the asset is in its date
-    range (the window can't toggle activeness outside of it).
-    """
-    candidates: list[datetime] = []
-    has_windowed = False
-
-    for asset, is_active in zip(assets, active_flags):
-        boundary = asset.end_date if is_active else asset.start_date
-        if boundary and boundary > now:
-            candidates.append(boundary)
-        if (
-            asset.has_window_filter()
-            and asset.start_date is not None
-            and asset.end_date is not None
-            and asset.start_date < now < asset.end_date
-        ):
-            has_windowed = True
-
-    if has_windowed:
-        candidates.append(
-            now + timedelta(seconds=_VIEWER_WINDOWED_DEADLINE_CAP_S)
-        )
-
-    return min(candidates) if candidates else None
 
 
 class ViewerPlaylistViewV2(APIView):
