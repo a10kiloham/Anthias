@@ -101,6 +101,11 @@ urlpatterns = [
         name='playlist_move_item',
     ),
     path(
+        'playlists/<str:playlist_id>/order/',
+        views.playlist_order,
+        name='playlist_order',
+    ),
+    path(
         'review-cta/dismiss/',
         views.review_cta_dismiss,
         name='review_cta_dismiss',

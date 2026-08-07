@@ -173,10 +173,11 @@
 
   {% if node.entries %}
   <table class="asset-table">
-    <tbody>
+    <tbody data-order-url="{% url 'anthias_app:playlist_order' node.playlist.playlist_id %}">
       {% for entry in node.entries %}
-      <tr>
+      <tr data-item-id="{{ entry.item.id }}">
         <td>
+          <i class="ti ti-grip-vertical drag-handle" title="Drag to reorder"></i>
           {% if entry.asset %}
           <span class="asset-cell-name__icon">
             {% if entry.asset.mimetype == 'image' %}<i class="ti ti-photo"></i>

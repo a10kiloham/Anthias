@@ -70,8 +70,9 @@ from anthias_server.api.views.mixins import (
 from anthias_server.app.helpers import (
     AssetDuplicationError,
     add_default_assets,
-    duplicate_asset,
     remove_default_assets,
+    reorder_playlist_items,
+    schedule_asset_occurrence,
 )
 from anthias_server.app.models import (
     Asset,
@@ -469,24 +470,27 @@ class AssetViewV2(APIView, DeleteAssetViewMixin):
 
 
 class AssetDuplicateViewV2(APIView):
-    """Clone an asset into an independent playlist entry.
+    """Schedule an asset a second time.
 
-    The playlist has no item entity — the Asset row *is* the playlist
-    slot — so scheduling the same media twice means cloning the row.
-    See ``app.helpers.duplicate_asset`` for the file-ownership
-    (hardlink) and play-order semantics.
+    Playlists are first-class now, so "duplicate" no longer clones the
+    row and hardlinks its file — it adds another occurrence
+    (``PlaylistItem``) of the same asset to the Default playlist,
+    directly after its existing occurrence. See
+    ``app.helpers.schedule_asset_occurrence``.
     """
 
     serializer_class = AssetSerializerV2
 
     @extend_schema(
-        summary='Duplicate asset',
+        summary='Schedule asset again (duplicate)',
         description=(
-            'Creates an independent copy of the asset, inserted into '
-            'the playlist directly after the source. The copy has its '
-            'own asset_id and can be scheduled, reordered, edited, and '
-            'deleted separately. Returns 409 while the source asset is '
-            'still processing.'
+            'Adds another playlist occurrence of the asset to the '
+            'Default playlist, directly after its existing '
+            'occurrence, and returns the asset. No copy is made: the '
+            'same asset simply holds two playlist slots, and edits to '
+            'it apply to both. Reorder or remove the occurrence via '
+            'the /v2/playlists endpoints. Returns 409 while the asset '
+            'is still processing.'
         ),
         request=None,
         responses={201: AssetSerializerV2, 404: None, 409: None},
@@ -495,13 +499,13 @@ class AssetDuplicateViewV2(APIView):
     def post(self, request: Request, asset_id: str) -> Response:
         asset = get_object_or_404(Asset, asset_id=asset_id)
         try:
-            duplicate = duplicate_asset(asset)
+            schedule_asset_occurrence(asset)
         except AssetDuplicationError as error:
             return Response(
                 {'error': str(error)}, status=status.HTTP_409_CONFLICT
             )
         return Response(
-            AssetSerializerV2(duplicate).data,
+            AssetSerializerV2(asset).data,
             status=status.HTTP_201_CREATED,
         )
 
@@ -1646,25 +1650,9 @@ class PlaylistItemsOrderViewV2(APIView):
                 {'ids': 'ids must be a comma-separated list of item ids.'}
             ) from None
 
-        items = {item.id: item for item in playlist.items.all()}
-        unknown = [i for i in ordered_ids if i not in items]
-        if unknown:
-            raise ValidationError(
-                {'ids': f'Unknown item ids for this playlist: {unknown}'}
-            )
-
-        remainder = [
-            item for item in items.values() if item.id not in ordered_ids
-        ]
-        reordered = [items[i] for i in ordered_ids] + sorted(
-            remainder, key=lambda item: (item.position, item.id)
-        )
-        changed = []
-        for position, item in enumerate(reordered):
-            if item.position != position:
-                item.position = position
-                changed.append(item)
-        if changed:
-            PlaylistItem.objects.bulk_update(changed, ['position'])
+        try:
+            reorder_playlist_items(playlist, ordered_ids)
+        except ValueError as error:
+            raise ValidationError({'ids': str(error)}) from None
         _nudge_viewer()
         return Response(status=status.HTTP_204_NO_CONTENT)

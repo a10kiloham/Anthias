@@ -256,3 +256,53 @@ def test_nested_playlist_renders_recursively(client: Client) -> None:
     assert b'OuterList' in response.content
     assert b'InnerList' in response.content
     assert b'deep-asset' in response.content
+
+
+@pytest.mark.django_db
+def test_playlist_order_endpoint_reorders_items(client: Client) -> None:
+    """The drag handler POSTs the tbody's item-id sequence as a comma
+    CSV — same contract as the home page's assets_order."""
+    a, b, c = (_make_asset(i) for i in ('a', 'b', 'c'))
+    playlist = Playlist.objects.create(name='p')
+    items = [
+        PlaylistItem.objects.create(
+            playlist=playlist, asset=asset, position=index
+        )
+        for index, asset in enumerate((a, b, c))
+    ]
+
+    response = _hx(
+        client,
+        reverse('anthias_app:playlist_order', args=[playlist.playlist_id]),
+        {'ids': f'{items[2].id},{items[0].id},{items[1].id}'},
+    )
+    assert response.status_code == 200
+    ordered = list(
+        playlist.items.order_by('position', 'id').values_list(
+            'asset_id', flat=True
+        )
+    )
+    assert ordered == ['c', 'a', 'b']
+
+
+@pytest.mark.django_db
+def test_playlist_order_endpoint_rejects_foreign_ids(
+    client: Client,
+) -> None:
+    asset = _make_asset('a')
+    mine = Playlist.objects.create(name='mine')
+    other = Playlist.objects.create(name='other')
+    foreign = PlaylistItem.objects.create(
+        playlist=other, asset=asset, position=0
+    )
+    own = PlaylistItem.objects.create(playlist=mine, asset=asset, position=0)
+
+    _hx(
+        client,
+        reverse('anthias_app:playlist_order', args=[mine.playlist_id]),
+        {'ids': str(foreign.id)},
+    )
+    own.refresh_from_db()
+    foreign.refresh_from_db()
+    assert own.position == 0
+    assert foreign.position == 0
