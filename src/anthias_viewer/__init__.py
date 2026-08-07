@@ -61,11 +61,11 @@ from anthias_common.utils import (
     string_to_bool,
 )
 from anthias_server.app.models import (
-    Asset,
     clamp_duration,
     clamp_refresh_interval,
     normalize_asset_headers,
 )
+from anthias_server.app.playlist_eval import evaluate_playlist
 from anthias_server.django_project.settings import (
     resolve_time_zone,
 )
@@ -2189,14 +2189,24 @@ def _skip_if_current_asset_inactive() -> None:
     if not current_id:
         return
     try:
-        asset = Asset.objects.filter(asset_id=current_id).first()
+        # Evaluate through the playlist expansion, not the bare
+        # Asset.is_active(): an asset can be active in its own right
+        # while every occurrence of it is gated by a disabled or
+        # off-window ancestor playlist (or it was just removed from
+        # its last playlist) — and that mutation should clear the
+        # screen just like deactivating the asset itself.
+        occurrences, _ = evaluate_playlist()
+        still_playable = any(
+            occurrence.asset.asset_id == current_id
+            for occurrence in occurrences
+        )
     except Exception:
         logger.exception(
             'reload: failed to check current asset %s; skipping skip-decision',
             current_id,
         )
         return
-    if asset is None or not asset.is_active():
+    if not still_playable:
         logger.info(
             'Current asset %s is no longer active; signalling skip',
             current_id,
