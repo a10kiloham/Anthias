@@ -357,3 +357,96 @@ def integrations() -> dict[str, Any]:
             }
         )
     return data
+
+
+def playlists() -> dict[str, Any]:
+    """Playlist tree + pickers for /playlists/.
+
+    Mirrors ``playlist_eval.expand_occurrences``'s two-query walk (all
+    playlists, all items) but keeps the tree shape instead of
+    flattening: the page renders containers, not the play sequence.
+    Depth guard matches MAX_PLAYLIST_DEPTH so a hand-edited DB renders
+    a truncated tree instead of recursing without bound.
+    """
+    from anthias_server.app.models import (
+        MAX_PLAYLIST_DEPTH,
+        Asset,
+        Playlist,
+        PlaylistItem,
+    )
+
+    all_playlists = {p.playlist_id: p for p in Playlist.objects.all()}
+    items_by_playlist: dict[str, list[PlaylistItem]] = {}
+    for item in PlaylistItem.objects.select_related('asset').order_by(
+        'position', 'id'
+    ):
+        items_by_playlist.setdefault(item.playlist_id, []).append(item)
+
+    child_ids = {
+        item.child_playlist_id
+        for items in items_by_playlist.values()
+        for item in items
+        if item.child_playlist_id is not None
+    }
+    roots = sorted(
+        (p for p in all_playlists.values() if p.playlist_id not in child_ids),
+        # Default first, then operator order.
+        key=lambda p: (not p.is_default, p.position, p.playlist_id),
+    )
+
+    def build_node(playlist: Any, depth: int) -> dict[str, Any]:
+        entries: list[dict[str, Any]] = []
+        for item in items_by_playlist.get(playlist.playlist_id, []):
+            if item.asset is not None:
+                entries.append(
+                    {'item': item, 'asset': item.asset, 'child': None}
+                )
+            elif (
+                item.child_playlist_id in all_playlists
+                and depth + 1 < MAX_PLAYLIST_DEPTH
+            ):
+                entries.append(
+                    {
+                        'item': item,
+                        'asset': None,
+                        'child': build_node(
+                            all_playlists[item.child_playlist_id],
+                            depth + 1,
+                        ),
+                    }
+                )
+        return {
+            'playlist': playlist,
+            'entries': entries,
+            'depth': depth,
+            'can_nest': depth + 1 < MAX_PLAYLIST_DEPTH,
+        }
+
+    return {
+        'playlist_tree': [build_node(p, 0) for p in roots],
+        # Pickers: any asset can be added anywhere (occurrences are
+        # M:N); only parentless, non-default playlists can be nested
+        # (the server re-validates ancestry on submit).
+        'all_assets': sorted(
+            Asset.objects.all(), key=lambda a: (a.name or '').lower()
+        ),
+        'nestable_playlists': sorted(
+            (
+                p
+                for p in all_playlists.values()
+                if not p.is_default and p.playlist_id not in child_ids
+            ),
+            key=lambda p: (p.name or '').lower(),
+        ),
+        # ISO weekday numbering (1=Mon..7=Sun), matching
+        # Asset/Playlist.play_days semantics.
+        'week_days': [
+            (1, 'Mon'),
+            (2, 'Tue'),
+            (3, 'Wed'),
+            (4, 'Thu'),
+            (5, 'Fri'),
+            (6, 'Sat'),
+            (7, 'Sun'),
+        ],
+    }

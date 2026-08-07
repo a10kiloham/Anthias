@@ -1,0 +1,23 @@
+{% comment %} Playlist tree partial. Mirrors _asset_table.html's
+   contract: the wrapper carries id="playlist-tree" plus the hx-get /
+   hx-trigger pair for the background poll and the refresh event, and
+   every write endpoint swaps it with hx-swap="outerHTML" so polling
+   survives the swap.
+{% endcomment %}
+<div
+  id="playlist-tree"
+  hx-get="{% url 'anthias_app:playlists_tree' %}"
+  hx-trigger="every 10s, refresh-assets from:body"
+  hx-swap="outerHTML"
+  class="flex flex-col gap-4"
+>
+  {% for node in playlist_tree %}
+    {% include "_playlist_card.html" with node=node %}
+  {% empty %}
+  <section class="surface">
+    <header class="surface__header">
+      <h2>No playlists yet</h2>
+    </header>
+  </section>
+  {% endfor %}
+</div>
