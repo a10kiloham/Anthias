@@ -8,7 +8,10 @@ from rest_framework.views import exception_handler
 
 from anthias_common.remote_video import dispatch_remote_video_download
 from anthias_common.youtube import dispatch_download
-from anthias_server.app.models import Asset
+from anthias_server.app.models import (
+    Asset,
+    mirror_play_order_to_default_playlist,
+)
 from anthias_server.processing import dispatch_pending_normalize
 from anthias_server.settings import ViewerPublisher
 
@@ -116,13 +119,32 @@ def get_active_asset_ids() -> list[str]:
         is_enabled=True,
         start_date__isnull=False,
         end_date__isnull=False,
-    )
+    ).order_by('play_order')
     return [asset.asset_id for asset in enabled_assets if asset.is_active()]
 
 
 def save_active_assets_ordering(active_asset_ids: list[str]) -> None:
+    """Persist a flat active-asset ordering.
+
+    Two writes, kept in lockstep:
+
+    - ``Asset.play_order`` — the legacy per-asset column every
+      v1/v1.1/v1.2/v2 serializer still reports, and the tiebreak for
+      assets outside any playlist.
+    - The **Default playlist's** item positions — where the playlist
+      evaluators actually read order from. The flat reorder surfaces
+      (home-page drag, ``POST /assets/order``) predate playlists and
+      carry bare asset ids, so their scope is pinned to the Default
+      playlist: items whose asset is listed are permuted among their
+      existing position slots, and everything else (disabled assets'
+      items, nested-playlist items, other playlists) stays where it
+      is. Reordering a named playlist goes through the v2 playlist
+      endpoints instead.
+    """
     for i, asset_id in enumerate(active_asset_ids):
         Asset.objects.filter(asset_id=asset_id).update(play_order=i)
+
+    mirror_play_order_to_default_playlist()
 
 
 def finalize_asset_update(asset: Asset) -> None:

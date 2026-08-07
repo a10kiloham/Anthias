@@ -1,3 +1,4 @@
+import json
 from datetime import UTC
 from typing import Any, ClassVar
 
@@ -26,6 +27,8 @@ from anthias_server.app.models import (
     MAX_ASSET_HEADERS,
     REFRESH_INTERVAL_S_MAX,
     Asset,
+    Playlist,
+    PlaylistItem,
     clamp_refresh_interval,
     normalize_asset_headers,
     validate_asset_headers,
@@ -122,6 +125,47 @@ def _validate_time_window(
                     'play_time_from and play_time_to must be set together.'
                 )
             }
+        )
+    return attrs
+
+
+def _validate_playlist_window(
+    attrs: dict[str, Any],
+    instance: Any = None,
+) -> dict[str, Any]:
+    """Playlist-flavoured window validation.
+
+    Same both-or-neither rule for the time-of-day pair as assets
+    (``_validate_time_window``), plus a start<end sanity check for the
+    optional date bounds — unlike assets, playlist dates can each be
+    null (= unbounded), so only an actually-inverted pair is an error.
+    Checks the post-update state so PATCHes that touch one field see
+    the merged result.
+    """
+
+    def resolve(field: str) -> Any:
+        if field in attrs:
+            return attrs[field]
+        if instance is not None:
+            return getattr(instance, field, None)
+        return None
+
+    has_from = resolve('play_time_from') is not None
+    has_to = resolve('play_time_to') is not None
+    if has_from != has_to:
+        raise serializers.ValidationError(
+            {
+                'play_time_to' if has_from else 'play_time_from': (
+                    'play_time_from and play_time_to must be set together.'
+                )
+            }
+        )
+
+    start = resolve('start_date')
+    end = resolve('end_date')
+    if start is not None and end is not None and start >= end:
+        raise serializers.ValidationError(
+            {'end_date': 'end_date must be after start_date.'}
         )
     return attrs
 
@@ -548,3 +592,128 @@ class ImportItemSerializerV2(Serializer[Any]):
     token = CharField(write_only=True)
     remote_id = CharField()
     enable = BooleanField(required=False, default=True)
+
+
+class PlaylistItemSerializerV2(ModelSerializer[PlaylistItem]):
+    """One slot in a playlist: exactly one of ``asset_id`` /
+    ``child_playlist_id`` is non-null."""
+
+    asset_id = SerializerMethodField()
+    child_playlist_id = SerializerMethodField()
+
+    @extend_schema_field(OpenApiTypes.STR)
+    def get_asset_id(self, obj: PlaylistItem) -> str | None:
+        return obj.asset_id
+
+    @extend_schema_field(OpenApiTypes.STR)
+    def get_child_playlist_id(self, obj: PlaylistItem) -> str | None:
+        return obj.child_playlist_id
+
+    class Meta:
+        model = PlaylistItem
+        fields: ClassVar = [
+            'id',
+            'position',
+            'asset_id',
+            'child_playlist_id',
+        ]
+        read_only_fields: ClassVar = ['id', 'position']
+
+
+class PlaylistSerializerV2(ModelSerializer[Playlist]):
+    play_days = SerializerMethodField()
+    parent_id = SerializerMethodField()
+    items = PlaylistItemSerializerV2(many=True, read_only=True)
+
+    @extend_schema_field({'type': 'array', 'items': {'type': 'integer'}})
+    def get_play_days(self, obj: Playlist) -> list[int]:
+        return obj.get_play_days()
+
+    @extend_schema_field(OpenApiTypes.STR)
+    def get_parent_id(self, obj: Playlist) -> str | None:
+        # OneToOne reverse: absent attribute means "root playlist".
+        parent_item = getattr(obj, 'parent_item', None)
+        return parent_item.playlist_id if parent_item else None
+
+    class Meta:
+        model = Playlist
+        fields: ClassVar = [
+            'playlist_id',
+            'name',
+            'is_enabled',
+            'repeat',
+            'is_default',
+            'position',
+            'start_date',
+            'end_date',
+            'play_days',
+            'play_time_from',
+            'play_time_to',
+            'parent_id',
+            'items',
+        ]
+        read_only_fields: ClassVar = ['is_default']
+
+
+class CreatePlaylistSerializerV2(Serializer[Any]):
+    """POST /v2/playlists body. New playlists are roots; nest them by
+    adding a child-playlist item to the intended parent afterwards."""
+
+    name = CharField()
+    is_enabled = BooleanField(required=False, default=True)
+    # Playlists repeat (loop) by default; repeat=False plays the
+    # content through once per activation window.
+    repeat = BooleanField(required=False, default=True)
+    start_date = DateTimeField(
+        default_timezone=UTC, required=False, allow_null=True
+    )
+    end_date = DateTimeField(
+        default_timezone=UTC, required=False, allow_null=True
+    )
+    play_days = ListField(
+        child=IntegerField(min_value=1, max_value=7),
+        required=False,
+    )
+    play_time_from = TimeField(required=False, allow_null=True)
+    play_time_to = TimeField(required=False, allow_null=True)
+
+    def validate_play_days(self, value: Any) -> str:
+        # The model column is JSON text (matching Asset.play_days);
+        # normalise then stringify so Playlist.objects.create(**data)
+        # stores the canonical representation.
+        return json.dumps(_normalise_play_days(value))
+
+    def validate(self, data: dict[str, Any]) -> dict[str, Any]:
+        return _validate_playlist_window(data)
+
+
+class UpdatePlaylistSerializerV2(CreatePlaylistSerializerV2):
+    """PATCH /v2/playlists/<id> body: everything optional. ``position``
+    reorders the playlist among the root playlists."""
+
+    name = CharField(required=False)
+    is_enabled = BooleanField(required=False)
+    repeat = BooleanField(required=False)
+    position = IntegerField(required=False)
+
+    def validate(self, data: dict[str, Any]) -> dict[str, Any]:
+        return _validate_playlist_window(data, self.instance)
+
+
+class CreatePlaylistItemSerializerV2(Serializer[dict[str, Any]]):
+    """POST /v2/playlists/<id>/items body: exactly one of ``asset_id``
+    / ``child_playlist_id``. Optional ``position`` inserts at that slot
+    (default: append)."""
+
+    asset_id = CharField(required=False, allow_null=True)
+    child_playlist_id = CharField(required=False, allow_null=True)
+    position = IntegerField(required=False, allow_null=True)
+
+    def validate(self, data: dict[str, Any]) -> dict[str, Any]:
+        has_asset = data.get('asset_id') is not None
+        has_child = data.get('child_playlist_id') is not None
+        if has_asset == has_child:
+            raise serializers.ValidationError(
+                'Provide exactly one of asset_id or child_playlist_id.'
+            )
+        return data

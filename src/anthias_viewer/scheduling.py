@@ -9,6 +9,7 @@ from django.utils import timezone
 from anthias_server.app.models import Asset
 from anthias_server.app.playlist_eval import (
     WINDOWED_DEADLINE_CAP_SECONDS,
+    Occurrence,
     evaluate_playlist,
 )
 from anthias_server.settings import settings
@@ -44,25 +45,39 @@ def _asset_to_dict(asset: Asset) -> dict[str, Any]:
     }
 
 
+def _occurrence_to_dict(occurrence: Occurrence) -> dict[str, Any]:
+    """The plain dict the viewer consumes: the asset's fields plus the
+    occurrence identity and the repeat-once bookkeeping keys.
+
+    ``occurrence_id`` (not ``asset_id``) is the playlist-slot identity:
+    the same asset can appear several times in the flattened list, and
+    the shuffle membership guard needs to tell those slots apart.
+    """
+    result = _asset_to_dict(occurrence.asset)
+    result['occurrence_id'] = occurrence.occurrence_id
+    result['no_repeat_playlist_ids'] = occurrence.no_repeat_playlist_ids
+    return result
+
+
 def generate_asset_list() -> tuple[list[dict[str, Any]], datetime | None]:
     """Build the playlist plus a deadline for the next re-evaluation.
 
-    Filtering and deadline computation live in the shared
+    Expansion, filtering and deadline computation live in the shared
     ``anthias_server.app.playlist_eval`` module (one copy for this
     live path and the ``GET /api/v2/viewer/playlist`` shim); this
-    wrapper converts the rows to the plain dicts the viewer consumes
-    and applies the device shuffle setting.
+    wrapper converts the occurrences to the plain dicts the viewer
+    consumes and applies the device shuffle setting.
     """
     logger.info('Generating asset-list...')
 
-    active_assets, deadline = evaluate_playlist(timezone.now())
-    playlist = [_asset_to_dict(a) for a in active_assets]
+    occurrences, deadline = evaluate_playlist(timezone.now())
+    playlist = [_occurrence_to_dict(o) for o in occurrences]
 
     if settings['shuffle_playlist']:
         _sysrandom.shuffle(playlist)
 
     logger.debug(
-        'generate_asset_list: %d assets, deadline %s',
+        'generate_asset_list: %d occurrences, deadline %s',
         len(playlist),
         deadline,
     )
@@ -80,7 +95,31 @@ class Scheduler:
         self.index: int = 0
         self.reverse: bool = False
         self.last_update_db_mtime: float = 0
+        # Play-once bookkeeping for repeat=False playlists. Runtime
+        # state, deliberately not persisted: a viewer restart starts a
+        # fresh play-through, matching how shuffle order and playlist
+        # position already reset. Keyed by playlist_id; values are
+        # occurrence_ids already shown (``_played``) and the full
+        # occurrence membership of that playlist in the current
+        # evaluated list (``_members`` — the reset detector).
+        self._played: dict[str, set[str]] = {}
+        self._members: dict[str, set[str]] = {}
         self.update_playlist()
+
+    def _occurrence_played_out(self, asset: dict[str, Any]) -> bool:
+        """True if this occurrence sits under a repeat=False playlist
+        and has already been shown in the current play-through."""
+        return any(
+            asset.get('occurrence_id') in self._played.get(playlist_id, ())
+            for playlist_id in asset.get('no_repeat_playlist_ids') or ()
+        )
+
+    def _mark_played(self, asset: dict[str, Any]) -> None:
+        occurrence_id = asset.get('occurrence_id')
+        if occurrence_id is None:
+            return
+        for playlist_id in asset.get('no_repeat_playlist_ids') or ():
+            self._played.setdefault(playlist_id, set()).add(occurrence_id)
 
     def get_next_asset(self) -> dict[str, Any] | None:
         logger.debug('get_next_asset')
@@ -107,13 +146,37 @@ class Scheduler:
         if not self.assets:
             self.current_asset_id = None
             return None
-        if self.reverse:
-            idx = (self.index - 2) % len(self.assets)
-            self.index = (self.index - 1) % len(self.assets)
-            self.reverse = False
-        else:
-            idx = self.index
-            self.index = (self.index + 1) % len(self.assets)
+
+        # Walk at most one full cycle looking for an occurrence that
+        # hasn't played out its repeat=False budget. Everything played
+        # out -> blank screen until an activation flip or a DB edit
+        # resets the play-once state — that IS the semantics of a
+        # non-repeating playlist with nothing else scheduled.
+        current_asset: dict[str, Any] | None = None
+        for _ in range(len(self.assets)):
+            if self.reverse:
+                idx = (self.index - 2) % len(self.assets)
+                self.index = (self.index - 1) % len(self.assets)
+                self.reverse = False
+            else:
+                idx = self.index
+                self.index = (self.index + 1) % len(self.assets)
+
+            if settings['shuffle_playlist'] and self.index == 0:
+                self.counter += 1
+
+            candidate = self.assets[idx]
+            if not self._occurrence_played_out(candidate):
+                current_asset = candidate
+                break
+
+        if current_asset is None:
+            logger.debug(
+                'get_next_asset: all occurrences played out '
+                '(repeat=False playlists exhausted)'
+            )
+            self.current_asset_id = None
+            return None
 
         logger.debug(
             'get_next_asset counter %s returning asset %s of %s',
@@ -122,10 +185,7 @@ class Scheduler:
             len(self.assets),
         )
 
-        if settings['shuffle_playlist'] and self.index == 0:
-            self.counter += 1
-
-        current_asset = self.assets[idx]
+        self._mark_played(current_asset)
         self.current_asset_id = current_asset.get('asset_id')
         return current_asset
 
@@ -154,6 +214,7 @@ class Scheduler:
         logger.debug('update_playlist')
         self.last_update_db_mtime = self.get_db_mtime()
         (new_assets, new_deadline) = generate_asset_list()
+        self._sync_play_once_state(new_assets)
 
         if settings['shuffle_playlist'] and not allow_reshuffle:
             # generate_asset_list() reshuffles on every call, so list
@@ -161,15 +222,19 @@ class Scheduler:
             # whenever the cap-driven refresh fires (~60s for windowed
             # assets). Compare by membership only here; legitimate
             # reshuffles (end-of-cycle, counter >= 5) opt in via
-            # allow_reshuffle.
-            current_ids = sorted(a['asset_id'] for a in self.assets)
-            new_ids = sorted(a['asset_id'] for a in new_assets)
+            # allow_reshuffle. Keyed on occurrence_id, not asset_id:
+            # the same asset can hold several slots in the flattened
+            # playlist, and each slot is its own membership entry.
+            current_ids = sorted(a['occurrence_id'] for a in self.assets)
+            new_ids = sorted(a['occurrence_id'] for a in new_assets)
             if current_ids == new_ids:
                 # Membership unchanged: preserve current order, but
                 # refresh each dict so DB-driven field edits (duration,
                 # uri, etc.) take effect on the next get_next_asset().
-                new_by_id = {a['asset_id']: a for a in new_assets}
-                self.assets = [new_by_id[a['asset_id']] for a in self.assets]
+                new_by_id = {a['occurrence_id']: a for a in new_assets}
+                self.assets = [
+                    new_by_id[a['occurrence_id']] for a in self.assets
+                ]
                 self.deadline = new_deadline
                 return
         elif new_assets == self.assets and new_deadline == self.deadline:
@@ -190,6 +255,32 @@ class Scheduler:
             self.index,
             self.deadline,
         )
+
+    def _sync_play_once_state(self, new_assets: list[dict[str, Any]]) -> None:
+        """Reset play-once bookkeeping where it no longer applies.
+
+        A repeat=False playlist's ``_played`` set survives ordinary
+        refreshes (a 60s cap tick must not restart a finished
+        play-through) and resets when:
+
+          - its occurrence membership changes (operator edited the
+            playlist — a new play-through with the new content), or
+          - it leaves the evaluated list entirely (its activation
+            window closed — the next window starts a fresh
+            play-through).
+        """
+        new_members: dict[str, set[str]] = {}
+        for asset in new_assets:
+            occurrence_id = asset.get('occurrence_id')
+            if occurrence_id is None:
+                continue
+            for playlist_id in asset.get('no_repeat_playlist_ids') or ():
+                new_members.setdefault(playlist_id, set()).add(occurrence_id)
+
+        for playlist_id in list(self._played):
+            if new_members.get(playlist_id) != self._members.get(playlist_id):
+                del self._played[playlist_id]
+        self._members = new_members
 
     def get_db_mtime(self) -> float:
         # Newest mtime across the SQLite database and its WAL sidecars.
