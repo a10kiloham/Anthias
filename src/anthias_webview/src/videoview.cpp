@@ -1038,6 +1038,12 @@ gboolean anthias_gst_audio_bus(GstBus* /*bus*/, GstMessage* message,
 {
     auto* view = static_cast<VideoView*>(user_data);
     switch (GST_MESSAGE_TYPE(message)) {
+    case GST_MESSAGE_ASYNC_DONE:
+        view->gstArmAudioSegment();
+        break;
+    case GST_MESSAGE_SEGMENT_DONE:
+        view->gstAudioSegmentDone();
+        break;
     case GST_MESSAGE_EOS:
         view->gstLoopAudio();
         break;
@@ -1065,7 +1071,24 @@ gboolean anthias_gst_bus_loop(GstBus* /*bus*/, GstMessage* message,
 {
     auto* view = static_cast<VideoView*>(user_data);
     switch (GST_MESSAGE_TYPE(message)) {
+    case GST_MESSAGE_ASYNC_DONE:
+        // Preroll complete: only now can a segment seek succeed. Enter
+        // segment mode here (once) rather than right after set_state, where
+        // the pipeline is still prerolling and the seek is rejected. Arming
+        // latches only on a successful seek, so an early ASYNC_DONE from a
+        // child bin just retries on the pipeline's own ASYNC_DONE.
+        view->gstArmVideoSegment();
+        break;
+    case GST_MESSAGE_SEGMENT_DONE:
+        // Reduced-seam loop: re-arm the segment without flushing so the HW
+        // decoder is not fully torn down. On the bcm2835 v4l2 decoder this
+        // roughly halves the loop-point drop vs the flushing restart
+        // (measured ~0.2s -> ~0.1s on real pi3-64; not fully gapless).
+        view->gstVideoSegmentDone();
+        break;
     case GST_MESSAGE_EOS:
+        // Fallback if the pipeline delivered EOS instead of SEGMENT_DONE
+        // (segment seek unsupported); flushing restart, small seam.
         view->gstRestartLoop();
         break;
     case GST_MESSAGE_QOS: {
@@ -1342,19 +1365,34 @@ bool VideoView::gstPlayOverlay(const QString& uri)
     // froze the VIDEO at the first frame). Keeping it independent means
     // this overlay chain stays byte-for-byte the proven 30 fps path and
     // can never be stalled by audio.
+    // pi3-64: the vc4 overlay plane can HW-rotate 0°/180° — a free
+    // scanout-time transform (measured: full 30 fps at ~7% CPU, no
+    // thermal cost, unlike a software videoflip which collapses under
+    // throttling). eglfs rotates the UI plane via QT_QPA_EGLFS_ROTATION
+    // but NOT this independent overlay plane, so at 180° the plane must
+    // rotate itself to match the UI (forum 6730). The Python side only
+    // routes 0°/180° to the overlay (90°/270° have no HW plane rotation
+    // and take the raster path), so the only non-zero value seen here is
+    // 180 → DRM_MODE_ROTATE_180 (0x4).
+    const QString planeProps =
+        (qgetenv("QT_QPA_EGLFS_ROTATION") == "180")
+            ? QStringLiteral(" plane-properties=props,rotation=%1")
+                  .arg(DRM_MODE_ROTATE_180)
+            : QString();
     const QString description =
         QStringLiteral(
             "filesrc location=\"%1\" ! qtdemux ! h264parse ! %7 ! "
             "queue max-size-buffers=%5 max-size-time=0 max-size-bytes=0 ! "
             "%6"
-            "kmssink name=vsink qos=true fd=%2 connector-id=%3 plane-id=%4 "
+            "kmssink name=vsink qos=true fd=%2 connector-id=%3 plane-id=%4%8 "
             "force-modesetting=false can-scale=true skip-vsync=true")
             .arg(location)
             .arg(driFd)
             .arg(connId)
             .arg(planeId)
             .arg(queueBuffers)
-            .arg(convertStage, decodeStage);
+            .arg(convertStage, decodeStage)
+            .arg(planeProps);
 
     GError* error = nullptr;
     gstPipeline = gst_parse_launch(description.toUtf8().constData(), &error);
@@ -1409,6 +1447,9 @@ bool VideoView::gstPlayOverlay(const QString& uri)
         rasterWidget->clear();
     }
     gstOverlayActive = true;
+    // Segment mode (for reduced-seam looping) is entered from the
+    // ASYNC_DONE bus message once the pipeline has prerolled — a seek issued
+    // here, right after set_state(PLAYING), races preroll and is rejected.
     writeStats(
         QStringLiteral("INIT"),
         QStringLiteral(
@@ -1481,6 +1522,8 @@ void VideoView::gstStartAudio(const QString& location, const QString& alsaDev)
         gstStopAudio();
         return;
     }
+    // Match the video: segment mode is entered from the audio pipeline's
+    // ASYNC_DONE (see gstArmAudioSegment) so audio loops the same way.
     writeStats(QStringLiteral("AUDIO"),
                QStringLiteral("started sink=%1 device=%2")
                    .arg(audioSink,
@@ -1527,6 +1570,7 @@ void VideoView::gstStopAudio()
     gst_element_set_state(gstAudioPipeline, GST_STATE_NULL);
     gst_object_unref(gstAudioPipeline);
     gstAudioPipeline = nullptr;
+    gstAudioSegmentArmed = false;
 }
 
 void VideoView::gstStop()
@@ -1543,6 +1587,7 @@ void VideoView::gstStop()
         }
     }
     gstOverlayActive = false;
+    gstSegmentArmed = false;
     if (gstAppSink) {
         gst_object_unref(gstAppSink);
         gstAppSink = nullptr;
@@ -1618,6 +1663,81 @@ void VideoView::gstRestartLoop()
     // Re-seek audio to the top too so it re-aligns with the video every
     // loop (the two pipelines otherwise drift on their own clocks).
     gstLoopAudio();
+}
+
+bool VideoView::gstSegmentSeek(GstElement* pipe, bool flush)
+{
+    if (!pipe) {
+        return false;
+    }
+    // A SEGMENT seek makes the pipeline post SEGMENT_DONE (not EOS) at the
+    // end; re-arming it there WITHOUT flushing loops the clip without a full
+    // decoder teardown, which roughly halves the loop-point frame drop on
+    // the bcm2835 v4l2 decoder (~0.2s flushing restart -> ~0.1s; the
+    // decoder still partially re-primes, so it is reduced, not eliminated).
+    // The first seek must flush to switch the pipeline into segment mode;
+    // subsequent ones must not. KEY_UNIT matches the flushing loop seeks;
+    // the target is 0, always a keyframe, so it only keeps the flag set
+    // consistent.
+    GstSeekFlags flags = static_cast<GstSeekFlags>(GST_SEEK_FLAG_SEGMENT
+                                                   | GST_SEEK_FLAG_KEY_UNIT);
+    if (flush) {
+        flags = static_cast<GstSeekFlags>(flags | GST_SEEK_FLAG_FLUSH);
+    }
+    return gst_element_seek(pipe, 1.0, GST_FORMAT_TIME, flags,
+                            GST_SEEK_TYPE_SET, 0,
+                            GST_SEEK_TYPE_SET, GST_CLOCK_TIME_NONE);
+}
+
+void VideoView::gstArmVideoSegment()
+{
+    if (gstSegmentArmed || !gstPipeline) {
+        return;
+    }
+    // Latch only on success: an early ASYNC_DONE (e.g. from a child bin
+    // mid-preroll) whose seek is rejected leaves the flag clear so the
+    // pipeline's own ASYNC_DONE retries.
+    if (gstSegmentSeek(gstPipeline, true)) {
+        gstSegmentArmed = true;
+    }
+}
+
+void VideoView::gstArmAudioSegment()
+{
+    if (gstAudioSegmentArmed || !gstAudioPipeline) {
+        return;
+    }
+    if (gstSegmentSeek(gstAudioPipeline, true)) {
+        gstAudioSegmentArmed = true;
+    }
+}
+
+void VideoView::gstVideoSegmentDone()
+{
+    // Re-arm the video segment without flushing. If the re-arm fails,
+    // segment mode delivers no EOS, so the pipeline would freeze on its
+    // last frame forever — fall back to the flushing restart (small seam,
+    // but the clip keeps looping) and stop here.
+    if (!gstSegmentSeek(gstPipeline, false)) {
+        gstRestartLoop();
+        return;
+    }
+    // Keep audio aligned to the video's loop point; on failure loop it the
+    // flushing way rather than let it stall silently.
+    if (!gstSegmentSeek(gstAudioPipeline, false)) {
+        gstLoopAudio();
+    }
+}
+
+void VideoView::gstAudioSegmentDone()
+{
+    // Video drives re-alignment; if audio finishes its segment first just
+    // re-arm audio so it keeps playing until the video loops it again. On
+    // a failed re-arm fall back to the flushing loop so audio doesn't
+    // stall silently at the segment boundary.
+    if (!gstSegmentSeek(gstAudioPipeline, false)) {
+        gstLoopAudio();
+    }
 }
 
 void VideoView::onOverlayBuffer(struct _GstPad* pad)

@@ -93,14 +93,14 @@ def test_fetch_latest_release_tag_skips_non_app_releases(
     github_env: None, redis_data: dict[str, str]
 ) -> None:
     """The ANTHIAS-3P scenario: a non-app release (frozen Qt 5
-    toolchain, tagged ``WebView-v2026.07.0``) is the newest release in
+    toolchain, tagged ``WebView-v2026.07.1``) is the newest release in
     the repo. ``/releases/latest`` would return it and break the
     update check fleet-wide; the list-based fetch must skip it and
     pick the newest parseable CalVer tag instead."""
     resp = _resp(
         200,
         json_data=[
-            {'tag_name': 'WebView-v2026.07.0', 'name': 'WebView toolchain'},
+            {'tag_name': 'WebView-v2026.07.1', 'name': 'WebView toolchain'},
             {'tag_name': 'v2026.7.0', 'name': 'Anthias'},
             {'tag_name': 'v2026.6.3', 'name': 'Anthias'},
         ],
@@ -181,7 +181,7 @@ def test_fetch_latest_release_tag_invalid_json(
         [],
         [{'name': 'Release without tag_name'}],
         [{'tag_name': 12345}],
-        [{'tag_name': 'nightly'}, {'tag_name': 'WebView-v2026.07.0'}],
+        [{'tag_name': 'nightly'}, {'tag_name': 'WebView-v2026.07.1'}],
         {'tag_name': 'v2026.6.0'},  # dict (old /latest shape), not a list
     ],
     ids=[
@@ -441,8 +441,8 @@ def test_handle_github_error_logs_at_warning_not_error(
     exc = requests_exceptions.ConnectionError()
     exc.response = None
     with (
-        mock.patch('anthias_server.lib.github.logging.warning') as m_warning,
-        mock.patch('anthias_server.lib.github.logging.error') as m_error,
+        mock.patch('anthias_server.lib.github.logger.warning') as m_warning,
+        mock.patch('anthias_server.lib.github.logger.error') as m_error,
     ):
         github.handle_github_error(exc, 'latest release')
     m_warning.assert_called_once()
@@ -489,6 +489,6 @@ def test_handle_github_error_surfaces_exception_detail(
     host/timeout info that str(exc) carries."""
     exc = requests_exceptions.ReadTimeout('read timed out')
     exc.response = None
-    with mock.patch('anthias_server.lib.github.logging.warning') as m_warning:
+    with mock.patch('anthias_server.lib.github.logger.warning') as m_warning:
         github.handle_github_error(exc, 'latest release')
     assert m_warning.call_args.args[3] == 'read timed out'

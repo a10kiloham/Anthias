@@ -29,6 +29,12 @@ from django.utils.http import (
 )
 from django.views.decorators.http import require_http_methods
 
+from anthias_common.utils import (
+    DISK_FULL_ERROR,
+    clamp_screen_rotation,
+    connect_to_redis,
+    is_disk_full,
+)
 from anthias_server.app import page_context
 from anthias_server.app.models import (
     clamp_duration,
@@ -36,19 +42,13 @@ from anthias_server.app.models import (
     parse_header_lines,
 )
 from anthias_server.celery_tasks import reboot_anthias, shutdown_anthias
+from anthias_server.django_project.settings import is_valid_time_zone
 from anthias_server.lib import backup_helper, diagnostics
 from anthias_server.lib.auth import (
     AuthSettingsError,
     apply_auth_settings,
     authorized,
 )
-from anthias_common.utils import (
-    DISK_FULL_ERROR,
-    clamp_screen_rotation,
-    connect_to_redis,
-    is_disk_full,
-)
-from anthias_server.django_project.settings import is_valid_time_zone
 from anthias_server.settings import ViewerPublisher, settings
 
 from .helpers import (
@@ -97,7 +97,8 @@ def _parse_local_datetime(value: str) -> datetime:
     candidates = [f'{date_fmt} {time_fmt}', f'{date_fmt} %H:%M']
     for fmt in candidates:
         try:
-            return timezone.make_aware(datetime.strptime(value, fmt))
+            # Naive strptime is deliberate — make_aware attaches the tz.
+            return timezone.make_aware(datetime.strptime(value, fmt))  # noqa: DTZ007
         except ValueError:
             continue
     return timezone.make_aware(datetime.fromisoformat(value))
@@ -118,7 +119,8 @@ def _parse_local_time(value: str) -> time:
     value = value.strip()
     for fmt in ('%H:%M', '%I:%M %p'):
         try:
-            return datetime.strptime(value, fmt).time()
+            # Time-of-day only, no date or tz involved.
+            return datetime.strptime(value, fmt).time()  # noqa: DTZ007
         except ValueError:
             continue
     return time.fromisoformat(value)
@@ -233,6 +235,8 @@ def assets_create(request: HttpRequest) -> HttpResponse:
     queued to fetch the file. The "Processing" pill on the table row
     clears once the worker completes.
     """
+    from datetime import timedelta
+
     from anthias_common.remote_video import is_streaming_uri
     from anthias_common.utils import validate_url
     from anthias_common.youtube import (
@@ -241,7 +245,6 @@ def assets_create(request: HttpRequest) -> HttpResponse:
         youtube_destination_path,
     )
     from anthias_server.app.models import Asset
-    from datetime import timedelta
 
     uri = (request.POST.get('uri') or '').strip()
     if not uri or not validate_url(uri):
@@ -397,10 +400,10 @@ def assets_create_app(request: HttpRequest) -> HttpResponse:
     plays.
     """
     import json
+    from datetime import timedelta
 
     from anthias_common.utils import validate_url
     from anthias_server.app.models import Asset
-    from datetime import timedelta
 
     # The launch URL / values are posted as app_uri / app_values (not
     # uri / values) so the Apps form's hidden inputs don't collide with
@@ -490,8 +493,9 @@ def assets_upload(request: HttpRequest) -> HttpResponse:
     """File upload tab. Mirrors api.views.mixins.FileAssetViewMixin.post:
     move the upload into assetdir, create an Asset row, return the
     table partial so HTMX can swap straight in."""
-    from anthias_server.app.models import Asset
     from datetime import timedelta
+
+    from anthias_server.app.models import Asset
 
     # ``request.FILES`` triggers the (lazy) multipart parse, which
     # spools the body to a temp file — on a full disk that write is
@@ -656,8 +660,7 @@ def assets_upload(request: HttpRequest) -> HttpResponse:
     final_path = path.join(settings['assetdir'], f'{final_name}{src_ext}')
     try:
         with open(final_path, 'wb') as f:
-            for chunk in file_upload.chunks():
-                f.write(chunk)
+            f.writelines(file_upload.chunks())
     except OSError as exc:
         if not is_disk_full(exc):
             raise
@@ -682,13 +685,15 @@ def assets_upload(request: HttpRequest) -> HttpResponse:
     #     The set lives in one place so adding a new format only
     #     touches that constant — this comment is intentionally
     #     not the source of truth.
-    from anthias_server.processing import needs_image_normalisation
+    from anthias_server.processing import needs_image_processing
 
     is_video = mimetype == 'video'
-    needs_image_normalize = mimetype == 'image' and needs_image_normalisation(
+    # Either reason earns the Celery hop: a format that needs converting
+    # to WebP, or a JPEG/PNG too large for a low-RAM board to render.
+    needs_image_pipeline = mimetype == 'image' and needs_image_processing(
         final_path
     )
-    is_processing = is_video or needs_image_normalize
+    is_processing = is_video or needs_image_pipeline
 
     duration = settings['default_duration']
 
@@ -737,7 +742,7 @@ def assets_upload(request: HttpRequest) -> HttpResponse:
             ),
             offer_review_cta=True,
         )
-    if needs_image_normalize:
+    if needs_image_pipeline:
         from anthias_server.processing import dispatch_normalize_image
 
         dispatch_normalize_image(asset.asset_id)
@@ -852,8 +857,10 @@ def assets_update(request: HttpRequest, asset_id: str) -> HttpResponse:
             request,
             toast=(
                 'error',
-                'Set both play from and until times, or clear both '
-                '— not saved',
+                (
+                    'Set both play from and until times, or clear both '
+                    '— not saved'
+                ),
             ),
         )
     else:
@@ -916,8 +923,10 @@ def assets_update(request: HttpRequest, asset_id: str) -> HttpResponse:
                 request,
                 toast=(
                     'error',
-                    'That app URL is not from a recognised '
-                    'app store — not saved',
+                    (
+                        'That app URL is not from a recognised '
+                        'app store — not saved'
+                    ),
                 ),
             )
         try:
@@ -1219,8 +1228,10 @@ def assets_bulk_update(request: HttpRequest) -> HttpResponse:
                     request,
                     toast=(
                         'error',
-                        'Could not read the play from/until times '
-                        '— nothing changed',
+                        (
+                            'Could not read the play from/until times '
+                            '— nothing changed'
+                        ),
                     ),
                 )
         elif play_from or play_to:
@@ -1228,8 +1239,10 @@ def assets_bulk_update(request: HttpRequest) -> HttpResponse:
                 request,
                 toast=(
                     'error',
-                    'Set both play from and until times, or clear both '
-                    '— nothing changed',
+                    (
+                        'Set both play from and until times, or clear both '
+                        '— nothing changed'
+                    ),
                 ),
             )
         else:
@@ -1307,8 +1320,10 @@ def assets_bulk_update(request: HttpRequest) -> HttpResponse:
             request,
             toast=(
                 'info',
-                'Duration applies to images and web pages only '
-                '— nothing changed',
+                (
+                    'Duration applies to images and web pages only '
+                    '— nothing changed'
+                ),
             ),
         )
     ViewerPublisher.get_instance().send_to_viewer('reload')
@@ -1397,15 +1412,23 @@ def assets_download(request: HttpRequest, asset_id: str) -> HttpResponseBase:
     asset = Asset.objects.filter(asset_id=asset_id).first()
     if asset is None or not asset.uri:
         return redirect(reverse('anthias_app:home'))
-    if asset.mimetype in ('webpage', 'streaming'):
-        safe = _safe_redirect_uri(asset.uri)
+    # Any asset whose content lives at a remote http(s) URL — a webpage,
+    # a stream, or a remote-hosted image/video — has no local file to
+    # stream, so we redirect the browser to the source. Only locally
+    # uploaded assets (uri is a filesystem path) are served from disk.
+    # Keying off the URI scheme rather than the mimetype is what fixes
+    # the blank preview/download for remote image/video assets (forum
+    # "web content doesn't display"): those are stored mimetype
+    # image/video but their uri is an http(s) URL, so the old
+    # mimetype-only branch fell through to the local-path lookup, found
+    # nothing, and bounced to the home page.
+    safe = _safe_redirect_uri(asset.uri)
+    if safe is not None:
         # `safe` is whitelisted to http(s):// schemes by _safe_redirect_uri,
         # and the endpoint is gated by @authorized (only operators with a
         # session reach this). The redirect target is the operator's own
         # asset URI — that's the feature, not a sink.
-        return (  # lgtm [py/url-redirection]
-            redirect(safe) if safe else redirect(reverse('anthias_app:home'))
-        )
+        return redirect(safe)  # lgtm [py/url-redirection]
     safe_path = _safe_local_asset_path(asset.uri)
     if safe_path is None:
         return redirect(reverse('anthias_app:home'))
@@ -1428,15 +1451,18 @@ def assets_preview(request: HttpRequest, asset_id: str) -> HttpResponseBase:
     asset = Asset.objects.filter(asset_id=asset_id).first()
     if asset is None or not asset.uri:
         return redirect(reverse('anthias_app:home'))
-    if asset.mimetype in ('webpage', 'streaming'):
-        safe = _safe_redirect_uri(asset.uri)
+    # Remote http(s) assets (webpage, streaming, or a remote-hosted
+    # image/video) redirect to the source; the modal renders those in an
+    # <img>/<video>/<iframe>. Keying off the URI scheme rather than the
+    # mimetype is what makes remote image/video previews work — see
+    # assets_download for the full rationale.
+    safe = _safe_redirect_uri(asset.uri)
+    if safe is not None:
         # `safe` is whitelisted to http(s):// schemes by _safe_redirect_uri,
         # and the endpoint is gated by @authorized (only operators with a
         # session reach this). The redirect target is the operator's own
         # asset URI — that's the feature, not a sink.
-        return (  # lgtm [py/url-redirection]
-            redirect(safe) if safe else redirect(reverse('anthias_app:home'))
-        )
+        return redirect(safe)  # lgtm [py/url-redirection]
     safe_path = _safe_local_asset_path(asset.uri)
     if safe_path is None:
         return redirect(reverse('anthias_app:home'))
@@ -1792,8 +1818,7 @@ def settings_recover(request: HttpRequest) -> HttpResponse:
     try:
         publisher.send_to_viewer('stop')
         with open(location, 'wb') as f:
-            for chunk in file_upload.chunks():
-                f.write(chunk)
+            f.writelines(file_upload.chunks())
         try:
             backup_helper.recover(location)
             messages.success(request, 'Recovery successful.')

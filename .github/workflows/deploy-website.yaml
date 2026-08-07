@@ -43,7 +43,7 @@ jobs:
       pages: write
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Pages
         uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6
@@ -122,6 +122,14 @@ jobs:
 
       - name: Build website
         run: hugo --source website --minify
+
+      # Generate llms.txt / llms-full.txt from the rendered public/
+      # tree (llmstxt.org convention). Reading the built HTML keeps
+      # the files in sync with what visitors see, including marketing
+      # copy that lives in Hugo layouts rather than content/*.md.
+      - name: Generate llms.txt
+        run: bun run llms:generate
+        working-directory: website
 
       # Fetch rpi-imager.json from the latest GitHub release. The
       # file is built by build-balena-disk-image.yaml at release time

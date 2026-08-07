@@ -150,6 +150,16 @@ def _sentry_before_send(event: Event, hint: Hint) -> Event | None:
         asset renders a "Failed" pill with the reason — the operator
         gets the feedback without a Sentry page (Sentry ANTHIAS-3T).
         Matched by name+module so we don't import yt_dlp here.
+      * ``RuntimeError: Response content shorter than Content-Length`` —
+        a client that hangs up mid-response while Django's ASGI handler
+        is still streaming a static file (WhiteNoise serving e.g. the
+        splash SVG as the viewer navigates away). Django declared a
+        Content-Length from the file size, then the transfer is cut
+        short by the disconnect — a broken pipe, not a truncated file.
+        Same client-disconnect class as ``CancelledError`` above, but it
+        surfaces as a bare ``RuntimeError``, so it's matched by message
+        text to avoid swallowing unrelated RuntimeErrors (Sentry
+        ANTHIAS-37).
     """
     # Imported lazily — this runs only when an event is about to send,
     # well after Django is configured, and avoids an import cycle at
@@ -172,6 +182,10 @@ def _sentry_before_send(event: Event, hint: Hint) -> Event | None:
         if isinstance(exc, AuthSettingsError):
             return None
         if isinstance(exc, socket.gaierror):
+            return None
+        if isinstance(exc, RuntimeError) and (
+            'Response content shorter than Content-Length' in str(exc)
+        ):
             return None
         exc_cls = type(exc)
         if exc_cls.__name__ == 'DownloadError' and (
@@ -335,7 +349,7 @@ if not DEBUG:
 else:
     # SECURITY WARNING: keep the secret key used in production secret!
     SECRET_KEY = (
-        'django-insecure-7rz*$)g6dk&=h-3imq2xw*iu!zuhfb&w6v482_vs!w@4_gha=j'  # noqa: E501
+        'django-insecure-7rz*$)g6dk&=h-3imq2xw*iu!zuhfb&w6v482_vs!w@4_gha=j'
     )
 
 # Anthias is a local-network signage device with no fixed public
@@ -455,7 +469,26 @@ CHANNEL_LAYERS = {
     'default': {
         'BACKEND': 'channels_redis.core.RedisChannelLayer',
         'CONFIG': {
-            'hosts': [(getenv('REDIS_HOST', 'redis'), 6379)],
+            # channels_redis polls each channel with a blocking BZPOPMIN
+            # whose server-side timeout is brpop_timeout (5s). redis-py
+            # 8.0.1 introduced a default 5s async socket read timeout
+            # (DEFAULT_SOCKET_TIMEOUT = 5); with no override the blocking
+            # read inherits it and an empty 5s poll races the socket
+            # timeout, raising "Timeout reading from redis:6379" on every
+            # cycle of an open WebSocket (issue #3228).
+            #
+            # Keep a read timeout so a genuinely dead redis connection is
+            # still detected, but set it well above the 5s poll so it
+            # cannot race: 15s = 3x brpop_timeout, leaving margin for a
+            # slow / memory-pressured board to return the empty poll
+            # before the socket read gives up.
+            'hosts': [
+                {
+                    'host': getenv('REDIS_HOST', 'redis'),
+                    'port': 6379,
+                    'socket_timeout': 15,
+                }
+            ],
         },
     },
 }
@@ -581,12 +614,10 @@ def is_valid_time_zone(
         zoneinfo.ZoneInfo(time_zone)
     except (ValueError, zoneinfo.ZoneInfoNotFoundError):
         return False
-    if (
+    return not (
         zoneinfo_root.exists()
         and not zoneinfo_root.joinpath(*time_zone.split('/')).exists()
-    ):
-        return False
-    return True
+    )
 
 
 def get_host_time_zone(

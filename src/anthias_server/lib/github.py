@@ -7,6 +7,8 @@ from requests import get as requests_get
 from anthias_common.utils import connect_to_redis
 from anthias_server.lib.diagnostics import get_anthias_release
 
+logger = logging.getLogger(__name__)
+
 r = connect_to_redis()
 
 # Cache the latest-release lookup for 24h. Lines up with GitHub's
@@ -33,7 +35,7 @@ DEFAULT_REQUESTS_TIMEOUT = 5  # seconds
 # The releases *list*, not ``/releases/latest``: that endpoint returns
 # the newest non-draft, non-prerelease release of ANY kind, and the
 # repo also publishes non-app releases (e.g. the frozen Qt 5 toolchain,
-# tagged ``WebView-v2026.07.0``). The day such a release goes out,
+# tagged ``WebView-v2026.07.1``). The day such a release goes out,
 # ``/releases/latest`` stops pointing at an Anthias CalVer tag and the
 # update check degrades fleet-wide until the next app release (Sentry
 # ANTHIAS-3P). Listing lets us pick the highest CalVer-parseable tag
@@ -71,7 +73,7 @@ def handle_github_error(
     # degrades through gracefully — backoff above, cached verdict
     # fallback in is_up_to_date(). An ERROR-level log would land in
     # Sentry on every offline device (ANTHIAS-8).
-    logging.warning(
+    logger.warning(
         '%s fetching %s from GitHub: %s', type(exc).__name__, action, errdesc
     )
 
@@ -81,7 +83,7 @@ def _latest_parseable_tag(payload: object) -> str | None:
     ``/releases`` list payload.
 
     Skips drafts, prereleases, and any release whose tag doesn't parse
-    (non-app releases like ``WebView-v2026.07.0``, hand-edited tags
+    (non-app releases like ``WebView-v2026.07.1``, hand-edited tags
     like ``nightly``). Highest-by-version rather than first-in-list:
     the list is ordered by creation date, and a non-app release
     created after the newest app release would otherwise mask it.
@@ -117,7 +119,7 @@ def _fetch_latest_release_tag() -> str | None:
         return cached
 
     if r.get('github-api-error') is not None:
-        logging.warning('GitHub requests suspended due to prior error')
+        logger.warning('GitHub requests suspended due to prior error')
         return None
 
     try:
@@ -138,7 +140,7 @@ def _fetch_latest_release_tag() -> str | None:
     try:
         payload = resp.json()
     except ValueError:
-        logging.warning('Malformed JSON from GitHub /releases')
+        logger.warning('Malformed JSON from GitHub /releases')
         _set_github_error_backoff('latest release: malformed JSON')
         return None
 
@@ -148,7 +150,7 @@ def _fetch_latest_release_tag() -> str | None:
     # corrects it.
     tag = _latest_parseable_tag(payload)
     if tag is None:
-        logging.warning('No parseable release tag in GitHub /releases')
+        logger.warning('No parseable release tag in GitHub /releases')
         _set_github_error_backoff('latest release: no parseable tag')
         return None
 
@@ -209,7 +211,7 @@ def is_up_to_date() -> bool:
 
     latest_version = _parse_version(latest_tag)
     if latest_version is None:
-        logging.warning('Malformed tag_name from GitHub: %r', latest_tag)
+        logger.warning('Malformed tag_name from GitHub: %r', latest_tag)
         return _fallback_verdict(local_release)
 
     verdict = local_version >= latest_version
