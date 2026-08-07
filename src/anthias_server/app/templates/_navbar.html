@@ -34,6 +34,17 @@
           </a>
         </li>
 
+        <li class="app-tab-item">
+          <a
+            href="{% url 'anthias_app:playlists' %}"
+            class="app-tab-link {% if active_nav == 'playlists' %}active{% endif %}"
+            @click="open = false"
+          >
+            <i class="ti ti-list-details"></i>
+            <span>Playlists</span>
+          </a>
+        </li>
+
         {% if is_balena %}
         <li class="app-tab-item">
           <a

@@ -1,3 +1,4 @@
+import json
 import logging
 import re
 import tarfile
@@ -1954,3 +1955,352 @@ def splash_page(request: HttpRequest) -> HttpResponse:
             'splash_logo_url': settings['splash_logo_url'],
         },
     )
+
+
+def _playlists_response(
+    request: HttpRequest,
+    *,
+    toast: tuple[str, str] | None = None,
+) -> HttpResponse:
+    """Shared response helper for the playlist write endpoints —
+    same contract as ``_asset_table_response``: HTMX requests get the
+    swapped tree partial, plain form submits fall back to a redirect,
+    and ``toast`` fires the client toast either way."""
+    from anthias_server.app.consumers import notify_asset_update
+
+    notify_asset_update()
+
+    if request.headers.get('HX-Request'):
+        from django.shortcuts import render as _render
+
+        response = _render(
+            request, '_playlist_tree.html', page_context.playlists()
+        )
+        if toast is not None:
+            _set_toast_header(response, toast[0], toast[1])
+        return response
+
+    if toast is not None:
+        _msg_fn = {
+            'success': messages.success,
+            'error': messages.error,
+            'info': messages.info,
+        }.get(toast[0], messages.info)
+        _msg_fn(request, toast[1])
+    return redirect('anthias_app:playlists')
+
+
+@authorized
+@require_http_methods(['GET'])
+def playlists(request: HttpRequest) -> HttpResponse:
+    context = page_context.playlists()
+    context['active_nav'] = 'playlists'
+    return template(request, 'playlists.html', context)
+
+
+@authorized
+@require_http_methods(['GET'])
+def playlists_table_partial(request: HttpRequest) -> HttpResponse:
+    """HTMX endpoint for the playlist tree only — re-rendered after
+    every successful write and by the background poll."""
+    from django.shortcuts import render as _render
+
+    return _render(request, '_playlist_tree.html', page_context.playlists())
+
+
+@authorized
+@require_http_methods(['POST'])
+def playlists_create(request: HttpRequest) -> HttpResponse:
+    from anthias_server.app.models import Playlist
+
+    name = (request.POST.get('name') or '').strip()
+    if not name:
+        return _playlists_response(
+            request, toast=('error', 'A playlist needs a name')
+        )
+    last_root_position = (
+        Playlist.objects.filter(parent_item__isnull=True)
+        .order_by('-position')
+        .values_list('position', flat=True)
+        .first()
+    )
+    Playlist.objects.create(
+        name=name,
+        position=(0 if last_root_position is None else last_root_position + 1),
+    )
+    ViewerPublisher.get_instance().send_to_viewer('reload')
+    return _playlists_response(request, toast=('success', 'Playlist created'))
+
+
+@authorized
+@require_http_methods(['POST'])
+def playlists_delete(request: HttpRequest, playlist_id: str) -> HttpResponse:
+    from anthias_server.app.models import Playlist
+
+    playlist = Playlist.objects.filter(playlist_id=playlist_id).first()
+    if playlist is None:
+        return _playlists_response(request)
+    if playlist.is_default:
+        return _playlists_response(
+            request,
+            toast=('error', 'The Default playlist cannot be deleted'),
+        )
+    playlist.delete()
+    ViewerPublisher.get_instance().send_to_viewer('reload')
+    return _playlists_response(request, toast=('success', 'Playlist deleted'))
+
+
+@authorized
+@require_http_methods(['POST'])
+def playlists_toggle(request: HttpRequest, playlist_id: str) -> HttpResponse:
+    from anthias_server.app.models import Playlist
+
+    toast: tuple[str, str] | None = None
+    playlist = Playlist.objects.filter(playlist_id=playlist_id).first()
+    if playlist is not None:
+        playlist.is_enabled = not playlist.is_enabled
+        playlist.save()
+        ViewerPublisher.get_instance().send_to_viewer('reload')
+        toast = (
+            'success',
+            f'Playlist {"enabled" if playlist.is_enabled else "disabled"}',
+        )
+    return _playlists_response(request, toast=toast)
+
+
+@authorized
+@require_http_methods(['POST'])
+def playlists_toggle_repeat(
+    request: HttpRequest, playlist_id: str
+) -> HttpResponse:
+    from anthias_server.app.models import Playlist
+
+    toast: tuple[str, str] | None = None
+    playlist = Playlist.objects.filter(playlist_id=playlist_id).first()
+    if playlist is not None:
+        playlist.repeat = not playlist.repeat
+        playlist.save()
+        ViewerPublisher.get_instance().send_to_viewer('reload')
+        toast = (
+            'success',
+            'Playlist repeats'
+            if playlist.repeat
+            else 'Playlist plays through once per window',
+        )
+    return _playlists_response(request, toast=toast)
+
+
+@authorized
+@require_http_methods(['POST'])
+def playlists_schedule(request: HttpRequest, playlist_id: str) -> HttpResponse:
+    """Save the per-playlist window: optional date bounds
+    (datetime-local inputs; blank clears), day-of-week checkboxes, and
+    an optional time-of-day pair."""
+    from anthias_server.app.models import ALL_DAYS, Playlist
+
+    playlist = Playlist.objects.filter(playlist_id=playlist_id).first()
+    if playlist is None:
+        return _playlists_response(request)
+
+    def parse_dt(field: str) -> datetime | None:
+        raw = (request.POST.get(field) or '').strip()
+        if not raw:
+            return None
+        try:
+            value = datetime.fromisoformat(raw)
+        except ValueError:
+            raise ValueError(
+                f'Could not parse {field.replace("_", " ")}'
+            ) from None
+        if timezone.is_naive(value):
+            value = timezone.make_aware(value, timezone.get_current_timezone())
+        return value
+
+    def parse_t(field: str) -> time | None:
+        raw = (request.POST.get(field) or '').strip()
+        if not raw:
+            return None
+        try:
+            return time.fromisoformat(raw)
+        except ValueError:
+            raise ValueError(
+                f'Could not parse {field.replace("_", " ")}'
+            ) from None
+
+    try:
+        start_date = parse_dt('start_date')
+        end_date = parse_dt('end_date')
+        play_time_from = parse_t('play_time_from')
+        play_time_to = parse_t('play_time_to')
+    except ValueError as exc:
+        return _playlists_response(request, toast=('error', str(exc)))
+
+    if start_date and end_date and start_date >= end_date:
+        return _playlists_response(
+            request, toast=('error', 'End date must be after start date')
+        )
+    if (play_time_from is None) != (play_time_to is None):
+        return _playlists_response(
+            request,
+            toast=(
+                'error',
+                'Set both start and end of the time window, or neither',
+            ),
+        )
+
+    days = [
+        int(d)
+        for d in request.POST.getlist('play_days')
+        if d.isdigit() and 1 <= int(d) <= 7
+    ]
+    if not days:
+        return _playlists_response(
+            request,
+            toast=(
+                'error',
+                (
+                    'Pick at least one day (disable the playlist to '
+                    'stop playback entirely)'
+                ),
+            ),
+        )
+
+    playlist.start_date = start_date
+    playlist.end_date = end_date
+    playlist.play_time_from = play_time_from
+    playlist.play_time_to = play_time_to
+    playlist.play_days = json.dumps(sorted(set(days)) or list(ALL_DAYS))
+    playlist.save()
+    ViewerPublisher.get_instance().send_to_viewer('reload')
+    return _playlists_response(request, toast=('success', 'Schedule saved'))
+
+
+@authorized
+@require_http_methods(['POST'])
+def playlist_add_asset(request: HttpRequest, playlist_id: str) -> HttpResponse:
+    from anthias_server.app.models import Asset, Playlist, PlaylistItem
+
+    playlist = Playlist.objects.filter(playlist_id=playlist_id).first()
+    asset = Asset.objects.filter(
+        asset_id=request.POST.get('asset_id', '')
+    ).first()
+    if playlist is None or asset is None:
+        return _playlists_response(
+            request, toast=('error', 'Asset or playlist not found')
+        )
+    last = playlist.items.order_by('-position').first()
+    PlaylistItem.objects.create(
+        playlist=playlist,
+        asset=asset,
+        position=last.position + 1 if last else 0,
+    )
+    ViewerPublisher.get_instance().send_to_viewer('reload')
+    return _playlists_response(
+        request, toast=('success', f'Added “{asset.name}”')
+    )
+
+
+@authorized
+@require_http_methods(['POST'])
+def playlist_nest(request: HttpRequest, playlist_id: str) -> HttpResponse:
+    from anthias_server.app.models import (
+        Playlist,
+        PlaylistItem,
+        playlist_is_self_or_ancestor,
+    )
+
+    parent = Playlist.objects.filter(playlist_id=playlist_id).first()
+    child = Playlist.objects.filter(
+        playlist_id=request.POST.get('child_playlist_id', '')
+    ).first()
+    if parent is None or child is None:
+        return _playlists_response(
+            request, toast=('error', 'Playlist not found')
+        )
+    if child.is_default:
+        return _playlists_response(
+            request,
+            toast=('error', 'The Default playlist cannot be nested'),
+        )
+    if getattr(child, 'parent_item', None) is not None:
+        return _playlists_response(
+            request,
+            toast=('error', 'That playlist is already nested elsewhere'),
+        )
+    if playlist_is_self_or_ancestor(child, parent):
+        return _playlists_response(
+            request,
+            toast=('error', 'Nesting that playlist here would create a loop'),
+        )
+    last = parent.items.order_by('-position').first()
+    PlaylistItem.objects.create(
+        playlist=parent,
+        child_playlist=child,
+        position=last.position + 1 if last else 0,
+    )
+    ViewerPublisher.get_instance().send_to_viewer('reload')
+    return _playlists_response(
+        request, toast=('success', f'Nested “{child.name}”')
+    )
+
+
+@authorized
+@require_http_methods(['POST'])
+def playlist_remove_item(
+    request: HttpRequest, playlist_id: str, item_id: int
+) -> HttpResponse:
+    from anthias_server.app.models import PlaylistItem
+
+    item = PlaylistItem.objects.filter(
+        id=item_id, playlist_id=playlist_id
+    ).first()
+    if item is not None:
+        item.delete()
+        ViewerPublisher.get_instance().send_to_viewer('reload')
+    return _playlists_response(request, toast=('success', 'Item removed'))
+
+
+@authorized
+@require_http_methods(['POST'])
+def playlist_move_item(
+    request: HttpRequest, playlist_id: str, item_id: int
+) -> HttpResponse:
+    """Swap the item with its neighbour (direction=up|down) — simple,
+    reliable reordering without a tree-aware drag handler."""
+    from anthias_server.app.models import PlaylistItem
+
+    direction = request.POST.get('direction', '')
+    item = PlaylistItem.objects.filter(
+        id=item_id, playlist_id=playlist_id
+    ).first()
+    if item is None or direction not in ('up', 'down'):
+        return _playlists_response(request)
+
+    siblings = list(
+        PlaylistItem.objects.filter(playlist_id=playlist_id).order_by(
+            'position', 'id'
+        )
+    )
+    index = next(
+        (i for i, sibling in enumerate(siblings) if sibling.id == item.id),
+        None,
+    )
+    if index is None:
+        return _playlists_response(request)
+    swap_with = index - 1 if direction == 'up' else index + 1
+    if not 0 <= swap_with < len(siblings):
+        return _playlists_response(request)
+
+    other = siblings[swap_with]
+    # Positions can tie (mirror seeding); renumber the whole sibling
+    # list with the pair exchanged so the swap always takes.
+    siblings[index], siblings[swap_with] = other, item
+    changed = []
+    for position, sibling in enumerate(siblings):
+        if sibling.position != position:
+            sibling.position = position
+            changed.append(sibling)
+    if changed:
+        PlaylistItem.objects.bulk_update(changed, ['position'])
+    ViewerPublisher.get_instance().send_to_viewer('reload')
+    return _playlists_response(request)

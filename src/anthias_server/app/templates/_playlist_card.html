@@ -1,0 +1,237 @@
+{% comment %} One playlist card; includes itself for nested playlists
+   (Django template recursion via include is safe here — the context
+   builder caps the tree at MAX_PLAYLIST_DEPTH). Expects `node` =
+   {playlist, entries, depth, can_nest} from page_context.playlists().
+{% endcomment %}
+<section
+  class="surface {% if node.playlist.is_enabled %}surface--active{% endif %}"
+  {% if node.depth %}style="margin-left: {{ node.depth }}rem"{% endif %}
+  x-data="{ scheduleOpen: false, addOpen: false }"
+>
+  <header class="surface__header">
+    <div class="surface__header-left">
+      <h2>
+        <i class="ti {% if node.playlist.is_default %}ti-home{% else %}ti-list-details{% endif %} mr-2"></i>
+        {{ node.playlist.name }}
+        {% if node.playlist.is_default %}
+          <span class="schedule-chip schedule-chip--all" title="Assets added outside a playlist land here">Default</span>
+        {% endif %}
+        {% if not node.playlist.repeat %}
+          <span class="schedule-chip schedule-chip--time" title="Plays its content once per schedule window, then waits for the next window"><i class="ti ti-repeat-off"></i> Play once</span>
+        {% endif %}
+        {% if not node.playlist.is_enabled %}
+          <span class="schedule-chip schedule-chip--disabled">Disabled</span>
+        {% endif %}
+      </h2>
+    </div>
+    <div class="flex items-center gap-2">
+      <span class="surface__count">{{ node.entries|length }} item{{ node.entries|length|pluralize }}</span>
+
+      <form method="post" class="inline m-0"
+            action="{% url 'anthias_app:playlists_toggle' node.playlist.playlist_id %}"
+            hx-post="{% url 'anthias_app:playlists_toggle' node.playlist.playlist_id %}"
+            hx-target="#playlist-tree" hx-swap="outerHTML">
+        {% csrf_token %}
+        <button type="submit" class="app-btn app-btn-light app-btn-pill"
+                title="{% if node.playlist.is_enabled %}Disable{% else %}Enable{% endif %} this playlist">
+          <i class="ti {% if node.playlist.is_enabled %}ti-toggle-right{% else %}ti-toggle-left{% endif %}"></i>
+        </button>
+      </form>
+
+      <form method="post" class="inline m-0"
+            action="{% url 'anthias_app:playlists_toggle_repeat' node.playlist.playlist_id %}"
+            hx-post="{% url 'anthias_app:playlists_toggle_repeat' node.playlist.playlist_id %}"
+            hx-target="#playlist-tree" hx-swap="outerHTML">
+        {% csrf_token %}
+        <button type="submit" class="app-btn app-btn-light app-btn-pill"
+                title="{% if node.playlist.repeat %}Currently repeats — switch to play-once-per-window{% else %}Currently plays once per window — switch to repeat{% endif %}">
+          <i class="ti {% if node.playlist.repeat %}ti-repeat{% else %}ti-repeat-off{% endif %}"></i>
+        </button>
+      </form>
+
+      <button type="button" class="app-btn app-btn-light app-btn-pill"
+              @click="scheduleOpen = !scheduleOpen" title="Schedule window">
+        <i class="ti ti-calendar-time"></i>
+      </button>
+
+      <button type="button" class="app-btn app-btn-light app-btn-pill"
+              @click="addOpen = !addOpen" title="Add content">
+        <i class="ti ti-plus"></i>
+      </button>
+
+      {% if not node.playlist.is_default %}
+      <form method="post" class="inline m-0"
+            action="{% url 'anthias_app:playlists_delete' node.playlist.playlist_id %}"
+            hx-post="{% url 'anthias_app:playlists_delete' node.playlist.playlist_id %}"
+            hx-confirm="Delete playlist “{{ node.playlist.name }}”? Its assets are kept; nested playlists become top-level."
+            hx-target="#playlist-tree" hx-swap="outerHTML">
+        {% csrf_token %}
+        <button type="submit" class="app-btn app-btn-light app-btn-pill" title="Delete playlist">
+          <i class="ti ti-trash"></i>
+        </button>
+      </form>
+      {% endif %}
+    </div>
+  </header>
+
+  {% if node.playlist.start_date or node.playlist.end_date or node.playlist.play_time_from or node.playlist.has_window_filter %}
+  <p class="px-4 pt-2 text-sm">
+    <i class="ti ti-calendar-event"></i>
+    {% if node.playlist.start_date %}from {{ node.playlist.start_date }}{% endif %}
+    {% if node.playlist.end_date %}until {{ node.playlist.end_date }}{% endif %}
+    {% if node.playlist.play_time_from and node.playlist.play_time_to %}
+      · {{ node.playlist.play_time_from|time:'H:i' }}–{{ node.playlist.play_time_to|time:'H:i' }}
+    {% endif %}
+    · days:
+    {% for day in node.playlist.get_play_days %}{{ day }}{% if not forloop.last %},{% endif %}{% endfor %}
+  </p>
+  {% endif %}
+
+  <div x-show="scheduleOpen" x-cloak class="p-4">
+    <form method="post"
+          action="{% url 'anthias_app:playlists_schedule' node.playlist.playlist_id %}"
+          hx-post="{% url 'anthias_app:playlists_schedule' node.playlist.playlist_id %}"
+          hx-target="#playlist-tree" hx-swap="outerHTML"
+          class="flex flex-wrap items-end gap-3">
+      {% csrf_token %}
+      <label class="flex flex-col text-sm">
+        Start (optional)
+        <input type="datetime-local" class="app-input" name="start_date"
+               value="{{ node.playlist.start_date|date:'Y-m-d\TH:i' }}">
+      </label>
+      <label class="flex flex-col text-sm">
+        End (optional)
+        <input type="datetime-local" class="app-input" name="end_date"
+               value="{{ node.playlist.end_date|date:'Y-m-d\TH:i' }}">
+      </label>
+      <label class="flex flex-col text-sm">
+        From (time)
+        <input type="time" class="app-input" name="play_time_from"
+               value="{{ node.playlist.play_time_from|time:'H:i' }}">
+      </label>
+      <label class="flex flex-col text-sm">
+        To (time)
+        <input type="time" class="app-input" name="play_time_to"
+               value="{{ node.playlist.play_time_to|time:'H:i' }}">
+      </label>
+      <fieldset class="flex items-center gap-2 text-sm">
+        <legend class="sr-only">Days of week</legend>
+        {% for day_num, day_label in week_days %}
+        <label class="flex items-center gap-1">
+          <input type="checkbox" class="app-check-input" name="play_days"
+                 value="{{ day_num }}"
+                 {% if day_num in node.playlist.get_play_days %}checked{% endif %}>
+          {{ day_label }}
+        </label>
+        {% endfor %}
+      </fieldset>
+      <button type="submit" class="app-btn app-btn-primary app-btn-pill">
+        Save schedule
+      </button>
+    </form>
+  </div>
+
+  <div x-show="addOpen" x-cloak class="p-4 flex flex-wrap gap-4">
+    <form method="post"
+          action="{% url 'anthias_app:playlist_add_asset' node.playlist.playlist_id %}"
+          hx-post="{% url 'anthias_app:playlist_add_asset' node.playlist.playlist_id %}"
+          hx-target="#playlist-tree" hx-swap="outerHTML"
+          class="flex items-center gap-2 m-0">
+      {% csrf_token %}
+      <select class="app-input" name="asset_id" required>
+        <option value="" disabled selected>Add an asset…</option>
+        {% for asset in all_assets %}
+        <option value="{{ asset.asset_id }}">{{ asset.name }}</option>
+        {% endfor %}
+      </select>
+      <button type="submit" class="app-btn app-btn-light app-btn-pill">
+        <i class="ti ti-plus"></i> Asset
+      </button>
+    </form>
+
+    {% if node.can_nest %}
+    <form method="post"
+          action="{% url 'anthias_app:playlist_nest' node.playlist.playlist_id %}"
+          hx-post="{% url 'anthias_app:playlist_nest' node.playlist.playlist_id %}"
+          hx-target="#playlist-tree" hx-swap="outerHTML"
+          class="flex items-center gap-2 m-0">
+      {% csrf_token %}
+      <select class="app-input" name="child_playlist_id" required>
+        <option value="" disabled selected>Nest a playlist…</option>
+        {% for candidate in nestable_playlists %}
+        {% if candidate.playlist_id != node.playlist.playlist_id %}
+        <option value="{{ candidate.playlist_id }}">{{ candidate.name }}</option>
+        {% endif %}
+        {% endfor %}
+      </select>
+      <button type="submit" class="app-btn app-btn-light app-btn-pill">
+        <i class="ti ti-list-details"></i> Playlist
+      </button>
+    </form>
+    {% endif %}
+  </div>
+
+  {% if node.entries %}
+  <table class="asset-table">
+    <tbody>
+      {% for entry in node.entries %}
+      <tr>
+        <td>
+          {% if entry.asset %}
+          <span class="asset-cell-name__icon">
+            {% if entry.asset.mimetype == 'image' %}<i class="ti ti-photo"></i>
+            {% elif entry.asset.mimetype == 'video' %}<i class="ti ti-video"></i>
+            {% else %}<i class="ti ti-world"></i>{% endif %}
+          </span>
+          {{ entry.asset.name }}
+          {% else %}
+          <i class="ti ti-list-details"></i>
+          <strong>{{ entry.child.playlist.name }}</strong> (playlist)
+          {% endif %}
+        </td>
+        <td class="text-right" style="width: 12rem">
+          <form method="post" class="inline m-0"
+                action="{% url 'anthias_app:playlist_move_item' node.playlist.playlist_id entry.item.id %}"
+                hx-post="{% url 'anthias_app:playlist_move_item' node.playlist.playlist_id entry.item.id %}"
+                hx-target="#playlist-tree" hx-swap="outerHTML">
+            {% csrf_token %}
+            <input type="hidden" name="direction" value="up">
+            <button type="submit" class="app-btn app-btn-light app-btn-pill"
+                    title="Move up" {% if forloop.first %}disabled{% endif %}>
+              <i class="ti ti-chevron-up"></i>
+            </button>
+          </form>
+          <form method="post" class="inline m-0"
+                action="{% url 'anthias_app:playlist_move_item' node.playlist.playlist_id entry.item.id %}"
+                hx-post="{% url 'anthias_app:playlist_move_item' node.playlist.playlist_id entry.item.id %}"
+                hx-target="#playlist-tree" hx-swap="outerHTML">
+            {% csrf_token %}
+            <input type="hidden" name="direction" value="down">
+            <button type="submit" class="app-btn app-btn-light app-btn-pill"
+                    title="Move down" {% if forloop.last %}disabled{% endif %}>
+              <i class="ti ti-chevron-down"></i>
+            </button>
+          </form>
+          <form method="post" class="inline m-0"
+                action="{% url 'anthias_app:playlist_remove_item' node.playlist.playlist_id entry.item.id %}"
+                hx-post="{% url 'anthias_app:playlist_remove_item' node.playlist.playlist_id entry.item.id %}"
+                hx-target="#playlist-tree" hx-swap="outerHTML"
+                {% if entry.child %}hx-confirm="Un-nest “{{ entry.child.playlist.name }}”? It becomes a top-level playlist."{% endif %}>
+            {% csrf_token %}
+            <button type="submit" class="app-btn app-btn-light app-btn-pill" title="Remove from this playlist">
+              <i class="ti ti-x"></i>
+            </button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  {% for entry in node.entries %}
+    {% if entry.child %}
+      {% include "_playlist_card.html" with node=entry.child %}
+    {% endif %}
+  {% endfor %}
+</section>

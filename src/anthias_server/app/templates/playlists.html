@@ -1,0 +1,43 @@
+{% extends "_layout.html" %}
+{% load static %}
+
+{% block title %}{% if player_name %}{{ player_name }} · {% endif %}Playlists{% endblock %}
+
+{% block main %}
+<div class="app-container">
+  <div class="page-header-bar">
+    <div class="page-header-bar__title">
+      <h1 class="page-header">Playlists</h1>
+      <p class="page-header-bar__lede">
+        Group assets into playlists, nest playlists inside playlists,
+        and give each one its own schedule. Playlists repeat unless set
+        to play through once.
+      </p>
+    </div>
+    <div class="page-header-bar__actions">
+      <form
+        method="post"
+        action="{% url 'anthias_app:playlists_create' %}"
+        hx-post="{% url 'anthias_app:playlists_create' %}"
+        hx-target="#playlist-tree"
+        hx-swap="outerHTML"
+        class="flex items-center gap-2 m-0"
+      >
+        {% csrf_token %}
+        <input
+          type="text"
+          class="app-input"
+          name="name"
+          placeholder="New playlist name"
+          required
+        >
+        <button type="submit" class="app-btn app-btn-primary app-btn-pill">
+          <i class="ti ti-plus"></i><span>Create</span>
+        </button>
+      </form>
+    </div>
+  </div>
+
+  {% include "_playlist_tree.html" %}
+</div>
+{% endblock %}
