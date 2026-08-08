@@ -198,14 +198,14 @@ def build_image(
         cache_from = None
         cache_to = None
     elif cache_backend == 'registry':
-        # Hardcode the GHCR-primary namespace so the cache lives next to
-        # the published images for this service. Doesn't read from
-        # `namespaces` below: cache only needs one canonical home, and
-        # GHCR's free unlimited storage for public packages makes it the
-        # right one. If the namespaces list changes in the future, this
-        # ref needs to move with it.
+        # The registry cache lives on the fork's GHCR (not Docker Hub,
+        # where the images go): CI already logs into ghcr.io with
+        # GITHUB_TOKEN so cache pushes need no extra secrets, and
+        # GHCR's free unlimited storage for public packages makes it
+        # the right home. Doesn't read from `namespaces` below: cache
+        # only needs one canonical home.
         cache_ref = (
-            f'ghcr.io/screenly/anthias-{service}:buildcache-{cache_scope}'
+            f'ghcr.io/a10kiloham/anthias-{service}:buildcache-{cache_scope}'
         )
         # Reads are always safe — anthias-* GHCR packages are public,
         # so cache_from works without auth (matters for someone
@@ -361,22 +361,15 @@ def main(
 
     # Build Docker images
     for service_name in services_to_build:
-        # Define tag components.
-        #
-        # GHCR is listed first because it is the primary, canonical source
-        # for Anthias images going forward — `bin/upgrade_containers.sh`
-        # regenerates compose from `docker-compose.yml.tmpl`, so flipping
-        # the template (separate change) flips every device on next
-        # upgrade. Docker Hub stays in the list as a parallel push during
-        # the migration window so devices that haven't yet picked up the
-        # template flip keep getting `latest-*` advanced.
-        #
-        # The legacy `screenly/srly-ose-*` namespace was dropped: every
-        # device that has run `upgrade_containers.sh` since 2023-02
-        # (b9998438) is on `screenly/anthias-*`, and stale `srly-ose-*`
-        # `latest-*` mirroring (one of two reasons d568602 hit Docker
-        # Hub's 429) gives no real back-compat in exchange.
-        namespaces = ['ghcr.io/screenly/anthias', 'screenly/anthias']
+        # The fork publishes its images to Docker Hub under
+        # robkanthias/anthias-* — the single namespace
+        # docker-compose.yml.tmpl points devices at. (Upstream's
+        # ghcr.io/screenly / screenly namespaces are not pushable from
+        # this fork, and pulled upstream images would lack the fork's
+        # features anyway. Local builds tag the same name, so a device
+        # that built from source and one that pulled from Docker Hub
+        # run under identical image refs.)
+        namespaces = ['robkanthias/anthias']
 
         # Generate all tags
         docker_tags = []

@@ -111,7 +111,7 @@ fi
 #                          path now.
 #   * anthias-celery / srly-ose-celery containers from the era when
 #     celery had its own image. The new compose file recreates the
-#     anthias-celery container against ghcr.io/screenly/anthias-server,
+#     anthias-celery container against robkanthias/anthias-server,
 #     so the old container (still pointing at the deleted celery image)
 #     must be removed first or the server-image-backed replacement
 #     can't take its name.
