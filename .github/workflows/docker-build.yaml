@@ -134,10 +134,12 @@ jobs:
           DOCKER_BUILDKIT: 1
           BUILDKIT_PROGRESS: plain
           # On push events (master): use BuildKit's registry cache
-          # backend — pushes cache to ghcr.io/screenly/anthias-
+          # backend — pushes cache to ghcr.io/a10kiloham/anthias-
           # <service>:buildcache-<board> so subsequent push runs of
           # the same board can pull cached layers without
           # re-installing ~825 MB of apt packages from scratch.
+          # (Images themselves go to Docker Hub; only the build cache
+          # lives on GHCR, where GITHUB_TOKEN can write for free.)
           #
           # On workflow_dispatch (manual runs on any branch): fall
           # through to `local` mode — a per-runner ephemeral
@@ -164,20 +166,14 @@ jobs:
       # (identical digest), so they inherit the attestation for free.
       #
       # Attestation is by digest, and GitHub's attestation store is keyed
-      # on (repository, digest) rather than on the container registry, so
-      # a single attestation makes the image verifiable on BOTH registries:
+      # on (repository, digest) rather than on the container registry:
       #   gh attestation verify \
-      #     oci://ghcr.io/screenly/anthias-server:<short-hash>-<board> \
+      #     oci://docker.io/robkanthias/anthias-server:<short-hash>-<board> \
       #     --repo ${{ github.repository }}
-      #   gh attestation verify \
-      #     oci://docker.io/screenly/anthias-server:<short-hash>-<board> \
-      #     --repo ${{ github.repository }}
-      # We additionally push an in-registry copy (push-to-registry) to
-      # each registry so registry-native / offline tooling can discover
-      # the attestation without the GitHub API. GHCR is hard-fail; the
-      # Docker Hub copy is best-effort (continue-on-error) because its
-      # referrers API periodically 429s under the free-tier pull limit —
-      # the same reason publish-latest soft-fails its Docker Hub mirror.
+      # We additionally push an in-registry copy (push-to-registry), but
+      # best-effort (continue-on-error) because Docker Hub's referrers
+      # API periodically 429s under the free-tier pull limit — the same
+      # reason publish-latest wraps its retags in retries.
       - name: Resolve pushed image digests
         if: success() && github.event_name == 'push'
         id: digests
@@ -185,43 +181,19 @@ jobs:
           set -euo pipefail
           short_hash="$(git rev-parse --short=7 HEAD)"
           for service in server viewer redis; do
-            ref="ghcr.io/screenly/anthias-${service}:${short_hash}-${{ matrix.board }}"
+            ref="robkanthias/anthias-${service}:${short_hash}-${{ matrix.board }}"
             digest="$(docker buildx imagetools inspect "${ref}" \
               --format '{{ .Manifest.Digest }}')"
             echo "${service}=${digest}" >> "${GITHUB_OUTPUT}"
             echo "Resolved ${ref} -> ${digest}"
           done
 
-      - name: Attest anthias-server provenance (GHCR)
-        if: success() && github.event_name == 'push'
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
-        with:
-          subject-name: ghcr.io/screenly/anthias-server
-          subject-digest: ${{ steps.digests.outputs.server }}
-          push-to-registry: true
-
-      - name: Attest anthias-viewer provenance (GHCR)
-        if: success() && github.event_name == 'push'
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
-        with:
-          subject-name: ghcr.io/screenly/anthias-viewer
-          subject-digest: ${{ steps.digests.outputs.viewer }}
-          push-to-registry: true
-
-      - name: Attest anthias-redis provenance (GHCR)
-        if: success() && github.event_name == 'push'
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
-        with:
-          subject-name: ghcr.io/screenly/anthias-redis
-          subject-digest: ${{ steps.digests.outputs.redis }}
-          push-to-registry: true
-
       - name: Attest anthias-server provenance (Docker Hub)
         if: success() && github.event_name == 'push'
         continue-on-error: true
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
         with:
-          subject-name: docker.io/screenly/anthias-server
+          subject-name: docker.io/robkanthias/anthias-server
           subject-digest: ${{ steps.digests.outputs.server }}
           push-to-registry: true
 
@@ -230,7 +202,7 @@ jobs:
         continue-on-error: true
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
         with:
-          subject-name: docker.io/screenly/anthias-viewer
+          subject-name: docker.io/robkanthias/anthias-viewer
           subject-digest: ${{ steps.digests.outputs.viewer }}
           push-to-registry: true
 
@@ -239,7 +211,7 @@ jobs:
         continue-on-error: true
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
         with:
-          subject-name: docker.io/screenly/anthias-redis
+          subject-name: docker.io/robkanthias/anthias-redis
           subject-digest: ${{ steps.digests.outputs.redis }}
           push-to-registry: true
 
@@ -259,24 +231,11 @@ jobs:
   # call is wrapped in 5-attempt exponential backoff so a transient
   # 429 / 5xx doesn't strand latest-* half-mirrored.
   #
-  # Two registries, two steps: `ghcr.io/screenly/anthias-*` is the new
-  # primary (rate-limit-friendly, free unlimited storage for public
-  # packages, auth via the workflow-issued GITHUB_TOKEN with
-  # `packages: write`) and is the hard-fail step. `screenly/anthias-*`
-  # on Docker Hub stays as a parallel mirror during the migration
-  # window so devices that haven't yet picked up the compose-template
-  # flip keep getting `latest-*` advanced — but it runs in its own
-  # step with `continue-on-error: true` because Docker Hub's
-  # unauthenticated/free-tier pull rate limit periodically 429s the
-  # manifest GETs that `imagetools create` issues, and GHCR being
-  # current is what actually matters for new devices. GHCR runs first
-  # so the canonical primary is up to date even if Docker Hub flakes.
-  # The legacy `screenly/srly-ose-*` namespace was dropped: every
-  # device that has run `upgrade_containers.sh` since 2023-02
-  # (b9998438) is on `screenly/anthias-*` already, so the parallel
-  # `srly-ose-*` push was buying no real back-compat in exchange for
-  # half the manifest GETs (one of two reasons d568602's publish hit
-  # Docker Hub's 429).
+  # One registry, one step: `robkanthias/anthias-*` on Docker Hub is
+  # the fork's only image home, so the retag is hard-fail — if it
+  # doesn't land, latest-* is stale and the run should say so. The
+  # retry/backoff inside mirror-latest-tags.sh absorbs Docker Hub's
+  # transient 429s/5xxs.
   publish-latest:
     needs: buildx
     if: github.event_name == 'push'
@@ -284,7 +243,6 @@ jobs:
     # See `buildx.permissions` above for rationale; same scoping reason.
     permissions:
       contents: read
-      packages: write
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -298,26 +256,7 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Mirror short-hash tags to latest-<board> (GHCR)
-        env:
-          NAMESPACE: ghcr.io/screenly/anthias
-        run: bash .github/workflows/scripts/mirror-latest-tags.sh
-
-      # Soft-fail: Docker Hub's free-tier pull rate limit regularly 429s
-      # the manifest GETs that `imagetools create` issues, and GHCR
-      # (mirrored above) is the canonical primary — failing the whole
-      # job because the mirror flaked would needlessly red-X otherwise
-      # green pushes. The step still runs to completion so partial
-      # mirrors get as far as they can.
       - name: Mirror short-hash tags to latest-<board> (Docker Hub)
-        continue-on-error: true
         env:
-          NAMESPACE: screenly/anthias
+          NAMESPACE: robkanthias/anthias
         run: bash .github/workflows/scripts/mirror-latest-tags.sh

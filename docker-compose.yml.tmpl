@@ -2,7 +2,7 @@
 
 services:
   anthias-server:
-    image: ghcr.io/screenly/anthias-server:${DOCKER_TAG}-${DEVICE_TYPE}
+    image: robkanthias/anthias-server:${DOCKER_TAG}-${DEVICE_TYPE}
     build:
       context: .
       dockerfile: docker/Dockerfile.server
@@ -54,7 +54,7 @@ services:
         tag: anthias-server
 
   anthias-viewer:
-    image: ghcr.io/screenly/anthias-viewer:${DOCKER_TAG}-${DEVICE_TYPE}
+    image: robkanthias/anthias-viewer:${DOCKER_TAG}-${DEVICE_TYPE}
     build:
       context: .
       dockerfile: docker/Dockerfile.viewer
@@ -132,7 +132,7 @@ services:
     # share their entire root filesystem (base apt + venv + app source),
     # and a separate celery image was duplicating ~825 MB extracted of
     # identical content per device. See refactor: drop celery image.
-    image: ghcr.io/screenly/anthias-server:${DOCKER_TAG}-${DEVICE_TYPE}
+    image: robkanthias/anthias-server:${DOCKER_TAG}-${DEVICE_TYPE}
     # ``mem_limit`` keeps a runaway celery task (e.g. a HEIC →
     # WebP convert on a decompression-bomb fixture) from eating
     # the box's RAM and starving the viewer. 60% of host (computed
@@ -187,7 +187,7 @@ services:
         tag: anthias-celery
 
   redis:
-    image: ghcr.io/screenly/anthias-redis:${DOCKER_TAG}-${DEVICE_TYPE}
+    image: robkanthias/anthias-redis:${DOCKER_TAG}-${DEVICE_TYPE}
     build:
       context: .
       dockerfile: docker/Dockerfile.redis
