@@ -29,6 +29,22 @@ Want to help Anthias thrive? Support us using [GitHub Sponsor](https://github.co
 
 See [this](https://anthias.screenly.io/docs/install/) page for options on how to install Anthias.
 
+### Production install from source (this fork)
+
+Fork-only features (first-class playlists, duplicate-asset scheduling, …) only exist in this repository's source — the published `ghcr.io/screenly` images don't have them. To install or upgrade a device with everything built from source, run one command on the device:
+
+```bash
+bash <(curl -sL https://raw.githubusercontent.com/a10kiloham/Anthias/master/bin/install_production.sh)
+```
+
+or, from an existing clone:
+
+```bash
+./bin/install_production.sh
+```
+
+It clones/syncs the repo to `~/anthias`, runs the standard installer once if the host has never been provisioned, builds the server/viewer/redis images locally for the detected board, and starts the stack from those images. Re-run it any time you pull new code.
+
 ## :white_check_mark: Compatibility
 
 ### balenaOS
