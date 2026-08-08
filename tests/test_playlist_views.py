@@ -2,10 +2,8 @@
 endpoints (thin wrappers over the same model operations as the v2
 API — these pin the form-side behaviour and the partial contract)."""
 
-from collections.abc import Iterator
 from datetime import timedelta
 from typing import Any
-from unittest import mock
 
 import pytest
 from django.test import Client
@@ -18,15 +16,6 @@ from anthias_server.app.models import (
     PlaylistItem,
     get_default_playlist,
 )
-
-
-@pytest.fixture(autouse=True)
-def _mock_ws_notify() -> Iterator[None]:
-    """Skip the Channels group_send fan-out: it's not under test here,
-    and on a host without the Docker Redis each call eats a ~20s
-    connection timeout before the swallow-and-continue path runs."""
-    with mock.patch('anthias_server.app.consumers.notify_asset_update'):
-        yield
 
 
 @pytest.fixture
