@@ -43,6 +43,7 @@ Three concerns are handled here, in order:
 import importlib.util
 import os
 import sys
+import time
 import types
 from collections.abc import Iterator
 from typing import Any
@@ -87,6 +88,23 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 os.environ.setdefault('ENVIRONMENT', 'test')
+
+# Pin the test timezone to UTC. settings.resolve_time_zone() falls
+# through conf -> TZ env -> host /etc/timezone, so on a developer host
+# in a non-UTC zone (or a shell exporting TZ=Europe/London) Django's
+# TIME_ZONE follows the host, and tests drift by the UTC offset in two
+# ways: wall-clock posts ("9:00 AM") land at a different stored UTC
+# hour than they assert, and the v1/v1.1 create-vs-get responses render
+# datetimes through two serializer paths that only agree under UTC.
+# The CI containers run UTC, which is why these only ever failed
+# locally. A hard assignment, not setdefault — the whole point is to
+# neutralise whatever zone the invoking shell happens to be in; tests
+# that exercise timezone behaviour activate their zone explicitly via
+# django.utils.timezone / time_machine. tzset() makes the pin effective
+# for C-library localtime in this process, not just Django.
+os.environ['TZ'] = 'UTC'
+if hasattr(time, 'tzset'):
+    time.tzset()
 
 
 # ---------------------------------------------------------------------------

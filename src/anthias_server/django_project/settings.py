@@ -465,33 +465,50 @@ TEMPLATES = [
 
 ASGI_APPLICATION = 'anthias_server.django_project.asgi.application'
 
-CHANNEL_LAYERS = {
-    'default': {
-        'BACKEND': 'channels_redis.core.RedisChannelLayer',
-        'CONFIG': {
-            # channels_redis polls each channel with a blocking BZPOPMIN
-            # whose server-side timeout is brpop_timeout (5s). redis-py
-            # 8.0.1 introduced a default 5s async socket read timeout
-            # (DEFAULT_SOCKET_TIMEOUT = 5); with no override the blocking
-            # read inherits it and an empty 5s poll races the socket
-            # timeout, raising "Timeout reading from redis:6379" on every
-            # cycle of an open WebSocket (issue #3228).
-            #
-            # Keep a read timeout so a genuinely dead redis connection is
-            # still detected, but set it well above the 5s poll so it
-            # cannot race: 15s = 3x brpop_timeout, leaving margin for a
-            # slow / memory-pressured board to return the empty poll
-            # before the socket read gives up.
-            'hosts': [
-                {
-                    'host': getenv('REDIS_HOST', 'redis'),
-                    'port': 6379,
-                    'socket_timeout': 15,
-                }
-            ],
+if getenv('ENVIRONMENT') == 'test' or _running_under_pytest:
+    # Unit tests run without the Docker Redis (the root conftest fakes
+    # the plain redis client, but channels_redis opens its own async
+    # connections). Every view-level write funnels a group_send through
+    # notify_asset_update; against an absent broker each call burns the
+    # full connect timeout before the swallow-and-continue path runs —
+    # ~20s per request on a dev host — and the two API tests that
+    # exercise it outright fail. The in-memory layer is the standard
+    # channels test backend; nothing in the unit suite asserts
+    # cross-process fan-out (the integration suite talks to the real
+    # server container, which keeps the Redis layer below).
+    CHANNEL_LAYERS: dict[str, Any] = {
+        'default': {'BACKEND': 'channels.layers.InMemoryChannelLayer'}
+    }
+else:
+    CHANNEL_LAYERS = {
+        'default': {
+            'BACKEND': 'channels_redis.core.RedisChannelLayer',
+            'CONFIG': {
+                # channels_redis polls each channel with a blocking
+                # BZPOPMIN whose server-side timeout is brpop_timeout
+                # (5s). redis-py 8.0.1 introduced a default 5s async
+                # socket read timeout (DEFAULT_SOCKET_TIMEOUT = 5);
+                # with no override the blocking read inherits it and an
+                # empty 5s poll races the socket timeout, raising
+                # "Timeout reading from redis:6379" on every cycle of
+                # an open WebSocket (issue #3228).
+                #
+                # Keep a read timeout so a genuinely dead redis
+                # connection is still detected, but set it well above
+                # the 5s poll so it cannot race: 15s = 3x
+                # brpop_timeout, leaving margin for a slow /
+                # memory-pressured board to return the empty poll
+                # before the socket read gives up.
+                'hosts': [
+                    {
+                        'host': getenv('REDIS_HOST', 'redis'),
+                        'port': 6379,
+                        'socket_timeout': 15,
+                    }
+                ],
+            },
         },
-    },
-}
+    }
 
 
 # Database
