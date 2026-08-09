@@ -203,3 +203,16 @@ fi
 # Without it `up -d` only logs a warning and leaves the orphans running,
 # which is confusing on a `docker ps` audit later.
 sudo -E docker compose "${COMPOSE_FILES[@]}" up -d --remove-orphans
+
+# Drop stale upstream-namespace images left behind by a device that
+# previously ran ghcr.io/screenly / screenly images (this fork pulls
+# robkanthias/anthias-*). The rmi is best-effort: an image still in
+# use by some container is skipped rather than failing the upgrade;
+# what matters is reclaiming the ~1 GB an orphaned upstream image set
+# eats on an SD card.
+set +e
+sudo docker images \
+    --format '{{.Repository}}:{{.Tag}}' \
+    | grep -E '^(ghcr\.io/screenly|screenly)/(anthias|srly-ose)-' \
+    | xargs -r sudo docker rmi >/dev/null 2>&1
+set -e
