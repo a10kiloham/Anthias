@@ -271,12 +271,13 @@ def test_remove_item_unnests_child_without_deleting_it(
         )
     )
     assert response.status_code == status.HTTP_204_NO_CONTENT
-    # The child playlist survives as a root again.
+    # The child playlist survives — back in the Default playlist,
+    # i.e. a top-level Schedule row again.
     detail = api_client.get(
         reverse('api:playlist_detail_v2', args=[child['playlist_id']])
     )
     assert detail.status_code == status.HTTP_200_OK
-    assert detail.data['parent_id'] is None
+    assert detail.data['parent_id'] == get_default_playlist().playlist_id
 
 
 @pytest.mark.django_db

@@ -302,7 +302,7 @@ def device_settings() -> dict[str, Any]:
 
 
 def assets() -> dict[str, Any]:
-    """Active + inactive asset lists for /.
+    """Active + inactive Schedule rows (assets AND playlists) for /.
 
     Partition matches what the operator can change directly from the
     home page: `is_enabled` (the Activity toggle in the row) AND
@@ -314,22 +314,88 @@ def assets() -> dict[str, Any]:
     because today's weekday isn't in the asset's play_days, and the
     operator would have no way to flip it back without editing the
     schedule. React's UI used the same operator-facing split.
-    """
-    from anthias_server.app.models import Asset
 
-    qs = Asset.objects.all()
+    The Schedule list *is* the Default playlist, so its child
+    playlists appear as rows too, interleaved with assets in item
+    order — reorderable, toggleable and deletable like any other row.
+    Row ordering follows the Default playlist's item positions
+    (mirrored from play_order for assets); an asset that has been
+    removed from the Default playlist but still exists (it plays via
+    some named playlist) sorts after the scheduled rows.
+    """
+    from django.db.models import Count
+
+    from anthias_server.app.models import (
+        Asset,
+        PlaylistItem,
+        get_default_playlist,
+    )
+
+    default_items = list(
+        get_default_playlist()
+        .items.select_related('child_playlist')
+        .order_by('position', 'id')
+    )
+    asset_position: dict[str, int] = {}
+    playlist_rows: list[dict[str, Any]] = []
+    item_counts = dict(
+        PlaylistItem.objects.values_list('playlist_id').annotate(n=Count('id'))
+    )
+    for item in default_items:
+        if item.asset_id is not None:
+            asset_position.setdefault(str(item.asset_id), item.position)
+        elif item.child_playlist is not None:
+            playlist_rows.append(
+                {
+                    'kind': 'playlist',
+                    'playlist': item.child_playlist,
+                    'item_count': item_counts.get(
+                        item.child_playlist.playlist_id, 0
+                    ),
+                    'sort': (0, item.position),
+                }
+            )
+
+    # Assets outside the Default playlist sort after every scheduled
+    # row, in play_order.
+    unscheduled = 1_000_000_000
+
+    def asset_row(asset: Asset) -> dict[str, Any]:
+        position = asset_position.get(asset.asset_id)
+        return {
+            'kind': 'asset',
+            'asset': asset,
+            'sort': (
+                (0, position)
+                if position is not None
+                else (1, unscheduled + asset.play_order)
+            ),
+        }
+
     active: list[Asset] = []
     inactive: list[Asset] = []
-    for asset in qs:
+    for asset in Asset.objects.all():
         if asset.is_enabled and not asset.is_processing:
             active.append(asset)
         else:
             inactive.append(asset)
-    active.sort(key=lambda a: a.play_order)
-    inactive.sort(key=lambda a: a.play_order)
+
+    active_rows = [asset_row(a) for a in active] + [
+        row for row in playlist_rows if row['playlist'].is_enabled
+    ]
+    inactive_rows = [asset_row(a) for a in inactive] + [
+        row for row in playlist_rows if not row['playlist'].is_enabled
+    ]
+    active_rows.sort(key=lambda row: row['sort'])
+    inactive_rows.sort(key=lambda row: row['sort'])
+
     from anthias_server.app.models import REFRESH_INTERVAL_S_MAX
 
     return {
+        'active_rows': active_rows,
+        'inactive_rows': inactive_rows,
+        # Asset-only lists still back the bulk-selection bookkeeping
+        # (syncVisibleIds) — playlist rows don't join bulk actions.
         'active_assets': active,
         'inactive_assets': inactive,
         # Render the auto-refresh input's ``max`` attribute from the
@@ -357,6 +423,22 @@ def integrations() -> dict[str, Any]:
             }
         )
     return data
+
+
+def _nested_outside_default(
+    items_by_playlist: dict[str, list[Any]],
+    all_playlists: dict[str, Any],
+) -> set[str]:
+    """Ids of playlists nested under a NON-default parent — the only
+    ones the nest picker must exclude (a Default slot is just a
+    top-level Schedule row, and nesting moves it)."""
+    return {
+        item.child_playlist_id
+        for playlist_id, items in items_by_playlist.items()
+        for item in items
+        if item.child_playlist_id is not None
+        and not all_playlists[playlist_id].is_default
+    }
 
 
 def playlists() -> dict[str, Any]:
@@ -425,8 +507,11 @@ def playlists() -> dict[str, Any]:
     return {
         'playlist_tree': [build_node(p, 0) for p in roots],
         # Pickers: any asset can be added anywhere (occurrences are
-        # M:N); only parentless, non-default playlists can be nested
-        # (the server re-validates ancestry on submit).
+        # M:N). Nestable playlists are the top-level Schedule rows —
+        # Default's children (nesting MOVES them out of the Schedule
+        # list) plus any stray parentless playlist. One nested under a
+        # non-default parent must be removed there first; the server
+        # re-validates ancestry on submit either way.
         'all_assets': sorted(
             Asset.objects.all(), key=lambda a: (a.name or '').lower()
         ),
@@ -434,7 +519,11 @@ def playlists() -> dict[str, Any]:
             (
                 p
                 for p in all_playlists.values()
-                if not p.is_default and p.playlist_id not in child_ids
+                if not p.is_default
+                and p.playlist_id
+                not in _nested_outside_default(
+                    items_by_playlist, all_playlists
+                )
             ),
             key=lambda p: (p.name or '').lower(),
         ),

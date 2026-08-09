@@ -484,6 +484,31 @@ def get_default_playlist() -> Playlist:
     return playlist
 
 
+def append_playlist_to_default(playlist: Playlist) -> PlaylistItem | None:
+    """Give ``playlist`` a slot at the end of the Default playlist.
+
+    The Schedule tab *is* the Default playlist: playlists appear there
+    as reorderable rows exactly like assets, which means every playlist
+    that isn't deliberately nested inside another one must be a child
+    item of Default — a parentless playlist would still play (it's a
+    root for the evaluator) but be invisible and un-orderable in the
+    UI. Called on create, on un-nest, and when a deleted playlist's
+    children need a new home. No-op (returns None) for the Default
+    playlist itself or a playlist that already has a parent.
+    """
+    if playlist.is_default:
+        return None
+    if getattr(playlist, 'parent_item', None) is not None:
+        return None
+    default = get_default_playlist()
+    last = default.items.order_by('-position').first()
+    return PlaylistItem.objects.create(
+        playlist=default,
+        child_playlist=playlist,
+        position=last.position + 1 if last else 0,
+    )
+
+
 def playlist_is_self_or_ancestor(candidate: Playlist, of: Playlist) -> bool:
     """True if ``candidate`` is ``of`` itself or an ancestor of it.
 

@@ -33,10 +33,10 @@
         {% endif %}
         <h2><i class="ti ti-toggle-right mr-2"></i>Enabled</h2>
       </div>
-      <span class="surface__count">{{ active_assets|length }} item{{ active_assets|length|pluralize }}</span>
+      <span class="surface__count">{{ active_rows|length }} item{{ active_rows|length|pluralize }}</span>
     </header>
 
-    {% if active_assets %}
+    {% if active_rows %}
     <table class="asset-table">
       <thead>
         <tr>
@@ -50,8 +50,12 @@
         </tr>
       </thead>
       <tbody id="active-rows">
-        {% for asset in active_assets %}
-        {% include "_asset_row.html" with asset=asset is_active=True %}
+        {% for row in active_rows %}
+        {% if row.kind == 'playlist' %}
+        {% include "_playlist_row.html" with row=row is_active=True %}
+        {% else %}
+        {% include "_asset_row.html" with asset=row.asset is_active=True %}
+        {% endif %}
         {% endfor %}
       </tbody>
     </table>
@@ -74,10 +78,10 @@
         {% endif %}
         <h2><i class="ti ti-player-pause mr-2"></i>Inactive</h2>
       </div>
-      <span class="surface__count">{{ inactive_assets|length }} item{{ inactive_assets|length|pluralize }}</span>
+      <span class="surface__count">{{ inactive_rows|length }} item{{ inactive_rows|length|pluralize }}</span>
     </header>
 
-    {% if inactive_assets %}
+    {% if inactive_rows %}
     <table class="asset-table">
       <thead>
         <tr>
@@ -91,8 +95,12 @@
         </tr>
       </thead>
       <tbody>
-        {% for asset in inactive_assets %}
-        {% include "_asset_row.html" with asset=asset is_active=False %}
+        {% for row in inactive_rows %}
+        {% if row.kind == 'playlist' %}
+        {% include "_playlist_row.html" with row=row is_active=False %}
+        {% else %}
+        {% include "_asset_row.html" with asset=row.asset is_active=False %}
+        {% endif %}
         {% endfor %}
       </tbody>
     </table>

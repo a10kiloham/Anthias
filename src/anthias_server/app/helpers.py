@@ -249,3 +249,55 @@ def reorder_playlist_items(playlist: Playlist, ordered_ids: list[int]) -> None:
             changed.append(item)
     if changed:
         PlaylistItem.objects.bulk_update(changed, ['position'])
+
+
+def save_schedule_ordering(refs: list[str]) -> None:
+    """Persist the home Schedule drag order.
+
+    ``refs`` is the on-screen row sequence: bare asset ids mixed with
+    ``playlist:<playlist_id>`` entries (the Default playlist's child
+    playlists render as reorderable rows alongside assets). Two writes:
+
+    - ``Asset.play_order`` follows the asset subsequence, keeping the
+      legacy v1/v1.1/v1.2/v2 wire field truthful.
+    - The Default playlist's items are renumbered to the full mixed
+      sequence — an asset with several occurrences moves as a group at
+      its row's position — with unlisted items (inactive rows) kept in
+      their prior relative order after the listed ones.
+    """
+    asset_ids = [r for r in refs if not r.startswith('playlist:')]
+    for i, asset_id in enumerate(asset_ids):
+        Asset.objects.filter(asset_id=asset_id).update(play_order=i)
+
+    default = get_default_playlist()
+    items = list(default.items.order_by('position', 'id'))
+    items_by_asset: dict[str, list[PlaylistItem]] = {}
+    child_by_playlist: dict[str, PlaylistItem] = {}
+    for item in items:
+        if item.asset_id is not None:
+            items_by_asset.setdefault(str(item.asset_id), []).append(item)
+        elif item.child_playlist_id is not None:
+            child_by_playlist[str(item.child_playlist_id)] = item
+
+    sequence: list[PlaylistItem] = []
+    seen: set[int] = set()
+    for ref in refs:
+        if ref.startswith('playlist:'):
+            child_item = child_by_playlist.get(ref.removeprefix('playlist:'))
+            if child_item is not None and child_item.id not in seen:
+                sequence.append(child_item)
+                seen.add(child_item.id)
+        else:
+            for item in items_by_asset.get(ref, []):
+                if item.id not in seen:
+                    sequence.append(item)
+                    seen.add(item.id)
+    sequence.extend(item for item in items if item.id not in seen)
+
+    changed = []
+    for position, item in enumerate(sequence):
+        if item.position != position:
+            item.position = position
+            changed.append(item)
+    if changed:
+        PlaylistItem.objects.bulk_update(changed, ['position'])
