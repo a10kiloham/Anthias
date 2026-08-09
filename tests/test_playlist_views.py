@@ -295,3 +295,160 @@ def test_playlist_order_endpoint_rejects_foreign_ids(
     foreign.refresh_from_db()
     assert own.position == 0
     assert foreign.position == 0
+
+
+@pytest.mark.django_db
+def test_created_playlist_is_a_schedule_row(client: Client) -> None:
+    """A new playlist lands as a child item of the Default playlist —
+    i.e. a row in the Schedule list — and renders on the home page."""
+    _hx(
+        client,
+        reverse('anthias_app:playlists_create'),
+        {'name': 'Lobby loop'},
+    )
+    playlist = Playlist.objects.get(name='Lobby loop')
+    parent_item = playlist.parent_item
+    assert parent_item is not None
+    assert parent_item.playlist.is_default
+
+    response = client.get(reverse('anthias_app:home'))
+    assert response.status_code == 200
+    assert b'Lobby loop' in response.content
+    assert f'playlist:{playlist.playlist_id}'.encode() in response.content
+
+
+@pytest.mark.django_db
+def test_disabled_playlist_renders_in_inactive_section(
+    client: Client,
+) -> None:
+    playlist = Playlist.objects.create(name='Off air', is_enabled=False)
+    from anthias_server.app.models import append_playlist_to_default
+
+    append_playlist_to_default(playlist)
+
+    from anthias_server.app.page_context import assets as assets_context
+
+    context = assets_context()
+    active_names = [
+        row['playlist'].name
+        for row in context['active_rows']
+        if row['kind'] == 'playlist'
+    ]
+    inactive_names = [
+        row['playlist'].name
+        for row in context['inactive_rows']
+        if row['kind'] == 'playlist'
+    ]
+    assert 'Off air' not in active_names
+    assert 'Off air' in inactive_names
+
+
+@pytest.mark.django_db
+def test_schedule_order_interleaves_assets_and_playlists(
+    client: Client,
+) -> None:
+    """The home drag POSTs a mixed sequence; the Default playlist's
+    items land in exactly that order and the viewer plays it."""
+    from anthias_server.app.models import (
+        append_playlist_to_default,
+        get_default_playlist,
+    )
+    from anthias_server.app.playlist_eval import expand_occurrences
+
+    a, b = _make_asset('a'), _make_asset('b')
+    playlist = Playlist.objects.create(name='p')
+    append_playlist_to_default(playlist)
+    inner = _make_asset('inner')
+    PlaylistItem.objects.filter(
+        playlist=get_default_playlist(), asset=inner
+    ).delete()
+    PlaylistItem.objects.create(playlist=playlist, asset=inner, position=0)
+
+    response = _hx(
+        client,
+        reverse('anthias_app:assets_order'),
+        {'ids': f'{b.asset_id},playlist:{playlist.playlist_id},{a.asset_id}'},
+    )
+    assert response.status_code == 200
+
+    ordered = [
+        item.asset_id or f'playlist:{item.child_playlist_id}'
+        for item in get_default_playlist().items.order_by('position', 'id')
+    ]
+    assert ordered == ['b', f'playlist:{playlist.playlist_id}', 'a']
+    # And the flattened play order follows: b, then the playlist's
+    # content, then a.
+    play_order = [o.asset.asset_id for o in expand_occurrences()]
+    assert play_order == ['b', 'inner', 'a']
+
+
+@pytest.mark.django_db
+def test_playlist_toggle_from_schedule_returns_asset_table(
+    client: Client,
+) -> None:
+    from anthias_server.app.models import append_playlist_to_default
+
+    playlist = Playlist.objects.create(name='p')
+    append_playlist_to_default(playlist)
+    response = _hx(
+        client,
+        reverse('anthias_app:playlists_toggle', args=[playlist.playlist_id]),
+        {'return': 'schedule'},
+    )
+    assert response.status_code == 200
+    assert b'id="asset-table"' in response.content
+    playlist.refresh_from_db()
+    assert playlist.is_enabled is False
+
+
+@pytest.mark.django_db
+def test_deleting_parent_rehomes_children_to_schedule(
+    client: Client,
+) -> None:
+    from anthias_server.app.models import append_playlist_to_default
+
+    parent = Playlist.objects.create(name='parent')
+    child = Playlist.objects.create(name='child')
+    append_playlist_to_default(parent)
+    PlaylistItem.objects.create(
+        playlist=parent, child_playlist=child, position=0
+    )
+
+    _hx(
+        client,
+        reverse('anthias_app:playlists_delete', args=[parent.playlist_id]),
+        {},
+    )
+    assert not Playlist.objects.filter(name='parent').exists()
+    child.refresh_from_db()
+    parent_item = child.parent_item
+    assert parent_item is not None
+    assert parent_item.playlist.is_default
+
+
+@pytest.mark.django_db
+def test_nesting_a_schedule_row_moves_it_off_the_schedule(
+    client: Client,
+) -> None:
+    from anthias_server.app.models import (
+        append_playlist_to_default,
+        get_default_playlist,
+    )
+
+    outer = Playlist.objects.create(name='outer')
+    inner = Playlist.objects.create(name='inner')
+    append_playlist_to_default(outer)
+    append_playlist_to_default(inner)
+
+    _hx(
+        client,
+        reverse('anthias_app:playlist_nest', args=[outer.playlist_id]),
+        {'child_playlist_id': inner.playlist_id},
+    )
+    inner.refresh_from_db()
+    parent_item = inner.parent_item
+    assert parent_item is not None
+    assert parent_item.playlist_id == outer.playlist_id
+    assert not PlaylistItem.objects.filter(
+        playlist=get_default_playlist(), child_playlist=inner
+    ).exists()

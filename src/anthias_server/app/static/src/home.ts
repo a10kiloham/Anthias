@@ -600,8 +600,15 @@ function installProcessingToastWatcher(): void {
 type HtmxLike = { trigger: (target: string, event: string) => void }
 
 function postOrder(orderUrl: string, tbody: HTMLElement): void {
+  // Asset rows carry data-asset-id; playlist rows (interleaved in the
+  // same tbody) carry data-item-ref="playlist:<id>". The server
+  // understands the mixed sequence.
   const ids = Array.from(tbody.children)
-    .map((tr) => (tr as HTMLElement).dataset.assetId)
+    .map(
+      (tr) =>
+        (tr as HTMLElement).dataset.assetId ||
+        (tr as HTMLElement).dataset.itemRef,
+    )
     .filter(Boolean)
     .join(',')
   const fd = new FormData()

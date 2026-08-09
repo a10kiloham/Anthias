@@ -1001,12 +1001,15 @@ def assets_delete(request: HttpRequest, asset_id: str) -> HttpResponse:
 @authorized
 @require_http_methods(['POST'])
 def assets_order(request: HttpRequest) -> HttpResponse:
-    """Mirrors api.helpers.save_active_assets_ordering — same comma-csv
-    body that React's @dnd-kit handler POSTs."""
-    from anthias_server.api.helpers import save_active_assets_ordering
+    """Persist the Schedule drag order — same comma-csv body shape the
+    home page has always POSTed, extended with ``playlist:<id>``
+    entries for the playlist rows now interleaved with assets. The
+    v1/v2 ``POST /assets/order`` API endpoints keep their pure
+    asset-id contract via save_active_assets_ordering."""
+    from anthias_server.app.helpers import save_schedule_ordering
 
-    ids = [i for i in request.POST.get('ids', '').split(',') if i]
-    save_active_assets_ordering(ids)
+    refs = [i for i in request.POST.get('ids', '').split(',') if i]
+    save_schedule_ordering(refs)
     ViewerPublisher.get_instance().send_to_viewer('reload')
     return _asset_table_response(request)
 
@@ -1964,8 +1967,17 @@ def _playlists_response(
 ) -> HttpResponse:
     """Shared response helper for the playlist write endpoints —
     same contract as ``_asset_table_response``: HTMX requests get the
-    swapped tree partial, plain form submits fall back to a redirect,
-    and ``toast`` fires the client toast either way."""
+    swapped partial, plain form submits fall back to a redirect, and
+    ``toast`` fires the client toast either way.
+
+    Playlist rows also live in the home page's Schedule table, so the
+    same endpoints serve both surfaces: a form that posts
+    ``return=schedule`` gets the asset-table partial (and the home
+    redirect) instead of the playlist tree.
+    """
+    if request.POST.get('return') == 'schedule':
+        return _asset_table_response(request, toast=toast)
+
     from anthias_server.app.consumers import notify_asset_update
 
     notify_asset_update()
@@ -2011,23 +2023,19 @@ def playlists_table_partial(request: HttpRequest) -> HttpResponse:
 @authorized
 @require_http_methods(['POST'])
 def playlists_create(request: HttpRequest) -> HttpResponse:
-    from anthias_server.app.models import Playlist
+    from anthias_server.app.models import (
+        Playlist,
+        append_playlist_to_default,
+    )
 
     name = (request.POST.get('name') or '').strip()
     if not name:
         return _playlists_response(
             request, toast=('error', 'A playlist needs a name')
         )
-    last_root_position = (
-        Playlist.objects.filter(parent_item__isnull=True)
-        .order_by('-position')
-        .values_list('position', flat=True)
-        .first()
-    )
-    Playlist.objects.create(
-        name=name,
-        position=(0 if last_root_position is None else last_root_position + 1),
-    )
+    playlist = Playlist.objects.create(name=name)
+    # New playlists land as the last row of the Schedule list.
+    append_playlist_to_default(playlist)
     ViewerPublisher.get_instance().send_to_viewer('reload')
     return _playlists_response(request, toast=('success', 'Playlist created'))
 
@@ -2035,7 +2043,10 @@ def playlists_create(request: HttpRequest) -> HttpResponse:
 @authorized
 @require_http_methods(['POST'])
 def playlists_delete(request: HttpRequest, playlist_id: str) -> HttpResponse:
-    from anthias_server.app.models import Playlist
+    from anthias_server.app.models import (
+        Playlist,
+        append_playlist_to_default,
+    )
 
     playlist = Playlist.objects.filter(playlist_id=playlist_id).first()
     if playlist is None:
@@ -2045,7 +2056,17 @@ def playlists_delete(request: HttpRequest, playlist_id: str) -> HttpResponse:
             request,
             toast=('error', 'The Default playlist cannot be deleted'),
         )
+    orphaned_children = [
+        item.child_playlist
+        for item in playlist.items.select_related('child_playlist')
+        if item.child_playlist is not None
+    ]
     playlist.delete()
+    # Cascade removed the children's parent items; re-home them so
+    # their content stays visible (and playing) in the Schedule list.
+    for child in orphaned_children:
+        child.refresh_from_db()
+        append_playlist_to_default(child)
     ViewerPublisher.get_instance().send_to_viewer('reload')
     return _playlists_response(request, toast=('success', 'Playlist deleted'))
 
@@ -2222,7 +2243,11 @@ def playlist_nest(request: HttpRequest, playlist_id: str) -> HttpResponse:
             request,
             toast=('error', 'The Default playlist cannot be nested'),
         )
-    if getattr(child, 'parent_item', None) is not None:
+    existing_parent_item = getattr(child, 'parent_item', None)
+    if (
+        existing_parent_item is not None
+        and not existing_parent_item.playlist.is_default
+    ):
         return _playlists_response(
             request,
             toast=('error', 'That playlist is already nested elsewhere'),
@@ -2232,6 +2257,10 @@ def playlist_nest(request: HttpRequest, playlist_id: str) -> HttpResponse:
             request,
             toast=('error', 'Nesting that playlist here would create a loop'),
         )
+    # A Default-playlist slot just means "top-level Schedule row" —
+    # nesting under a real parent is a move, not a second parent.
+    if existing_parent_item is not None:
+        existing_parent_item.delete()
     last = parent.items.order_by('-position').first()
     PlaylistItem.objects.create(
         playlist=parent,
@@ -2249,13 +2278,22 @@ def playlist_nest(request: HttpRequest, playlist_id: str) -> HttpResponse:
 def playlist_remove_item(
     request: HttpRequest, playlist_id: str, item_id: int
 ) -> HttpResponse:
-    from anthias_server.app.models import PlaylistItem
+    from anthias_server.app.models import (
+        PlaylistItem,
+        append_playlist_to_default,
+    )
 
     item = PlaylistItem.objects.filter(
         id=item_id, playlist_id=playlist_id
     ).first()
     if item is not None:
+        child = item.child_playlist
         item.delete()
+        # An un-nested playlist returns to the end of the Schedule
+        # list rather than becoming an invisible root.
+        if child is not None:
+            child.refresh_from_db()
+            append_playlist_to_default(child)
         ViewerPublisher.get_instance().send_to_viewer('reload')
     return _playlists_response(request, toast=('success', 'Item removed'))
 

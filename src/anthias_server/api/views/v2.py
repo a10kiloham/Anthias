@@ -78,6 +78,7 @@ from anthias_server.app.models import (
     Asset,
     Playlist,
     PlaylistItem,
+    append_playlist_to_default,
     playlist_is_self_or_ancestor,
 )
 from anthias_server.app.playlist_eval import evaluate_playlist
@@ -1430,10 +1431,13 @@ class PlaylistListViewV2(APIView):
     @extend_schema(
         summary='Create playlist',
         description=(
-            'Creates a root playlist (nest it by adding a '
-            'child_playlist item to the intended parent). Playlists '
-            'repeat by default; pass repeat=false for a play-once-'
-            'per-activation playlist.'
+            'Creates a playlist as an item at the end of the Default '
+            'playlist — i.e. a new row in the Schedule list, '
+            'reorderable alongside assets. Nest it inside another '
+            'playlist by adding a child_playlist item to the intended '
+            'parent (which moves it out of the schedule list). '
+            'Playlists repeat by default; pass repeat=false for a '
+            'play-once-per-activation playlist.'
         ),
         request=CreatePlaylistSerializerV2,
         responses={201: PlaylistSerializerV2},
@@ -1442,21 +1446,12 @@ class PlaylistListViewV2(APIView):
     def post(self, request: Request) -> Response:
         serializer = CreatePlaylistSerializerV2(data=request.data)
         serializer.is_valid(raise_exception=True)
-        last_root_position = (
-            Playlist.objects.filter(parent_item__isnull=True)
-            .order_by('-position')
-            .values_list('position', flat=True)
-            .first()
-        )
-        playlist = Playlist.objects.create(
-            position=(
-                0 if last_root_position is None else last_root_position + 1
-            ),
-            **serializer.validated_data,
-        )
+        playlist = Playlist.objects.create(**serializer.validated_data)
+        append_playlist_to_default(playlist)
         _nudge_viewer()
+        refreshed = _playlist_queryset().get(playlist_id=playlist.playlist_id)
         return Response(
-            PlaylistSerializerV2(playlist).data,
+            PlaylistSerializerV2(refreshed).data,
             status=status.HTTP_201_CREATED,
         )
 
@@ -1497,9 +1492,10 @@ class PlaylistViewV2(APIView):
         summary='Delete playlist',
         description=(
             'Deletes the playlist and its items. Nested child '
-            'playlists are re-rooted (their content survives); assets '
-            'are never deleted. The Default playlist cannot be '
-            'deleted.'
+            'playlists move back into the Default playlist (their '
+            'content survives and stays visible in the Schedule '
+            'list); assets are never deleted. The Default playlist '
+            'cannot be deleted.'
         ),
         responses={204: None, 404: None, 409: None},
     )
@@ -1511,7 +1507,18 @@ class PlaylistViewV2(APIView):
                 {'error': 'The Default playlist cannot be deleted.'},
                 status=status.HTTP_409_CONFLICT,
             )
+        orphaned_children = [
+            item.child_playlist
+            for item in playlist.items.select_related('child_playlist')
+            if item.child_playlist is not None
+        ]
         playlist.delete()
+        # The cascade deleted the children's parent items, leaving them
+        # parentless — playing (any root plays) but invisible in the
+        # Schedule list. Re-home them so nothing silently disappears.
+        for child in orphaned_children:
+            child.refresh_from_db()
+            append_playlist_to_default(child)
         _nudge_viewer()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -1524,10 +1531,14 @@ class PlaylistItemsViewV2(APIView):
         description=(
             'Appends an asset occurrence or nests a child playlist. '
             'The same asset may be added any number of times (each '
-            'item is an independent occurrence); a playlist may only '
-            'be nested once (one parent, tree shape), never under '
-            'itself or a descendant, and the Default playlist cannot '
-            'be nested. Optional position inserts at that slot.'
+            'item is an independent occurrence). A playlist has one '
+            'parent (tree shape): nesting a playlist that currently '
+            'sits in the Default playlist MOVES it here (out of the '
+            'top-level Schedule list); one nested under any other '
+            'playlist must be removed there first. Never nestable '
+            'under itself or a descendant, and the Default playlist '
+            'cannot be nested. Optional position inserts at that '
+            'slot.'
         ),
         request=CreatePlaylistItemSerializerV2,
         responses={201: PlaylistSerializerV2, 400: None, 404: None},
@@ -1552,7 +1563,11 @@ class PlaylistItemsViewV2(APIView):
                     {'error': 'The Default playlist cannot be nested.'},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
-            if getattr(child, 'parent_item', None) is not None:
+            existing_parent_item = getattr(child, 'parent_item', None)
+            if (
+                existing_parent_item is not None
+                and not existing_parent_item.playlist.is_default
+            ):
                 return Response(
                     {
                         'error': (
@@ -1572,6 +1587,11 @@ class PlaylistItemsViewV2(APIView):
                     },
                     status=status.HTTP_400_BAD_REQUEST,
                 )
+            # Sitting in the Default playlist just means "top-level
+            # row in the Schedule list" — nesting it under a real
+            # parent is a MOVE, not a second parent.
+            if existing_parent_item is not None:
+                existing_parent_item.delete()
 
         items = list(playlist.items.all())
         requested = data.get('position')
@@ -1603,9 +1623,10 @@ class PlaylistItemViewV2(APIView):
     @extend_schema(
         summary='Remove an item from a playlist',
         description=(
-            'Removes the occurrence (or un-nests the child playlist — '
-            'which becomes a root playlist again). Assets are never '
-            'deleted by this call.'
+            'Removes the occurrence (or un-nests the child playlist, '
+            'which moves back to the end of the Default playlist — '
+            'i.e. becomes a top-level Schedule row again). Assets are '
+            'never deleted by this call.'
         ),
         responses={204: None, 404: None},
     )
@@ -1616,7 +1637,11 @@ class PlaylistItemViewV2(APIView):
         item = get_object_or_404(
             PlaylistItem, id=item_id, playlist_id=playlist_id
         )
+        child = item.child_playlist
         item.delete()
+        if child is not None:
+            child.refresh_from_db()
+            append_playlist_to_default(child)
         _nudge_viewer()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
