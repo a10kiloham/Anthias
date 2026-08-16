@@ -220,7 +220,7 @@ def build_image(
                 # `image-manifest=true` writes the cache as an OCI
                 # image manifest rather than the legacy index-only
                 # form, which is the only thing GHCR will accept
-                # under the ghcr.io/screenly/anthias-* repos (it
+                # under the ghcr.io/a10kiloham/anthias-* repos (it
                 # rejects standalone cache manifests). Cheap, just
                 # affects how the cache blob is wrapped.
                 'image-manifest': 'true',
@@ -327,7 +327,7 @@ def build_image(
         '$XDG_CACHE_HOME/anthias-buildx/<board>/ (typically '
         '~/.cache/anthias-buildx/) and is right for local dev. '
         '`registry` pushes the cache to '
-        'ghcr.io/screenly/anthias-<service>:buildcache-<board> for '
+        'ghcr.io/a10kiloham/anthias-<service>:buildcache-<board> for '
         'CI — reuses the GHCR login already done by the workflow, '
         'no extra tokens needed. Override via $BUILDX_CACHE_BACKEND.'
     ),

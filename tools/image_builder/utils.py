@@ -2,7 +2,7 @@ from typing import Any
 
 from jinja2 import Environment, FileSystemLoader
 
-from tools.image_builder.constants import BASE_IMAGE
+from tools.image_builder.constants import BASE_IMAGE, GITHUB_REPO_URL
 
 
 def get_build_parameters(build_target: str) -> dict[str, Any]:
@@ -161,15 +161,14 @@ def get_test_context() -> dict[str, Any]:
 
 
 def get_viewer_context(board: str, target_platform: str) -> dict[str, Any]:
-    # The prebuilt Qt 5 toolchain tarballs live on UPSTREAM's GitHub
-    # release — the fork never published its own copies, so this URL
-    # deliberately does not follow GITHUB_REPO_URL (same exception as
-    # the ghcr.io/screenly/bun base image: public, pinned, pull-only
-    # upstream artifacts). Retargeting it at the fork 404s the pi2/pi3
-    # viewer builds. If the fork ever rebuilds the toolchain
-    # (bin/rebuild_qt5_toolchain.sh) and publishes its own WebView-v*
-    # release, point this at GITHUB_REPO_URL again.
-    releases_url = 'https://github.com/Screenly/Anthias/releases/download'
+    # The prebuilt Qt 5 toolchain tarballs are hosted on the FORK's own
+    # WebView-v* release — a checksum-verified mirror of upstream's
+    # artifacts — so the image pipeline has no build-time dependency on
+    # upstream infrastructure (same posture as the ghcr.io/a10kiloham
+    # bun mirror). To CVE-patch or bump the toolchain run
+    # bin/rebuild_qt5_toolchain.sh and upload the tarballs to a new
+    # WebView-v* release on the fork.
+    releases_url = f'{GITHUB_REPO_URL}/releases/download'
 
     is_qt6 = board in ['pi5', 'pi4-64', 'pi3-64', 'x86', 'arm64']
 
