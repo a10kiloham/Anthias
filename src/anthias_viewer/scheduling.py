@@ -28,8 +28,12 @@ def get_specific_asset(asset_id: str) -> dict[str, Any] | None:
 
 
 def _asset_to_dict(asset: Asset) -> dict[str, Any]:
+    # playlist_id is a UI-side grouping concern — the viewer plays
+    # whatever play_order says, so keep the playlist payload unchanged.
     return {
-        k: v for k, v in asset.__dict__.items() if k not in ['_state', 'md5']
+        k: v
+        for k, v in asset.__dict__.items()
+        if k not in ['_state', 'md5', 'playlist_id']
     }
 
 

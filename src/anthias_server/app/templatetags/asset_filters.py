@@ -115,9 +115,12 @@ def asset_date(value: datetime | None) -> str:
 def _to_dict(obj: Any) -> Any:
     if hasattr(obj, '_meta'):
         out: dict[str, Any] = {}
+        # attname, not name: for FKs (Asset.playlist) that yields the
+        # raw id column ('playlist_id') instead of pulling the related
+        # row into the blob; identical for every other field.
         for field in obj._meta.fields:
-            value = getattr(obj, field.name)
-            out[field.name] = _coerce(value)
+            value = getattr(obj, field.attname)
+            out[field.attname] = _coerce(value)
         # Pre-format the local-time strings the edit modal binds to so
         # the template doesn't re-do the timezone math in JS — keeps
         # parity with the React EditAssetModal which used Intl.
@@ -207,6 +210,30 @@ def asset_ids(assets: Any) -> str:
     """
     ids = [getattr(a, 'asset_id', '') for a in (assets or [])]
     return json.dumps(ids, separators=(',', ':'))
+
+
+@register.filter
+def playlist_options(playlists: Any) -> str:
+    """Render playlists as a JSON array of {id, name} pairs.
+
+    Inlined into the asset-table partial's ``x-init`` (same
+    double-quoted-attribute escaping contract as ``asset_ids`` — plain
+    ``str`` on purpose so autoescaping keeps the markup valid) to
+    publish the current playlist list to Alpine after every swap. The
+    bulk bar's "Add to playlist" select and the edit modal's playlist
+    select both live *outside* the swapped partial, so this is how
+    they stay current without a full page reload.
+    """
+    return json.dumps(
+        [
+            {
+                'id': getattr(p, 'playlist_id', ''),
+                'name': getattr(p, 'name', '') or '',
+            }
+            for p in (playlists or [])
+        ],
+        separators=(',', ':'),
+    )
 
 
 @register.filter

@@ -8,7 +8,7 @@
 {% endblock %}
 
 {% block main %}
-<div class="app-container" :class="{ 'has-bulk-selection': selectedIds.length }" x-data="homeApp()" @asset-saved.window="closeModal()" @bulk-done.window="onBulkDone($event)">
+<div class="app-container" :class="{ 'has-bulk-selection': selectedIds.length }" x-data="homeApp()" @asset-saved.window="closeModal()" @playlist-saved.window="closePlaylistModal()" @bulk-done.window="onBulkDone($event)">
   <div class="page-header-bar">
     <div class="page-header-bar__title">
       <h1 class="page-header">Schedule Overview</h1>
@@ -29,6 +29,9 @@
           <i class="ti ti-player-skip-forward"></i><span class="hidden md:inline">Next</span>
         </button>
       </form>
+      <button type="button" id="add-playlist-button" class="app-btn app-btn-light app-btn-pill" @click="openPlaylistCreate()">
+        <i class="ti ti-playlist-add"></i><span>Add Playlist</span>
+      </button>
       <button type="button" id="add-asset-button" class="app-btn app-btn-primary app-btn-pill" @click="openAdd()">
         <i class="ti ti-plus"></i><span>Add Asset</span>
       </button>
@@ -50,6 +53,92 @@
   {% include "_bulk_action_bar.html" %}
 
   {% include "_bulk_edit_modal.html" %}
+
+  {% comment %} Create / rename playlist modal. One form, mode-driven:
+     playlistModal.mode is 'create' (POST playlists/new/) or 'rename'
+     (POST playlists/<id>/rename/). Mirrors the edit-asset form's
+     dynamic :action / x-bind:hx-post pattern; on success the server
+     returns the table partial (which re-syncs the playlist list into
+     Alpine) and 'playlist-saved' closes the modal. {% endcomment %}
+  <template x-if="playlistModal">
+    <div
+      class="modal-overlay"
+      @keydown.escape.window="closePlaylistModal()"
+      @click.self="closePlaylistModal()"
+    >
+      <div class="modal-card modal-card--sm">
+        <form
+          method="post"
+          :action="playlistModal.mode === 'rename' ? `/playlists/${playlistModal.id}/rename/` : '{% url 'anthias_app:playlists_create' %}'"
+          x-bind:hx-post="playlistModal.mode === 'rename' ? `/playlists/${playlistModal.id}/rename/` : '{% url 'anthias_app:playlists_create' %}'"
+          hx-target="#asset-table"
+          hx-swap="outerHTML"
+          hx-on::after-request="if (event.detail.successful) { window.dispatchEvent(new CustomEvent('playlist-saved')); }"
+        >
+          {% csrf_token %}
+          <div class="modal-card__header">
+            <h2 x-text="playlistModal.mode === 'rename' ? 'Rename playlist' : 'Add playlist'"></h2>
+            <button type="button" class="modal-card__close" @click="closePlaylistModal()" aria-label="Close">
+              <i class="ti ti-x"></i>
+            </button>
+          </div>
+          <div class="modal-card__body">
+            <div class="app-floating mb-3">
+              <input type="text" class="app-input" id="playlist-name" name="name" placeholder=" " required
+                x-model="playlistModal.name" x-init="$nextTick(() => $el.focus())">
+              <label for="playlist-name">Playlist name</label>
+            </div>
+            <p class="muted-label m-0" x-show="playlistModal.mode === 'create'">
+              Group assets so you can enable, disable, and sequence them together. Assign assets from the edit dialog or by selecting rows and using “Add to playlist”.
+            </p>
+          </div>
+          <div class="modal-card__footer">
+            <button type="button" class="app-btn app-btn-link" @click="closePlaylistModal()">Cancel</button>
+            <button type="submit" id="playlist-save" class="app-btn app-btn-primary">
+              <i class="ti" :class="playlistModal.mode === 'rename' ? 'ti-check' : 'ti-plus'"></i>
+              <span x-text="playlistModal.mode === 'rename' ? 'Save' : 'Create playlist'"></span>
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </template>
+
+  {% comment %} Playlist delete confirmation — same shell as the asset
+     delete prompt below. Deleting a playlist keeps its assets. {% endcomment %}
+  <div
+    x-show="pendingPlaylistDelete"
+    x-cloak
+    class="modal-overlay"
+    style="z-index: 1060"
+    @keydown.escape.window="pendingPlaylistDelete = null"
+    @click.self="pendingPlaylistDelete = null"
+  >
+    <div class="modal-card modal-card--sm">
+      <div class="modal-card__header">
+        <h2>Delete playlist?</h2>
+        <button type="button" class="modal-card__close" @click="pendingPlaylistDelete = null" aria-label="Close">
+          <i class="ti ti-x"></i>
+        </button>
+      </div>
+      <div class="modal-card__body">
+        <p class="m-0">
+          You're about to delete
+          <strong x-text="pendingPlaylistDelete ? pendingPlaylistDelete.name : 'this playlist'"></strong>.
+          Its assets are kept and simply leave the playlist.
+        </p>
+      </div>
+      <div class="modal-card__footer">
+        <button type="button" class="app-btn app-btn-link" @click="pendingPlaylistDelete = null">Cancel</button>
+        <form method="post" :action="pendingPlaylistDelete && `/playlists/${pendingPlaylistDelete.id}/delete/`" class="inline m-0">
+          {% csrf_token %}
+          <button type="submit" class="app-btn app-btn-danger confirm-playlist-delete">
+            <i class="ti ti-trash"></i><span>Delete</span>
+          </button>
+        </form>
+      </div>
+    </div>
+  </div>
 
   {% comment %} Delete confirmation overlay — shared shell with the reboot/shutdown
      prompt on /settings (.modal-overlay + .modal-card pattern). {% endcomment %}

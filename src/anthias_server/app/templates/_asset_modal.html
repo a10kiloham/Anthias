@@ -432,6 +432,21 @@
               x-text="isAppAsset ? 'App' : editAsset.mimetype"></span>
           </div>
 
+          {% comment %} Playlist membership. Options come from the Alpine
+             `playlists` state (synced on every table-partial swap) so a
+             playlist created moments ago is immediately assignable.
+             Only shown when at least one playlist exists — with none,
+             the posted empty value is a harmless no-op. {% endcomment %}
+          <div class="app-floating mb-3" x-show="playlists.length">
+            <select class="app-select" id="edit-playlist" name="playlist_id">
+              <option value="">No playlist</option>
+              <template x-for="p in playlists" :key="p.id">
+                <option :value="p.id" :selected="editAsset.playlist_id === p.id" x-text="p.name"></option>
+              </template>
+            </select>
+            <label for="edit-playlist">Playlist</label>
+          </div>
+
           {% comment %} App reconfiguration. appEdit() (apps.ts) refetches
              the app's manifest by metadata.app.manifest_url, re-renders
              the same manifest-driven config form seeded from the saved

@@ -269,9 +269,11 @@ def assets() -> dict[str, Any]:
     operator would have no way to flip it back without editing the
     schedule. React's UI used the same operator-facing split.
     """
-    from anthias_server.app.models import Asset
+    from anthias_server.app.models import Asset, Playlist
 
-    qs = Asset.objects.all()
+    # select_related so the playlist badge on each row doesn't add a
+    # query per asset (the table re-renders every 5 s on the HTMX poll).
+    qs = Asset.objects.select_related('playlist').all()
     active: list[Asset] = []
     inactive: list[Asset] = []
     for asset in qs:
@@ -283,9 +285,31 @@ def assets() -> dict[str, Any]:
     inactive.sort(key=lambda a: a.play_order)
     from anthias_server.app.models import REFRESH_INTERVAL_S_MAX
 
+    # Playlist management rows. Counts are derived from the asset list
+    # already in hand rather than per-playlist COUNT queries. The
+    # attributes are stamped onto the instances for the template only —
+    # nothing persists them.
+    playlists = list(Playlist.objects.all())
+    member_counts: dict[str, int] = {}
+    enabled_counts: dict[str, int] = {}
+    for asset in [*active, *inactive]:
+        pid = asset.playlist_id
+        if pid is None:
+            continue
+        member_counts[pid] = member_counts.get(pid, 0) + 1
+        if asset.is_enabled:
+            enabled_counts[pid] = enabled_counts.get(pid, 0) + 1
+    for playlist in playlists:
+        count = member_counts.get(playlist.playlist_id, 0)
+        enabled = enabled_counts.get(playlist.playlist_id, 0)
+        playlist.member_count = count
+        playlist.enabled_count = enabled
+        playlist.all_enabled = bool(count and enabled == count)
+
     return {
         'active_assets': active,
         'inactive_assets': inactive,
+        'playlists': playlists,
         # Render the auto-refresh input's ``max`` attribute from the
         # same constant the v2 serializer / form handler use, so the
         # client-side and server-side caps can't drift.
