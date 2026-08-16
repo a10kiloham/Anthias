@@ -19,8 +19,10 @@ import redis.exceptions
 import requests
 import sh as sh
 
+from anthias_common import smart, storage_health
 from anthias_common.board import is_low_ram_device
 from anthias_common.http import get_anthias_product_token
+from anthias_server.lib import cec, cec_client
 from anthias_server.settings import LISTEN, PORT, ReplySender, settings
 from anthias_viewer import media_player as _media_player_module
 from anthias_viewer.constants import BLACK_SCREEN as BLACK_SCREEN
@@ -721,6 +723,51 @@ def send_current_asset_id_to_server(correlation_id: str | None) -> None:
     )
 
 
+def _reply_cec_status(correlation_id: str | None) -> None:
+    """Answer a ``display_power_status`` request.
+
+    The viewer owns CEC because it is the only container that can reach
+    ``/dev/cec*`` on every board and every deployment — see
+    ``anthias_server.lib.cec_client`` for why the server cannot.
+    """
+    if not correlation_id:
+        logger.warning(
+            'display_power_status received without a correlation ID; '
+            'dropping reply.'
+        )
+        return
+    try:
+        status = cec.power_status()
+    except cec.CEC_ERRORS as exc:
+        logger.warning('CEC power query failed: %s', exc)
+        status = cec.PowerStatus.ERROR
+    reply_sender.send(correlation_id, {'status': str(status)})
+
+
+def _reply_cec_set_power(correlation_id: str | None, on: bool) -> None:
+    """Answer a ``display_on`` / ``display_off`` request.
+
+    ``busy`` tells the caller nothing was transmitted, so a scheduler
+    retries rather than latching a command that never went out.
+    """
+    if not correlation_id:
+        logger.warning(
+            'display power command received without a correlation ID; '
+            'dropping reply.'
+        )
+        return
+    payload: dict[str, Any]
+    try:
+        acknowledged, attempted = cec.set_power(on)
+        payload = {'acknowledged': acknowledged, 'attempted': attempted}
+    except cec.CecBusyError:
+        payload = {'busy': True, 'acknowledged': 0, 'attempted': 0}
+    except cec.CEC_ERRORS as exc:
+        logger.warning('CEC power command failed: %s', exc)
+        payload = {'acknowledged': 0, 'attempted': 0, 'error': str(exc)}
+    reply_sender.send(correlation_id, payload)
+
+
 def blank_display() -> None:
     """Handle the ``blank`` command: darken the screen and pause playback.
 
@@ -784,6 +831,13 @@ commands = {
     'unblank': lambda _: unblank_display(),
     'unknown': lambda _: command_not_found(),
     'current_asset_id': lambda corr: send_current_asset_id_to_server(corr),
+    # HDMI-CEC. Handled here rather than in anthias-server because the
+    # viewer is the only container with access to /dev/cec* on every
+    # board and every deployment (privileged: true in all three compose
+    # templates, balena included).
+    'display_power_status': lambda corr: _reply_cec_status(corr),
+    'display_on': lambda corr: _reply_cec_set_power(corr, True),
+    'display_off': lambda corr: _reply_cec_set_power(corr, False),
 }
 
 
@@ -2534,6 +2588,13 @@ DISPLAY_RESOLUTION_KEY = 'viewer:display_resolution'
 DISPLAY_RESOLUTION_INTERVAL_S = 60
 DISPLAY_RESOLUTION_TTL_S = 180
 
+# SMART sampling cadence. Hourly because none of it moves faster than
+# that -- wear is a months-long trend and power-on hours tick once an
+# hour by definition -- and because each sample is an ATA/NVMe command
+# to a device that may already be struggling. Comfortably inside
+# smart.TTL_S so an ordinary slow sample never expires the fact.
+SMART_INTERVAL_S = 3600
+
 
 def _publish_display_resolution_once() -> None:
     """One reporter tick — detect the resolution and write it to Redis.
@@ -2587,6 +2648,76 @@ def _publish_display_resolution_loop() -> None:
     t.start()
 
 
+def _publish_smart_loop() -> None:
+    """Background reporter -- sample SMART and publish it for the server.
+
+    anthias-server renders the storage card but cannot read SMART: the
+    ioctl needs privilege it deliberately does not have, and on Balena
+    it cannot be handed the device node at all. This container is
+    ``privileged: true`` everywhere, so it does the reading. Same
+    division of labour as CEC (see anthias_server/lib/cec_client.py),
+    but published as a plain Redis fact rather than answered over the
+    request-reply bus, because SMART moves over hours and the server
+    reads it during a page render.
+
+    The disk is whichever one backs the data directory, resolved the
+    same way the server resolves it, so the two cannot disagree about
+    which device they are describing.
+    """
+    import threading
+
+    def tick() -> None:
+        while True:
+            try:
+                # settings.get_configdir() rather than letting probe()
+                # fall back to $HOME. HOME is /data in every compose
+                # template and survives start_viewer.sh's `sudo -E -u
+                # viewer` (verified on the x86 testbed), so the two
+                # agree today -- but resolving the disk the server
+                # reports on must not hinge on an env var surviving a
+                # shell script. anthias-celery passes the same thing
+                # to the storage watcher for the same reason.
+                facts = storage_health.probe(settings.get_configdir())
+                disk = facts.get('disk')
+                # Only ever a real answer on SATA/NVMe. SD and eMMC
+                # have their own registers and smartctl has nothing to
+                # say about them, so most of the fleet skips this.
+                if disk and facts['media']['kind'] == 'disk':
+                    smart.publish(r, smart.collect(f'/dev/{disk}'))
+            except Exception:
+                # A diagnostic must never take the viewer down; the
+                # display pipeline matters more.
+                logger.warning('Could not sample SMART', exc_info=True)
+            sleep(SMART_INTERVAL_S)
+
+    t = threading.Thread(target=tick, name='smart-reporter', daemon=True)
+    t.start()
+
+
+def _publish_cec_availability() -> None:
+    """Tell anthias-server whether this device has a CEC adapter.
+
+    The server gates its settings UI and its display-power endpoint on
+    this, and cannot answer it itself — it has no CEC device nodes. It is
+    published as a Redis fact rather than answered over the request-reply
+    bus because it gates a page render and must stay cheap; enumerating
+    costs 0.0-0.1 ms per adapter, so doing it once at startup is ample.
+    """
+    try:
+        adapters = cec.CecAdapter.enumerate()
+        cec_client.publish_availability(bool(adapters))
+        logger.info(
+            'CEC: %d adapter(s) present: %s',
+            len(adapters),
+            ', '.join(f'{a.node} ({a.physical_address_str})' for a in adapters)
+            or 'none',
+        )
+    except Exception:
+        # Never let a CEC probe stop the viewer starting — it is a
+        # peripheral feature and the display pipeline matters more.
+        logger.warning('Could not publish CEC availability', exc_info=True)
+
+
 def main() -> None:
     global scheduler
 
@@ -2596,7 +2727,11 @@ def main() -> None:
     subscriber.daemon = True
     subscriber.start()
 
+    _publish_cec_availability()
+
     _publish_display_resolution_loop()
+
+    _publish_smart_loop()
 
     # This will prevent white screen from happening before showing the
     # splash screen with IP addresses.

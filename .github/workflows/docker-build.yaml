@@ -43,9 +43,10 @@ jobs:
     # Scoped per-job (not at workflow level) so `run-tests` and any
     # future read-only job don't inherit `packages: write`. `buildx`
     # needs it so `docker login ghcr.io` with GITHUB_TOKEN can push
-    # both ghcr.io/screenly/anthias-* image tags and the
-    # `buildcache-*` registry cache tags written by --cache-backend=
-    # registry. `contents: read` is the implicit default but pinned
+    # the ghcr.io/a10kiloham `buildcache-*` registry cache tags
+    # written by --cache-backend=registry (the images themselves go
+    # to docker.io/robkanthias via DOCKER_USERNAME/DOCKER_PASSWORD).
+    # `contents: read` is the implicit default but pinned
     # explicitly so a future workflow edit can't silently lose
     # checkout access. `id-token: write` + `attestations: write` let
     # the keyless build-provenance step below mint Sigstore-backed
@@ -191,7 +192,7 @@ jobs:
       - name: Attest anthias-server provenance (Docker Hub)
         if: success() && github.event_name == 'push'
         continue-on-error: true
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-name: docker.io/robkanthias/anthias-server
           subject-digest: ${{ steps.digests.outputs.server }}
@@ -200,7 +201,7 @@ jobs:
       - name: Attest anthias-viewer provenance (Docker Hub)
         if: success() && github.event_name == 'push'
         continue-on-error: true
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-name: docker.io/robkanthias/anthias-viewer
           subject-digest: ${{ steps.digests.outputs.viewer }}
@@ -209,7 +210,7 @@ jobs:
       - name: Attest anthias-redis provenance (Docker Hub)
         if: success() && github.event_name == 'push'
         continue-on-error: true
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-name: docker.io/robkanthias/anthias-redis
           subject-digest: ${{ steps.digests.outputs.redis }}
