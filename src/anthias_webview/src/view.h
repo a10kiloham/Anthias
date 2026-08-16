@@ -3,9 +3,12 @@
 #include <QWidget>
 #include <QWebEngineView>
 #include <QAuthenticator>
+#include <QByteArray>
+#include <QList>
 #include <QNetworkAccessManager>
 #include <QImage>
 #include <QMovie>
+#include <QPair>
 #include <QTimer>
 #include <QUrl>
 #include <QVariantMap>
@@ -13,6 +16,13 @@
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
 #include "videoview.h"
 #endif
+
+// Defined in view.cpp. A QWebEngineUrlRequestInterceptor installed on
+// the shared profile that attaches the current webpage asset's custom
+// headers to same-origin requests (#2215). Forward-declared so View can
+// hold a pointer without pulling the QtWebEngineCore interceptor headers
+// into every translation unit that includes view.h.
+class RequestHeaderInterceptor;
 
 class View : public QWidget
 {
@@ -22,9 +32,15 @@ public:
     explicit View(QWidget* parent);
     ~View();
 
-    void loadPage(const QString &uri);
-    void loadImage(const QString &uri);
+    void loadPage(const QString &uri, bool skipSslVerify = false);
+    void loadImage(const QString &uri, bool skipSslVerify = false);
     void setReloadInterval(int seconds);
+    // Per-asset custom HTTP request headers (#2215). ``headersJson`` is
+    // a JSON object of ``{name: value}`` string pairs (an empty object
+    // clears them). The viewer calls this right before loadPage so the
+    // interceptor is armed when the navigation fires; the headers are
+    // scoped to the loaded URL's origin (scheme+host+port) at load time.
+    void setRequestHeaders(const QString &headersJson);
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
     // Hands the URI + option dict to VideoView (QtMultimedia
     // QMediaPlayer rendering into a QML VideoOutput) and switches
@@ -86,6 +102,13 @@ private:
     bool isAnimatedImage;
     quint64 loadGenerationId;
 
+    // Manual rotation applied in paintEvent to raster image assets —
+    // still images and animated GIFs, which share the ``currentImage``
+    // draw path — in degrees clockwise (0/90/180/270). Set once at
+    // construction from linuxfbRotationOverride(); non-zero only on
+    // linuxfb boards whose QPA plugin ignores ``rotation=N``.
+    int imageRotation;
+
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
     // QtMultimedia-backed video widget (issue #2904). Sibling of
     // the web / image widgets — visibility is toggled rather than
@@ -93,6 +116,16 @@ private:
     // across plays (no pipeline rebuild per asset).
     VideoView* videoView;
 #endif
+
+    // Request interceptor + the headers staged for the next page load
+    // (#2215). ``pendingHeaders`` is set by setRequestHeaders and applied
+    // — together with the loaded URL's origin (scheme+host+port) — to
+    // ``headerInterceptor`` in startPageLoad. Only touched on the UI
+    // thread; the interceptor's own
+    // copy is mutex-guarded because Chromium may invoke interceptRequest
+    // on a different thread (Qt 5).
+    RequestHeaderInterceptor* headerInterceptor;
+    QList<QPair<QByteArray, QByteArray>> pendingHeaders;
 
     // Dual web view system
     QWebEngineView* webView1;

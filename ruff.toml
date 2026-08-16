@@ -6,8 +6,23 @@ exclude = [
     # the file header. Reformatting would put the file off-pin and
     # silently break the provenance comment.
     "src/anthias_webview/sysroot-relativelinks.py",
+    # Build-time-only stdlib shims (imp/pipes/cgi) copied into the Qt 5
+    # toolchain builder image to satisfy Chromium 87's Python-2-era build
+    # tooling on Debian trixie's Python 3.13. Not app code; they emulate
+    # removed-stdlib APIs, so app formatting/typing rules don't apply.
+    "src/anthias_webview/pyshim/*.py",
 ]
 target-version = "py313"
+
+[lint]
+# Ruff 0.16.0 enables ~413 rules by default (up from 59); we adopt that
+# expanded set and fix the findings rather than pinning the old default.
+# The one family we opt out of is BLE001 (blind-except): Anthias is a
+# signage appliance that must degrade gracefully rather than crash, so
+# `except Exception:` around Redis reads, subprocess probes, viewer
+# teardown, etc. is a deliberate, load-bearing pattern. Narrowing every
+# such site would trade a real reliability property for a lint checkbox.
+ignore = ["BLE001"]
 
 [format]
 quote-style = "single"

@@ -7,6 +7,8 @@ from requests import get as requests_get
 from anthias_common.utils import connect_to_redis
 from anthias_server.lib.diagnostics import get_anthias_release
 
+logger = logging.getLogger(__name__)
+
 r = connect_to_redis()
 
 # Cache the latest-release lookup for 24h. Lines up with GitHub's
@@ -30,8 +32,17 @@ LAST_VERDICT_KEY_PREFIX = 'is-up-to-date:last-verdict'
 
 DEFAULT_REQUESTS_TIMEOUT = 5  # seconds
 
-GITHUB_RELEASES_LATEST_URL = (
-    'https://api.github.com/repos/a10kiloham/Anthias/releases/latest'
+# The releases *list*, not ``/releases/latest``: that endpoint returns
+# the newest non-draft, non-prerelease release of ANY kind, and the
+# repo also publishes non-app releases (e.g. the frozen Qt 5 toolchain,
+# tagged ``WebView-v2026.07.1``). The day such a release goes out,
+# ``/releases/latest`` stops pointing at an Anthias CalVer tag and the
+# update check degrades fleet-wide until the next app release (Sentry
+# ANTHIAS-3P). Listing lets us pick the highest CalVer-parseable tag
+# instead. 20 releases is years of headroom for non-app tags published
+# between app releases.
+GITHUB_RELEASES_URL = (
+    'https://api.github.com/repos/a10kiloham/Anthias/releases?per_page=20'
 )
 GITHUB_API_ACCEPT = 'application/vnd.github+json'
 
@@ -62,27 +73,58 @@ def handle_github_error(
     # degrades through gracefully — backoff above, cached verdict
     # fallback in is_up_to_date(). An ERROR-level log would land in
     # Sentry on every offline device (ANTHIAS-8).
-    logging.warning(
+    logger.warning(
         '%s fetching %s from GitHub: %s', type(exc).__name__, action, errdesc
     )
 
 
+def _latest_parseable_tag(payload: object) -> str | None:
+    """Pick the highest CalVer-parseable ``tag_name`` from a
+    ``/releases`` list payload.
+
+    Skips drafts, prereleases, and any release whose tag doesn't parse
+    (non-app releases like ``WebView-v2026.07.1``, hand-edited tags
+    like ``nightly``). Highest-by-version rather than first-in-list:
+    the list is ordered by creation date, and a non-app release
+    created after the newest app release would otherwise mask it.
+    """
+    if not isinstance(payload, list):
+        return None
+    best: str | None = None
+    best_version = None
+    for release in payload:
+        if not isinstance(release, dict):
+            continue
+        if release.get('draft') or release.get('prerelease'):
+            continue
+        tag = release.get('tag_name')
+        if not isinstance(tag, str) or not tag:
+            continue
+        version = _parse_version(tag)
+        if version is None:
+            continue
+        if best_version is None or version > best_version:
+            best, best_version = tag, version
+    return best
+
+
 def _fetch_latest_release_tag() -> str | None:
-    """Return the latest release tag from GitHub, hitting the API at
-    most once per ``LATEST_RELEASE_TTL`` and short-circuiting while a
-    prior error backoff is active. Returns ``None`` on any failure.
+    """Return the latest Anthias release tag from GitHub, hitting the
+    API at most once per ``LATEST_RELEASE_TTL`` and short-circuiting
+    while a prior error backoff is active. Returns ``None`` on any
+    failure.
     """
     cached = r.get(LATEST_RELEASE_TAG_KEY)
     if cached:
         return cached
 
     if r.get('github-api-error') is not None:
-        logging.warning('GitHub requests suspended due to prior error')
+        logger.warning('GitHub requests suspended due to prior error')
         return None
 
     try:
         resp = requests_get(
-            GITHUB_RELEASES_LATEST_URL,
+            GITHUB_RELEASES_URL,
             headers={'Accept': GITHUB_API_ACCEPT},
             timeout=DEFAULT_REQUESTS_TIMEOUT,
         )
@@ -92,29 +134,24 @@ def _fetch_latest_release_tag() -> str | None:
         return None
 
     # Trip the same 5-minute backoff for malformed bodies as for
-    # transport failures. Without this, a bad JSON body or missing
-    # tag_name from a 200 response would re-fire the GitHub call on
-    # every page render until upstream fixed the payload.
+    # transport failures. Without this, a bad JSON body or a payload
+    # with no usable tag from a 200 response would re-fire the GitHub
+    # call on every page render until upstream fixed the payload.
     try:
         payload = resp.json()
     except ValueError:
-        logging.warning('Malformed JSON from GitHub /releases/latest')
+        logger.warning('Malformed JSON from GitHub /releases')
         _set_github_error_backoff('latest release: malformed JSON')
         return None
 
-    tag = payload.get('tag_name') if isinstance(payload, dict) else None
-    if not isinstance(tag, str) or not tag:
-        logging.warning('Missing tag_name in /releases/latest response')
-        _set_github_error_backoff('latest release: missing tag_name')
-        return None
-
     # Validate parseability *before* caching. Otherwise a bad upstream
-    # tag (e.g. a hand-edited release with `nightly`) would be cached
-    # for 24h, locking is_up_to_date() into the fallback verdict for
-    # the full TTL even after upstream corrects the tag.
-    if _parse_version(tag) is None:
-        logging.warning('Unparseable tag_name from GitHub: %r', tag)
-        _set_github_error_backoff('latest release: unparseable tag_name')
+    # payload would be cached for 24h, locking is_up_to_date() into
+    # the fallback verdict for the full TTL even after upstream
+    # corrects it.
+    tag = _latest_parseable_tag(payload)
+    if tag is None:
+        logger.warning('No parseable release tag in GitHub /releases')
+        _set_github_error_backoff('latest release: no parseable tag')
         return None
 
     r.set(LATEST_RELEASE_TAG_KEY, tag)
@@ -152,9 +189,11 @@ def is_up_to_date() -> bool:
     published Anthias release.
 
     Compares ``importlib.metadata.version('anthias')`` (CalVer, sourced
-    from ``pyproject.toml``) against the ``tag_name`` of GitHub's
-    ``/releases/latest`` endpoint. Caches the remote tag for 24h and
-    falls back to the last computed verdict if GitHub is unreachable.
+    from ``pyproject.toml``) against the highest CalVer-parseable
+    ``tag_name`` in GitHub's ``/releases`` list (non-app releases like
+    ``WebView-*`` are skipped — see ``_latest_parseable_tag``). Caches
+    the remote tag for 24h and falls back to the last computed verdict
+    if GitHub is unreachable.
 
     Returns ``True`` (suppressing the "Update available" indicator)
     when the local CalVer can't be parsed, e.g. on dev / branch builds
@@ -172,7 +211,7 @@ def is_up_to_date() -> bool:
 
     latest_version = _parse_version(latest_tag)
     if latest_version is None:
-        logging.warning('Malformed tag_name from GitHub: %r', latest_tag)
+        logger.warning('Malformed tag_name from GitHub: %r', latest_tag)
         return _fallback_verdict(local_release)
 
     verdict = local_version >= latest_version

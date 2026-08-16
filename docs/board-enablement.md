@@ -63,6 +63,38 @@ pack below and confirm `dropped: 0` at the source framerate.
 > path is identical; their slower ARM cores only affect demux/parse + the fb
 > memcpy, not the offloaded decode/scale/convert.
 
+#### Screen rotation and video on Pi 1 / 2 / 3
+
+`screen_rotation` interacts badly with video on these boards, and the outcome
+depends on the angle — because VideoCore IV has **no rotate control at all**.
+`v4l2-ctl -l` on the ISP (`/dev/video12`) exposes only `horizontal_flip` and
+`vertical_flip`; no bcm2835 video device exposes `V4L2_CID_ROTATE`. (The same
+limit shows up on the pi3-64 vc4 DRM plane, which offers 0°/180° + reflect
+only — forum 6730.)
+
+| `screen_rotation` | path | Pi 2, 1080p30 |
+|---|---|---|
+| 0 | all hardware | ~27 fps |
+| 180 | ISP `horizontal_flip` + `vertical_flip` | ~27 fps |
+| 90 / 270 | software `videoflip` (no HW path) | **~2 fps** |
+
+* **180 is free.** hflip + vflip compose to a 180 rotation and ride along on
+  the `v4l2convert` pass that already does the aspect-fit scale, so the
+  pipeline stays fully hardware and the result is pixel-identical to the
+  software rotation.
+* **90 / 270 are effectively unsupported for video on Pi 1 / 2 / 3** (issue
+  #3198). The quarter turns need a transpose, which no VideoCore IV block can
+  do, so `videoflip` rotates each full-resolution frame on a single CPU core
+  and 1080p collapses to ~2 fps. The picture is *correct*, just far too slow to
+  use. Rotating still images and web pages costs nothing per frame and is
+  unaffected — this limit is video-only. **Use a Pi 4 / Pi 5 for
+  portrait-mounted video**, where the platform layer rotates instead.
+
+Note that reordering to scale-before-flip does not rescue 90/270: the case that
+actually matters — portrait content on a portrait-mounted panel — rotates to
+exactly fill the framebuffer, so there is no downscale to exploit ahead of the
+flip (measured slightly *worse*, 1.9 vs 2.1 fps).
+
 ## Goal: hardware-accelerated playback on every board
 
 Every clip Anthias displays should decode in hardware on the target board.
@@ -204,23 +236,30 @@ no public knob today.
 Boards with less than 1.5 GiB MemTotal (Pi 2/Pi 3 1GB, Pi 4 1GB, Rock Pi 4
 1GB, generic-arm64 1GB SKUs) run in a degraded "low-RAM" mode:
 
-* `bin/upgrade_containers.sh` reads `/proc/meminfo` and exports
-  `ANTHIAS_LOW_RAM=1` to the viewer container.
-* `AnthiasViewer` instantiates one `QWebEngineView` instead of two — no
-  preloaded crossfade between URL assets; the page swaps in place with a
-  brief blank during load.
 * `anthias_host_agent` publishes `host:total_mem_kb` to Redis;
   `anthias_server.processing` rejects uploads above 1920×1080 with the
   existing recipe machinery (`-vf scale=1920:1080:force_original_aspect_ratio=decrease`).
 * The diagnostics page's Memory card surfaces a "Low-RAM mode" banner so
   operators can see *why* the device degraded.
 
+The single-`QWebEngineView` renderer is **not** low-RAM-specific — every
+board runs it. The viewer used to instantiate a second, off-screen
+`QWebEngineView` to preload the next URL asset and swap it in, gated on
+`ANTHIAS_LOW_RAM` so 1 GB boards skipped the ~100 MB extra renderer. That
+preload path is gone (issue #2954): on the single fullscreen surface the Qt6
+boards use (Wayland/cage on Pi 5 / x86, eglfs on pi4-64) a hidden
+`QWebEngineView` is frame-throttled by Chromium and never composited the
+preloaded page, so revealing it flashed the *stale* page it had last shown
+two rotations earlier for ~1 frame on every webpage transition. Collapsing
+to one view fixed the flash and reclaimed the ~100 MB on all 2 GB+ boards
+too.
+
 The 1.5 GiB threshold cleanly separates 1 GB SKUs from 2 GB+ SKUs in the
-supported fleet. The cap was sized against on-device measurements: idle
-viewer + 2 QtWebEngine renderers + zygotes consume ~440 MB RSS on Rock Pi 4
-1GB, leaving roughly 500 MB for the kernel, host services, and decode
-pipeline. A 4K HEVC capture-buffer allocation pushes the container past the
-cgroup limit; the kernel logs `global_oom` and the container restart-loops.
+supported fleet. The upload cap was sized against on-device measurements:
+idle viewer + one QtWebEngine renderer + zygotes leave roughly 500 MB on
+Rock Pi 4 1GB for the kernel, host services, and decode pipeline. A 4K HEVC
+capture-buffer allocation pushes the container past the cgroup limit; the
+kernel logs `global_oom` and the container restart-loops.
 
 ### armv7 (Pi 2 / Pi 3) WebEngine-init crash + spawn retry
 
@@ -239,8 +278,8 @@ loaned 64-bit Pi 3B+ running the armv7 `anthias-viewer:*-pi3` image:
   corruption.
 * It is **heap-layout dependent**, firing on ~75–90 % of launches — so a
   *fresh* launch clears it ~10–25 % of the time. No userspace mitigation
-  fixes it: trimming the CJK fonts, `--single-process`, `--no-zygote`, a
-  single `QWebEngineView` (`ANTHIAS_LOW_RAM=1`), a jemalloc preload, and
+  fixes it: trimming the CJK fonts, `--single-process`, `--no-zygote`, the
+  single `QWebEngineView`, a jemalloc preload, and
   disabling glibc's tcache check (which just turns the abort into a raw
   `SIGSEGV`) all still crash.
 

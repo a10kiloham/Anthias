@@ -19,32 +19,27 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from anthias_server.app.helpers import (
-    AssetDuplicationError,
-    add_default_assets,
-    duplicate_asset,
-    remove_default_assets,
+from anthias_common import device_helper, storage_health, undervoltage
+from anthias_common.internal_auth import is_internal_request
+from anthias_common.utils import (
+    clamp_screen_rotation,
+    connect_to_redis,
+    get_balena_device_info,
+    get_node_ip,
+    get_node_mac_address,
+    is_balena_app,
 )
-from anthias_server.app.models import Asset
 from anthias_server.api.helpers import (
     AssetCreationError,
     finalize_asset_update,
-    get_active_asset_ids,
-    save_active_assets_ordering,
+    persist_new_asset,
 )
-from anthias_server.lib.auth import (
-    AuthSettingsError,
-    apply_auth_settings,
-    operator_username,
-)
-from anthias_common.internal_auth import is_internal_request
-from anthias_common.remote_video import dispatch_remote_video_download
-from anthias_common.youtube import dispatch_download
-from anthias_server.processing import dispatch_pending_normalize
 from anthias_server.api.serializers.v2 import (
     AssetSerializerV2,
     CreateAssetSerializerV2,
     DeviceSettingsSerializerV2,
+    ImportItemSerializerV2,
+    ImportValidateSerializerV2,
     IntegrationsSerializerV2,
     ScreenlyMigrateAssetSerializerV2,
     ScreenlyTokenSerializerV2,
@@ -52,13 +47,6 @@ from anthias_server.api.serializers.v2 import (
     UpdateDeviceSettingsSerializerV2,
     ViewerPlaylistSerializerV2,
     ViewerSettingsSerializerV2,
-)
-from anthias_server.lib.screenly_migration import (
-    MIGRATION_ASSET_GROUP_TITLE,
-    ScreenlyMigrationError,
-    ensure_asset_group,
-    migrate_asset,
-    validate_token,
 )
 from anthias_server.api.views.mixins import (
     AssetContentViewMixin,
@@ -73,18 +61,31 @@ from anthias_server.api.views.mixins import (
     RecoverViewMixin,
     ShutdownViewMixin,
 )
-from anthias_common import device_helper
-from anthias_server.lib import diagnostics
-from anthias_server.lib.auth import authorized
-from anthias_server.lib.github import is_up_to_date
-from anthias_common.utils import (
-    clamp_screen_rotation,
-    connect_to_redis,
-    get_balena_device_info,
-    get_node_ip,
-    get_node_mac_address,
-    is_balena_app,
+from anthias_server.app.helpers import (
+    AssetDuplicationError,
+    add_default_assets,
+    duplicate_asset,
+    remove_default_assets,
 )
+from anthias_server.app.models import Asset
+from anthias_server.lib import diagnostics
+from anthias_server.lib.auth import (
+    AuthSettingsError,
+    apply_auth_settings,
+    authorized,
+    operator_username,
+)
+from anthias_server.lib.github import is_up_to_date
+from anthias_server.lib.integrations.base import ProviderImportError
+from anthias_server.lib.integrations.registry import get_provider
+from anthias_server.lib.screenly_migration import (
+    MIGRATION_ASSET_GROUP_TITLE,
+    ScreenlyMigrationError,
+    ensure_asset_group,
+    migrate_asset,
+    validate_token,
+)
+from anthias_server.lib.timezone import format_utc_offset
 from anthias_server.settings import ViewerPublisher, settings
 
 r = connect_to_redis()
@@ -100,6 +101,30 @@ _SCREENLY_NETWORK_USER_MESSAGE = (
     "Could not reach Screenly. Check this device's internet "
     'connection and try again.'
 )
+
+# Same posture for inbound content-import providers: one canonical
+# message in place of the raw transport error, so an import provider
+# being unreachable never leaks socket/DNS/proxy state into a response.
+_IMPORT_NETWORK_USER_MESSAGE = (
+    "Could not reach the import provider. Check this device's internet "
+    'connection and try again.'
+)
+
+
+def _import_error_body(message: str) -> dict[str, Any]:
+    """Uniform error body for the import-item endpoint.
+
+    Same keys as ``ImportOutcome.as_dict()`` plus ``error`` so every
+    response from the endpoint has one shape regardless of outcome —
+    easier for non-wizard clients and matches the declared schema.
+    """
+    return {
+        'success': False,
+        'asset_id': None,
+        'skipped': False,
+        'reason': None,
+        'error': message,
+    }
 
 
 # Bounded HTTP timeout for the Balena supervisor lookup below. Hit by
@@ -368,59 +393,11 @@ class AssetListViewV2(APIView):
         except AssetCreationError as error:
             return Response(error.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        active_asset_ids = get_active_asset_ids()
-        asset = Asset.objects.create(**serializer.data)
-        # Apply ``metadata`` (set by CreateAssetSerializerV2.validate()
-        # when the operator passes ``refresh_interval_s``). It lives in
-        # ``validated_data`` rather than ``serializer.data`` because
-        # ``metadata`` isn't a declared field on the create serializer
-        # — surfacing it as one would open the upload-pipeline-owned
-        # bag (original_ext, transcoded, error_message) for arbitrary
-        # client writes. Pulling it from validated_data and applying
-        # post-create keeps the read-only stance on metadata while
-        # still letting the dedicated refresh_interval_s knob round-
-        # trip on POST.
-        post_create_metadata = serializer.validated_data.get('metadata')
-        if post_create_metadata:
-            existing = dict(asset.metadata or {})
-            existing.update(post_create_metadata)
-            asset.metadata = existing
-            asset.save(update_fields=['metadata'])
-        asset.refresh_from_db()
-
-        # Kick off the YouTube download out of band when the
-        # serializer flagged a youtube_asset. The row is already
-        # persisted with is_processing=True; the task fills in the
-        # title + duration once yt-dlp finishes.
-        if serializer._pending_youtube_uri:
-            dispatch_download(asset.asset_id, serializer._pending_youtube_uri)
-
-        # Generic remote video URLs get the same hand-off: the
-        # serializer pointed Asset.uri at a local destination path
-        # and flipped is_processing; the Celery task downloads via
-        # requests and chains into normalize_video_asset. Live
-        # streams (RTSP / HLS / DASH) are excluded by the
-        # serializer's ``is_downloadable_remote_video`` classify.
-        if serializer._pending_remote_video_uri:
-            dispatch_remote_video_download(
-                asset.asset_id, serializer._pending_remote_video_uri
-            )
-
-        # Normalisation pipeline: HEIC/HEIF/TIFF → WebP, exotic video
-        # → H.264 MP4. Dispatched after persistence (same pattern as
-        # the YouTube hop above) so the row's ``asset_id`` is already
-        # written to the DB by the time the worker picks it up. The
-        # row was set ``is_processing=True`` by ``prepare_asset``;
-        # the task clears it once the file lands. Shared with
-        # v1/v1.1/v1.2 via dispatch_pending_normalize so adding a
-        # new API version can't re-open GH #2870.
-        dispatch_pending_normalize(serializer, asset.asset_id)
-
-        if asset.is_active():
-            active_asset_ids.insert(asset.play_order, asset.asset_id)
-
-        save_active_assets_ordering(active_asset_ids)
-        asset.refresh_from_db()
+        # Persist + fire the deferred download / normalise pipelines and
+        # splice into the active ordering. Shared with the content
+        # importer (lib.integrations) so imported and uploaded assets
+        # travel exactly one create path.
+        asset = persist_new_asset(serializer)
 
         return Response(
             AssetSerializerV2(asset).data,
@@ -625,7 +602,7 @@ class DeviceSettingsViewV2(APIView):
             # Force reload of settings
             settings.load()
         except Exception as e:
-            logging.error(f'Failed to reload settings: {str(e)}')
+            logger.error(f'Failed to reload settings: {e!s}')
             # Continue with existing settings if reload fails
 
         return Response(
@@ -637,6 +614,7 @@ class DeviceSettingsViewV2(APIView):
                     settings['default_streaming_duration']
                 ),
                 'date_format': settings['date_format'],
+                'timezone': settings['timezone'],
                 'auth_backend': settings['auth_backend'],
                 'show_splash': settings['show_splash'],
                 'default_assets': settings['default_assets'],
@@ -644,6 +622,7 @@ class DeviceSettingsViewV2(APIView):
                 'use_24_hour_clock': settings['use_24_hour_clock'],
                 'debug_logging': settings['debug_logging'],
                 'prefer_dark_mode': settings['prefer_dark_mode'],
+                'verify_ssl': settings['verify_ssl'],
                 # Clamp on read too — the OpenAPI schema advertises
                 # an enum of {0,90,180,270}, but a hand-edited conf
                 # could have a stale 45 or any other int sitting on
@@ -658,6 +637,12 @@ class DeviceSettingsViewV2(APIView):
                     if settings['auth_backend'] == 'auth_basic'
                     else ''
                 ),
+                'display_power_schedule_enabled': settings[
+                    'display_power_schedule_enabled'
+                ],
+                'display_power_on_time': settings['display_power_on_time'],
+                'display_power_off_time': settings['display_power_off_time'],
+                'display_power_days': settings['display_power_days'],
             }
         )
 
@@ -713,6 +698,8 @@ class DeviceSettingsViewV2(APIView):
                 settings['audio_output'] = data['audio_output']
             if 'date_format' in data:
                 settings['date_format'] = data['date_format']
+            if 'timezone' in data:
+                settings['timezone'] = data['timezone']
             if 'show_splash' in data:
                 settings['show_splash'] = data['show_splash']
             if 'default_assets' in data:
@@ -729,8 +716,21 @@ class DeviceSettingsViewV2(APIView):
                 settings['debug_logging'] = data['debug_logging']
             if 'prefer_dark_mode' in data:
                 settings['prefer_dark_mode'] = data['prefer_dark_mode']
+            if 'verify_ssl' in data:
+                settings['verify_ssl'] = data['verify_ssl']
             if 'screen_rotation' in data:
                 settings['screen_rotation'] = int(data['screen_rotation'])
+            # Scheduled display power. Already normalised by the
+            # serializer's validators ('HH:MM', sorted weekday list), so
+            # the beat can never read a value it cannot parse.
+            for field in (
+                'display_power_schedule_enabled',
+                'display_power_on_time',
+                'display_power_off_time',
+                'display_power_days',
+            ):
+                if field in data:
+                    settings[field] = data[field]
 
             settings.save()
             publisher = ViewerPublisher.get_instance()
@@ -962,6 +962,87 @@ class InfoViewV2(InfoViewMixin):
             'low_ram': virtual_memory.total < LOW_RAM_THRESHOLD_KB * 1024,
         }
 
+    def get_time(self) -> dict[str, str]:
+        # The device's active timezone + wall clock. The activation
+        # middleware has already set the request's timezone from the
+        # operator's setting, so localtime()/get_current_timezone_name()
+        # reflect it. Lets an external client detect a wrong device
+        # clock or an unexpected zone (issue #1755).
+        now_local = timezone.localtime(timezone.now())
+        return {
+            # Seconds precision (drop microseconds) to match the System
+            # Info clock seed and stay parseable by any JS Date.parse().
+            'iso': now_local.isoformat(timespec='seconds'),
+            'timezone': timezone.get_current_timezone_name(),
+            'offset': format_utc_offset(now_local),
+        }
+
+    def get_under_voltage(self) -> dict[str, Any]:
+        """Power-supply health, mirroring the System Info card.
+
+        Read from the kernel's ``rpi_volt`` hwmon sensor rather than
+        ``vcgencmd get_throttled``: the hwmon driver clears the
+        firmware's sticky bits every 2 seconds, so the mailbox's
+        "since boot" field is not a durable record on any current
+        kernel. See ``anthias_common.undervoltage`` for the detail.
+
+        ``supported`` is false on hardware with no such sensor (x86,
+        most non-Pi arm64 SBCs). Clients must check it before treating
+        the other fields as meaningful: a board that cannot report
+        under-voltage is indistinguishable from a healthy one on the
+        remaining fields alone.
+
+        Timestamps stay ISO-8601 strings, which is how the latch
+        stores them; ``count`` and the timestamps reset on reboot.
+        """
+        try:
+            state = undervoltage.get_state(r)
+        except Exception:
+            # A diagnostic must never take the info endpoint down.
+            logger.exception('Could not read the under-voltage state.')
+            return {
+                'supported': False,
+                'active': False,
+                'seen_since_boot': False,
+                'first_seen': None,
+                'last_seen': None,
+                'count': 0,
+            }
+        return state
+
+    def get_storage(self) -> dict[str, Any]:
+        """Storage health, mirroring the System Info card.
+
+        SD cards have no health register, so unlike ``under_voltage``
+        this is not one sensor but a verdict assembled from ext4's
+        superblock error counters, a periodic write-and-read-back
+        check, and the eMMC wear registers where the board has them.
+        See ``anthias_common.storage_health`` for the reasoning.
+
+        ``status`` is the field to branch on. It is one of ``ok``,
+        ``wear``, ``errors``, ``full``, ``failing`` or ``unknown``,
+        ordered from healthy to worst, and it is the same verdict the
+        web UI renders. ``supported`` is false only when the
+        filesystem behind the data directory could not be resolved at
+        all; the other fields carry no information in that case.
+
+        ``errors_count`` is cumulative over the life of the
+        filesystem and deliberately survives reboots -- ext4 keeps it
+        in the superblock, and a card that corrupted data last month
+        is still the same card. ``errors_new`` and the write-check
+        fields reset on reboot, because those are things this device
+        observed rather than things the filesystem recorded.
+        """
+        try:
+            return storage_health.get_state(r, settings.get_configdir())
+        except Exception:
+            # A diagnostic must never take the info endpoint down.
+            logger.exception('Could not read the storage-health state.')
+            return {
+                'supported': False,
+                'status': storage_health.STATUS_UNKNOWN,
+            }
+
     def get_ip_addresses(self) -> list[str]:
         # /api/v2/info is auth'd and not polled, so blocking on
         # get_node_ip()'s host-readiness loop is acceptable here —
@@ -1003,12 +1084,214 @@ class InfoViewV2(InfoViewMixin):
                             'low_ram': {'type': 'boolean'},
                         },
                     },
+                    'under_voltage': {
+                        'type': 'object',
+                        'description': (
+                            'Power-supply health from the kernel '
+                            'rpi_volt sensor. Check `supported` first: '
+                            'when it is false this device has no such '
+                            'sensor and the other fields carry no '
+                            'information. Counters and timestamps '
+                            'reset when the device reboots.'
+                        ),
+                        'properties': {
+                            'supported': {'type': 'boolean'},
+                            'active': {'type': 'boolean'},
+                            'seen_since_boot': {'type': 'boolean'},
+                            'first_seen': {
+                                'type': ['string', 'null'],
+                                'format': 'date-time',
+                            },
+                            'last_seen': {
+                                'type': ['string', 'null'],
+                                'format': 'date-time',
+                            },
+                            'count': {'type': 'integer'},
+                        },
+                    },
+                    'storage': {
+                        'type': 'object',
+                        'description': (
+                            'Health of the filesystem this device '
+                            'runs from, assembled from ext4 '
+                            'superblock error counters, a periodic '
+                            'write-and-read-back check, and eMMC wear '
+                            'registers where present. Branch on '
+                            '`status`. Check `supported` first: when '
+                            'it is false the filesystem could not be '
+                            'resolved and no other field carries '
+                            'information. `errors_count` is '
+                            'cumulative over the life of the '
+                            'filesystem and survives reboots; '
+                            '`errors_new` and the write-check fields '
+                            'reset on reboot.'
+                        ),
+                        'properties': {
+                            'supported': {'type': 'boolean'},
+                            'status': {
+                                'type': 'string',
+                                'enum': [
+                                    'ok',
+                                    'wear',
+                                    'errors',
+                                    'full',
+                                    'failing',
+                                    'unknown',
+                                ],
+                            },
+                            'mount_point': {'type': ['string', 'null']},
+                            'fstype': {'type': ['string', 'null']},
+                            'device': {'type': ['string', 'null']},
+                            'disk': {'type': ['string', 'null']},
+                            'read_only': {'type': 'boolean'},
+                            'error_stats_supported': {'type': 'boolean'},
+                            'errors_count': {'type': 'integer'},
+                            'errors_new': {'type': 'integer'},
+                            'errors_this_boot': {'type': 'boolean'},
+                            'first_error': {
+                                'type': ['string', 'null'],
+                                'format': 'date-time',
+                            },
+                            'last_error': {
+                                'type': ['string', 'null'],
+                                'format': 'date-time',
+                            },
+                            'last_error_function': {
+                                'type': ['string', 'null']
+                            },
+                            'lifetime_written_kb': {
+                                'type': ['integer', 'null']
+                            },
+                            'write_ok': {'type': ['boolean', 'null']},
+                            'write_reason': {'type': ['string', 'null']},
+                            'write_failed_since_boot': {'type': 'boolean'},
+                            'write_fail_count': {'type': 'integer'},
+                            'first_write_fail': {
+                                'type': ['string', 'null'],
+                                'format': 'date-time',
+                            },
+                            'last_write_fail': {
+                                'type': ['string', 'null'],
+                                'format': 'date-time',
+                            },
+                            'last_check': {
+                                'type': ['string', 'null'],
+                                'format': 'date-time',
+                            },
+                            'fsync_ms': {'type': ['number', 'null']},
+                            'media': {
+                                'type': 'object',
+                                'description': (
+                                    'What the device is. `kind` is '
+                                    '`sd`, `emmc`, `disk` or '
+                                    '`unknown`; the wear fields are '
+                                    'populated on eMMC only, since '
+                                    'SD cards do not report health.'
+                                ),
+                                'properties': {
+                                    'kind': {'type': 'string'},
+                                    'name': {'type': ['string', 'null']},
+                                    'manufacturer': {
+                                        'type': ['string', 'null'],
+                                        'description': (
+                                            'Resolved vendor name, or '
+                                            "null when the card's "
+                                            'manufacturer id appears '
+                                            'in no published list. '
+                                            'Use `manufacturer_id` to '
+                                            'identify those.'
+                                        ),
+                                    },
+                                    'manufacturer_id': {
+                                        'type': ['integer', 'null'],
+                                        'description': (
+                                            'Raw CID manufacturer id. '
+                                            'SD and eMMC number the '
+                                            'same field from separate '
+                                            'namespaces, so interpret '
+                                            'it against `kind`.'
+                                        ),
+                                    },
+                                    'manufactured': {
+                                        'type': ['string', 'null']
+                                    },
+                                    'wear_pct': {'type': ['integer', 'null']},
+                                    'pre_eol': {'type': ['string', 'null']},
+                                    'smart': {
+                                        'type': ['object', 'null'],
+                                        'description': (
+                                            'SMART detail, present only '
+                                            'on a SATA/NVMe device that '
+                                            'reported it. `wear_pct` and '
+                                            '`pre_eol` above are already '
+                                            'derived from it, so most '
+                                            'clients need only those. '
+                                            '`wear_is_exact` is false '
+                                            'when the figure came from '
+                                            'an ATA vendor attribute '
+                                            'rather than a defined NVMe '
+                                            'field.'
+                                        ),
+                                        'properties': {
+                                            'supported': {'type': 'boolean'},
+                                            'device': {'type': 'string'},
+                                            'model': {
+                                                'type': ['string', 'null']
+                                            },
+                                            'firmware': {
+                                                'type': ['string', 'null']
+                                            },
+                                            'passed': {
+                                                'type': ['boolean', 'null']
+                                            },
+                                            'wear_pct': {
+                                                'type': ['integer', 'null']
+                                            },
+                                            'wear_is_exact': {
+                                                'type': 'boolean'
+                                            },
+                                            'power_on_hours': {
+                                                'type': ['integer', 'null']
+                                            },
+                                            'reallocated_sectors': {
+                                                'type': ['integer', 'null']
+                                            },
+                                            'pending_sectors': {
+                                                'type': ['integer', 'null']
+                                            },
+                                            'media_errors': {
+                                                'type': ['integer', 'null']
+                                            },
+                                            'temperature_c': {
+                                                'type': ['integer', 'null']
+                                            },
+                                            'pre_eol': {
+                                                'type': ['string', 'null']
+                                            },
+                                            'checked_at': {
+                                                'type': 'string',
+                                                'format': 'date-time',
+                                            },
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                    },
                     'ip_addresses': {
                         'type': 'array',
                         'items': {'type': 'string'},
                     },
                     'mac_address': {'type': 'string'},
                     'host_user': {'type': 'string'},
+                    'time': {
+                        'type': 'object',
+                        'properties': {
+                            'iso': {'type': 'string'},
+                            'timezone': {'type': 'string'},
+                            'offset': {'type': 'string'},
+                        },
+                    },
                 },
             }
         },
@@ -1033,9 +1316,12 @@ class InfoViewV2(InfoViewMixin):
                 'device_model': self.get_device_model(),
                 'uptime': self.get_uptime(),
                 'memory': self.get_memory(),
+                'under_voltage': self.get_under_voltage(),
+                'storage': self.get_storage(),
                 'ip_addresses': self.get_ip_addresses(),
                 'mac_address': get_node_mac_address(),
                 'host_user': getenv('HOST_USER'),
+                'time': self.get_time(),
             }
         )
 
@@ -1275,3 +1561,141 @@ class ScreenlyMigrateAssetViewV2(APIView):
                 'screenly_asset_id': screenly_asset_id,
             }
         )
+
+
+class ImportValidateViewV2(APIView):
+    """Validate an import provider's token and enumerate its media.
+
+    Inbound counterpart to ``ScreenlyValidateTokenViewV2``: validation
+    and listing happen in one round-trip so the wizard's Continue button
+    goes straight from the token field to the item picker. The token is
+    not stored; each request forwards it inline. ``provider`` is the
+    registry key from the URL (``yodeck``, later ``screencloud`` …).
+    """
+
+    serializer_class = ImportValidateSerializerV2
+
+    @extend_schema(
+        summary='Validate an import provider token and list its media',
+        request=ImportValidateSerializerV2,
+        responses={
+            200: {
+                'type': 'object',
+                'properties': {
+                    'valid': {'type': 'boolean'},
+                    'items': {'type': 'array', 'items': {'type': 'object'}},
+                    'error': {'type': 'string', 'nullable': True},
+                },
+            },
+        },
+    )
+    @authorized
+    def post(self, request: Request, provider: str) -> Response:
+        provider_impl = get_provider(provider)
+        if provider_impl is None:
+            return Response(
+                {'valid': False, 'error': 'Unknown import provider.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        serializer = self.serializer_class(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        token = serializer.validated_data['token']
+
+        try:
+            valid = provider_impl.validate_token(token)
+        except requests.RequestException:
+            # Log transport detail server-side only — see
+            # ScreenlyValidateTokenViewV2.post for the CodeQL rationale.
+            logger.warning('%s token validate failed', provider, exc_info=True)
+            return Response(
+                {'valid': False, 'error': _IMPORT_NETWORK_USER_MESSAGE},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        if not valid:
+            return Response({'valid': False})
+
+        try:
+            items = provider_impl.list_media(token)
+        except requests.RequestException:
+            logger.warning('%s list_media failed', provider, exc_info=True)
+            return Response(
+                {'valid': False, 'error': _IMPORT_NETWORK_USER_MESSAGE},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        return Response(
+            {'valid': True, 'items': [item.as_dict() for item in items]}
+        )
+
+
+class ImportItemViewV2(APIView):
+    """Import a single remote media item as an Anthias asset.
+
+    Per-item (not batch) for the same reason as
+    ``ScreenlyMigrateAssetViewV2``: the wizard shows live progress and
+    keeps going past individual failures. Known per-item failures return
+    200 with ``success: False`` so the queue keeps advancing; only a
+    transport failure is a 502.
+    """
+
+    serializer_class = ImportItemSerializerV2
+
+    @extend_schema(
+        summary='Import one media item from a provider',
+        request=ImportItemSerializerV2,
+        responses={
+            200: {
+                'type': 'object',
+                'properties': {
+                    'success': {'type': 'boolean'},
+                    'asset_id': {'type': 'string', 'nullable': True},
+                    'skipped': {'type': 'boolean'},
+                    'reason': {'type': 'string', 'nullable': True},
+                    'error': {'type': 'string', 'nullable': True},
+                },
+            },
+        },
+    )
+    @authorized
+    def post(self, request: Request, provider: str) -> Response:
+        provider_impl = get_provider(provider)
+        if provider_impl is None:
+            # Keep the uniform shape (asset_id/skipped/reason/error) so a
+            # client can read the same keys on every response.
+            return Response(
+                _import_error_body('Unknown import provider.'),
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        serializer = self.serializer_class(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        token = serializer.validated_data['token']
+        remote_id = serializer.validated_data['remote_id']
+        enable = serializer.validated_data.get('enable', True)
+
+        try:
+            outcome = provider_impl.import_item(
+                token, remote_id, enable=enable
+            )
+        except ProviderImportError as error:
+            # .user_message is the operator-display string we composed in
+            # the provider — using it (not str(error)) keeps the response
+            # free of exception state. Keep the same key shape as the
+            # success path (ImportOutcome.as_dict) plus ``error`` so every
+            # response is uniform for non-wizard clients.
+            return Response(_import_error_body(error.user_message))
+        except requests.RequestException:
+            logger.warning(
+                '%s import_item failed for %s',
+                provider,
+                remote_id,
+                exc_info=True,
+            )
+            return Response(
+                _import_error_body(_IMPORT_NETWORK_USER_MESSAGE),
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        return Response({**outcome.as_dict(), 'error': None})

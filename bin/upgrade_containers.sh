@@ -21,20 +21,15 @@ export SHM_SIZE_KB="$(echo "$TOTAL_MEMORY_KB" \* 0.3 | bc | cut -d'.' -f1)"
 # against a decompression-bomb fixture or runaway ffprobe, not
 # because routine workloads come anywhere near it.
 export CELERY_MEMORY_LIMIT_KB=$(echo "$TOTAL_MEMORY_KB * 0.6" | bc | cut -d'.' -f1)
-# Low-RAM gate. Boards with < 1.5 GiB MemTotal (Pi 2/Pi 3 1GB, Pi 4 1GB,
-# Rock Pi 4 1GB, generic-arm64 SBCs in that class) can't keep two
-# QtWebEngine renderer processes resident *and* play 1080p+ video
-# without OOM-thrashing through swap. The viewer reads this env to
-# drop into single-WebEngineView mode (no preloaded crossfade); the
-# asset processor reads it via Redis (host:total_mem_kb) and rejects
-# uploads above 1080p. Threshold is 1.5 GiB so 1 GB SKUs land below
-# and 2 GB SKUs sit above; both 1024 MB and 2048 MB boards exist in
-# the supported fleet.
-if [ "${TOTAL_MEMORY_KB:-0}" -lt 1572864 ]; then
-    export ANTHIAS_LOW_RAM=1
-else
-    export ANTHIAS_LOW_RAM=0
-fi
+# NB: the AnthiasViewer used to be gated into single-WebEngineView mode
+# on < 1.5 GiB boards via an ``ANTHIAS_LOW_RAM`` export here. That flag
+# is gone — the viewer now runs a single QWebEngineView on every board
+# (issue #2954: the preloaded second buffer flashed a stale foreign
+# page on every webpage transition, and the fix was to drop it), which
+# also reclaims the ~100 MB the second renderer cost. The independent
+# 1080p upload cap on low-RAM boards is unaffected: it lives in
+# anthias_server (``is_low_ram_device`` reads ``host:total_mem_kb`` from
+# Redis), not this export.
 GIT_BRANCH="${GIT_BRANCH:-master}"
 
 MODE="${MODE:-pull}"
@@ -147,36 +142,40 @@ if [ -f /etc/default/locale ]; then
     set +a
 fi
 
+# Pull the configured HTTP proxy into our shell env so envsubst renders
+# HTTP_PROXY/HTTPS_PROXY/NO_PROXY into the server/viewer/celery service
+# blocks (GH #3239). /etc/anthias/proxy.env is the single source of truth
+# written by the ansible system role; when it is absent (no proxy) the
+# substitutions resolve to empty strings, which every client treats as
+# "no proxy". `set -a` exports them so the envsubst child process sees them.
+if [[ -f /etc/anthias/proxy.env ]]; then
+    set -a
+    . /etc/anthias/proxy.env
+    set +a
+fi
+
 cat /home/${USER}/anthias/docker-compose.yml.tmpl \
     | envsubst \
     > /home/${USER}/anthias/docker-compose.yml
 
-# CEC device routing. Pi 1-4 reaches libcec via /dev/vchiq
-# (closed-firmware VideoCore IV), which is what the template's
-# `devices:` block bind-mounts. Pi 5 and mainline-KMS x86/arm64 boards
-# expose v4l2 CEC adapters at /dev/cec0 instead (Pi 5 also exposes
-# /dev/cec1 for the second HDMI output, so we map both). docker
-# compose's `devices:` fails container start if a listed host node is
-# missing, so we surgically rewrite the rendered mount per device
-# type — and on x86/arm64 we only swap in /dev/cec0 if the host
-# actually has it (a box without an HDMI-CEC adapter keeps the
-# pre-fix behaviour of dropping the bind mount entirely). Fixes
-# the "CEC error" toast on Pi 5 reported in issue #2863.
-case "$DEVICE_TYPE" in
-    pi5)
-        sed -i 's|^\([[:space:]]*\)- "/dev/vchiq:/dev/vchiq"$|\1- "/dev/cec0:/dev/cec0"\n\1- "/dev/cec1:/dev/cec1"|' \
-            /home/${USER}/anthias/docker-compose.yml
-        ;;
-    x86|arm64)
-        if [ -e /dev/cec0 ]; then
-            sed -i 's|/dev/vchiq:/dev/vchiq|/dev/cec0:/dev/cec0|g' \
-                /home/${USER}/anthias/docker-compose.yml
-        else
-            sed -i '/devices:/ {N; /\n.*\/dev\/vchiq:\/dev\/vchiq/d}' \
-                /home/${USER}/anthias/docker-compose.yml
-        fi
-        ;;
-esac
+# No CEC device passthrough is needed, on any board.
+#
+# HDMI-CEC is driven by the viewer container, which is `privileged: true`
+# in every compose template and therefore already sees every /dev/cec*
+# node. anthias-server and anthias-celery ask it over the Redis command
+# bus (see src/anthias_server/lib/cec_client.py).
+#
+# An earlier iteration of this script enumerated the host's adapters here
+# and generated a compose override for server/celery. That works on this
+# install path but is impossible on balena — its compose file is baked
+# into the release from a workstation, nothing on-device can enumerate
+# the host, and a statically listed node that turns out to be absent
+# stops the container from starting. Routing through the viewer supports
+# both deployments with no device wiring and no OTA upgrade risk.
+#
+# A stale override from that iteration is removed so it cannot keep
+# pinning nodes that the containers no longer need.
+rm -f /home/${USER}/anthias/docker-compose.cec.override.yml
 
 COMPOSE_FILES=(-f /home/${USER}/anthias/docker-compose.yml)
 SSL_OVERRIDE=/home/${USER}/anthias/docker-compose.ssl.override.yml

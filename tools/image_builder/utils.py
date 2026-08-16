@@ -99,7 +99,6 @@ def get_uv_builder_context(
     builder_extra_apt = []
     if uv_group in groups_needing_native_build_libs:
         builder_extra_apt = [
-            'libcec-dev',
             'libdbus-1-dev',
             'libdbus-glib-1-dev',
         ]
@@ -126,8 +125,7 @@ def get_uv_builder_context(
                 # variants ship the headers compile from source
                 # needs; the runtime ``.so`` files are pulled in
                 # by base_apt_dependencies via libjpeg62-turbo,
-                # libfreetype6, etc., or transitively by
-                # cec-utils / ffmpeg.
+                # libfreetype6, etc., or transitively by ffmpeg.
                 'libjpeg62-turbo-dev',
                 'libfreetype-dev',
                 'liblcms2-dev',
@@ -169,15 +167,21 @@ def get_viewer_context(board: str, target_platform: str) -> dict[str, Any]:
 
     # Qt version is only relevant for the Qt 5 path: pi2/pi3 pull the
     # cross-built Qt 5 toolchain tarball at build time. Qt 5 is frozen
-    # for these boards, so the toolchain stays pinned to the
-    # WebView-v2026.04.1 release indefinitely. Qt 6 boards install Qt
-    # straight from Debian apt (qt6-*-dev in viewer_extra_apt below).
-    qt_version = '6.4.2' if is_qt6 else '5.15.14'
+    # for these boards, so the toolchain stays pinned to a WebView-v*
+    # release. Bumped from WebView-v2026.07.0 to WebView-v2026.07.1,
+    # which carries the armv7 NEON-alignment fix (arm_use_neon=false +
+    # a -mno-unaligned-access cross-compiler wrap) that stops the Pi 2/3
+    # blank-screen crash-loop: gcc otherwise lowers struct init of
+    # 8-byte-aligned types into a NEON :64 block store that faults on
+    # the 4-byte-aligned pointers QtWebEngine hands it. Qt 6 boards
+    # install Qt straight from Debian apt (qt6-*-dev in viewer_extra_apt
+    # below).
+    qt_version = '6.4.2' if is_qt6 else '5.15.19'
     qt_major_version = qt_version.split('.')[0]
-    qt5_toolchain_url = f'{releases_url}/WebView-v2026.04.1'
+    qt5_toolchain_url = f'{releases_url}/WebView-v2026.07.1'
 
-    # Viewer-only apt deps. The shared runtime set (cec-utils, curl,
-    # ffmpeg, git, libcec7, procps, psmisc, python-is-python3,
+    # Viewer-only apt deps. The shared runtime set (curl,
+    # ffmpeg, git, procps, psmisc, python-is-python3,
     # python3-gi, python3-pip, python3-setuptools, sqlite3, sudo,
     # plus libraspberrypi0 on 32-bit Pi boards) is installed by
     # Dockerfile.base.j2 in a layer that server (and test) also use,
@@ -268,7 +272,6 @@ def get_viewer_context(board: str, target_platform: str) -> dict[str, Any]:
         # in production (pre-existing bug, not a regression here).
         # 200 KB, easier to just install everywhere than gate on board.
         'libharfbuzz-subset0',
-        'python3-netifaces',
         'fonts-wqy-zenhei',
     ]
 
@@ -348,6 +351,20 @@ def get_viewer_context(board: str, target_platform: str) -> dict[str, Any]:
                     'wlr-randr',
                 ]
             )
+
+            # smartmontools: these three are the boards that can boot
+            # from a SATA/NVMe device (x86 outright, Rock Pi 4 and a
+            # Pi 5 with an NVMe HAT), and SMART is the only place such
+            # a device reports wear -- there is no sysfs equivalent of
+            # eMMC's life_time. The viewer samples it and publishes a
+            # Redis fact because it is the one container privileged
+            # enough to issue the ioctl; see anthias_common/smart.py.
+            #
+            # Deliberately not on the SD-card-only boards (pi2, pi3,
+            # pi4): an SD card has no SMART at all, so smartctl there
+            # would be ~2 MB of image that can never return an answer,
+            # on exactly the boards whose storage is tightest.
+            viewer_extra_apt_dependencies.append('smartmontools')
 
         if board == 'x86':
             # va-driver-all is a Debian metapackage that pulls in

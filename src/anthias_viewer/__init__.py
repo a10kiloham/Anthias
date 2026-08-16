@@ -1,14 +1,17 @@
-# -*- coding: utf-8 -*-
-
+import json
 import logging
 import os
 import subprocess
 import sys
+from collections import deque
 from collections.abc import Callable
+from glob import glob
 from os import getenv, path
 from signal import SIGALRM, signal
-from time import monotonic, sleep
+from threading import Lock
+from time import monotonic, sleep, time
 from typing import Any
+from urllib.parse import urlparse, urlunparse
 
 import django
 import pydbus
@@ -16,15 +19,18 @@ import redis.exceptions
 import requests
 import sh as sh
 
+from anthias_common import smart, storage_health
+from anthias_common.board import is_low_ram_device
 from anthias_common.http import get_anthias_product_token
+from anthias_server.lib import cec, cec_client
 from anthias_server.settings import LISTEN, PORT, ReplySender, settings
+from anthias_viewer import media_player as _media_player_module
+from anthias_viewer.constants import BLACK_SCREEN as BLACK_SCREEN
 from anthias_viewer.constants import EMPTY_PL_DELAY as EMPTY_PL_DELAY
 from anthias_viewer.constants import SERVER_WAIT_TIMEOUT as SERVER_WAIT_TIMEOUT
-from anthias_viewer.constants import BLACK_SCREEN as BLACK_SCREEN
 from anthias_viewer.constants import SPLASH_DELAY as SPLASH_DELAY
 from anthias_viewer.constants import SPLASH_PAGE_URL as SPLASH_PAGE_URL
 from anthias_viewer.constants import STANDBY_SCREEN as STANDBY_SCREEN
-from anthias_viewer import media_player as _media_player_module
 from anthias_viewer.media_player import MediaPlayerProxy
 from anthias_viewer.playback import (
     navigate_to_asset,
@@ -44,19 +50,31 @@ django.setup()
 
 # Place imports that uses Django in this block.
 
-from anthias_common.internal_auth import INTERNAL_AUTH_HEADER  # noqa: E402
-from anthias_common.internal_auth import internal_auth_token  # noqa: E402
-from anthias_common.utils import (  # noqa: E402
+from django.utils import timezone
+
+from anthias_common.internal_auth import (
+    INTERNAL_AUTH_HEADER,
+    internal_auth_token,
+)
+from anthias_common.utils import (
     clamp_screen_rotation,
     connect_to_redis,
     detect_screen_resolution,
     string_to_bool,
 )
-from anthias_server.app.models import Asset  # noqa: E402
-from anthias_server.app.models import clamp_refresh_interval  # noqa: E402
-from anthias_viewer.messaging import ViewerSubscriber  # noqa: E402
-from anthias_viewer.scheduling import Scheduler  # noqa: E402
+from anthias_server.app.models import (
+    Asset,
+    clamp_duration,
+    clamp_refresh_interval,
+    normalize_asset_headers,
+)
+from anthias_server.django_project.settings import (
+    resolve_time_zone,
+)
+from anthias_viewer.messaging import ViewerSubscriber
+from anthias_viewer.scheduling import Scheduler
 
+logger = logging.getLogger(__name__)
 
 __author__ = 'Screenly, Inc'
 __copyright__ = 'Copyright 2012-2026, Screenly, Inc'
@@ -64,6 +82,11 @@ __license__ = 'Dual License: GPLv2 and Commercial License'
 
 
 current_browser_url: str | None = None
+# The per-asset "skip SSL verification" flag last sent to the webview,
+# tracked alongside ``current_browser_url`` so toggling the flag on the
+# currently-displayed asset (URI unchanged) still re-issues the load
+# with the new policy instead of being swallowed by the URI dedup.
+current_browser_skip_ssl: bool = False
 # Latched True->False on the first failure of ``setReloadInterval`` —
 # version skew between the running viewer and the AnthiasViewer
 # binary persists for the lifetime of the viewer process, so once we
@@ -72,7 +95,29 @@ current_browser_url: str | None = None
 # An operator who upgrades the webview package should restart the
 # viewer anyway; that resets the cache.
 _webview_supports_set_reload_interval: bool = True
+# Custom request headers currently applied to the webview (#2215). Held
+# so view_webpage can force a fresh load when only the headers change on
+# an asset whose URL is unchanged. Reset to {} on every (re)spawn along
+# with ``current_browser_url``.
+current_browser_headers: dict[str, str] = {}
+# Same version-skew latch as ``_webview_supports_set_reload_interval`` but
+# for the ``setRequestHeaders`` slot: an AnthiasViewer binary that
+# predates it raises UnknownMethod once, after which we stop paying the
+# D-Bus round-trip until the viewer restarts.
+_webview_supports_set_request_headers: bool = True
+# Version-skew latch for the ``skipSslVerify`` argument added to the
+# ``loadPage`` / ``loadImage`` slots in this release. An AnthiasViewer
+# binary that predates it exposes only the 1-arg slots, so the 2-arg
+# call fails; once that's confirmed we fall back to the legacy 1-arg
+# call and skip the doomed 2-arg attempt. Reset on every (re)spawn (a
+# respawn may pick up a newer binary that supports it).
+_webview_supports_ssl_arg: bool = True
 browser: Any = None
+# Bounded sink for the current AnthiasViewer's merged stdout+stderr. See
+# _BoundedWebviewOutput / _spawn_webview_once (issue #3138). Mirrors
+# ``browser``: replaced on every (re)spawn, so it always refers to the
+# live process's output.
+_webview_output: Any = None
 loop_is_stopped: bool = False
 # Set by the ``blank`` command: pauses the asset loop (via
 # loop_is_stopped) and signals the main thread to paint a black screen.
@@ -112,6 +157,48 @@ _last_applied_dark_mode: bool = False
 # asset_loop via _consume_pending_rotation_bounce().
 _rotation_bounce_pending: bool = False
 
+# Monotonic timestamp of when the Wayland output watchdog first observed
+# the "wedge" state — cage running with zero wl_outputs while the kernel
+# reports a connector *connected*. None whenever the display is healthy
+# (cage owns an output) or genuinely headless (nothing connected). Once
+# the wedge persists past WAYLAND_OUTPUT_GRACE_S the watchdog exits
+# non-zero so Docker recreates the container and cage re-enumerates DRM.
+# See _wayland_output_watchdog().
+_headless_wedge_since: float | None = None
+
+# Grace window for the Wayland output self-heal watchdog. Cage binds a
+# connected display within ~1-2s of process start, so 60s is comfortably
+# long enough to never fire on a display that's merely slow to sync (HDMI
+# handshake / AVR passthrough) while still recovering a headless-boot
+# wedge within a single restart.
+WAYLAND_OUTPUT_GRACE_S = 60
+
+# Hard cap on how many times the watchdog will restart the container to
+# recover a wedge *within one device boot*. A real display binds on the
+# first restart and resets the count; a connector we can never bind (dead
+# cable, a display that asserts hotplug but never delivers EDID) would
+# otherwise restart-loop forever. After the cap we give up and stay quiet
+# for the rest of the boot — a failed display must not keep the container
+# churning (and the SoC warm) for an unattended 8h overnight. The count is
+# boot-scoped (keyed on /proc/.../boot_id) so a real reboot always starts
+# fresh, and it is cleared the moment a display binds or goes away.
+WAYLAND_MAX_RECOVERY_RESTARTS = 3
+
+# Set once we've hit the cap so the "giving up" line is logged a single
+# time per wedge episode rather than every asset_loop tick. Cleared
+# whenever the wedge does — see _wayland_output_watchdog().
+_recovery_gave_up_logged: bool = False
+
+# One-shot latch so the empty-playlist notice is logged on the edge
+# rather than every poll. See the asset_loop() comment for why the
+# volume matters in production (GH #3268).
+_empty_playlist_logged: bool = False
+
+# Which asset we last reported as unavailable, so the 0.5s retry arm
+# logs once per offender instead of ~2 lines/second. Holds
+# "<asset_id>:<uri>" so a changed URI on the same row still reports.
+_unavailable_asset_logged: str | None = None
+
 
 def _rotation_value() -> int:
     """Coerce settings['screen_rotation'] to a known cardinal angle.
@@ -141,6 +228,90 @@ def _is_wayland_board() -> bool:
     because neither the linuxfb ``:rotation=`` option nor the wlr-randr
     path ran (issue #3044)."""
     return os.environ.get('QT_QPA_PLATFORM', '').startswith('wayland')
+
+
+# Qt's own words when the QPA plugin has no screen to draw on. Matched by
+# substring against the failed launch's captured output. Kept narrow on
+# purpose: a false positive here would abandon a retry budget that would
+# otherwise have succeeded.
+_NO_SCREEN_SIGNATURES = (
+    'Unable to figure out framebuffer device',
+    'linuxfb: Failed to initialize screen',
+    'no screens available',
+    # Emitted when the node exists but cannot be opened. Observed on the
+    # armhf testbed while deliberately probing for false positives; the
+    # list is a sample of Qt's phrasings, not an exhaustive set, which is
+    # why the device check below is the load-bearing condition.
+    'Failed to open framebuffer',
+)
+
+
+def _linuxfb_device() -> str:
+    """The framebuffer node this board's Qt platform will actually open.
+
+    ``linuxfb`` accepts ``fb=/dev/fbN``, so a board configured onto
+    ``fb1`` must not be judged by ``/dev/fb0``'s presence. Falls back to
+    ``/dev/fb0``, which is both Qt's default and what every current
+    board uses.
+
+    Parsed the same way as ``_set_qpa_rotation``: the Qt QPA syntax is
+    ``<plugin>[:opt1=val1,opt2=val2,...]`` — a *single* colon, then
+    **comma-separated** options. Splitting the options on ``:`` instead
+    would return ``/dev/fb1,rotation=90`` as the device path for
+    ``linuxfb:fb=/dev/fb1,rotation=90``, so ``os.path.exists`` would say
+    False and the caller would abandon a retry budget that should have
+    been spent — a false positive in exactly the guard this feeds
+    (Copilot review of #3266).
+    """
+    platform = os.environ.get('QT_QPA_PLATFORM', 'linuxfb')
+    _, _, options_str = platform.partition(':')
+    for option in options_str.split(','):
+        key, _, value = option.strip().partition('=')
+        if key == 'fb' and value:
+            return value
+    return '/dev/fb0'
+
+
+def _display_device_vanished(failure_text: str) -> bool:
+    """True when a launch failed because the display device is gone.
+
+    The container's ``/dev`` is a **start-time snapshot**, and
+    ``wait_for_framebuffer`` (``bin/lib/viewer/platform_linuxfb.sh``)
+    only runs once, at container start. So a linuxfb board whose display
+    disappears *after* that point keeps a stale view of ``/dev``: the
+    already-running webview is fine, but a newly spawned one cannot open
+    the framebuffer and dies before its D-Bus handshake.
+
+    Retrying cannot fix that — no amount of backoff re-snapshots
+    ``/dev`` — so burning the whole attempt budget just delays the only
+    real recovery (container restart) by ~6.5 min on the 30-attempt
+    startup path, or ~21 min if each attempt instead runs its timeout
+    out. Reproduced deterministically on the armhf/Qt5/linuxfb testbed
+    for GH #3266.
+
+    Deliberately conservative: it requires *both* one of Qt's own
+    no-screen messages **and** the framebuffer device actually being
+    absent, so a transient Qt init crash still gets its full retry
+    budget. The device check is the load-bearing half — verified on the
+    armhf testbed by replacing ``/dev/fb0`` with an unopenable node, so
+    that Qt emitted two of the three signatures while the device still
+    existed: the guard correctly declined and spent its full budget.
+    Wayland and eglfs boards are excluded — they do not consume a
+    framebuffer node, and the equivalent Wayland wedge already has its
+    own bounded-restart watchdog.
+
+    Note this cannot fire on the *handshake-timeout* flavour of
+    ``WebviewLaunchError``, whose message carries no Qt output to match.
+    An absent framebuffer makes Qt exit in about a second, so in
+    practice the crash flavour is the one that occurs here.
+    """
+    if _is_wayland_board():
+        return False
+    if os.environ.get('QT_QPA_PLATFORM', 'linuxfb').startswith('eglfs'):
+        return False
+    if not any(sig in failure_text for sig in _NO_SCREEN_SIGNATURES):
+        return False
+    return not os.path.exists(_linuxfb_device())
 
 
 def _set_qpa_rotation(qpa: str, rotation: int) -> str:
@@ -189,7 +360,13 @@ def _build_webview_env() -> dict[str, str]:
       AnthiasViewer is a QWidget app, so webpages, images and video
       all rotate uniformly — no per-content rotation needed (and the
       old ``video-rotate`` path in media_player must stay off here or
-      the video double-rotates).
+      the video double-rotates). Exception: on pi3-64 the HW overlay-
+      plane video path (kmssink on a vc4 DRM plane) is scanned out
+      independently of the QOpenGLCompositor, so QT_QPA_EGLFS_ROTATION
+      does NOT rotate it (forum 6730). The vc4 plane can HW-rotate
+      0°/180° only, so the overlay is kept for 0°/180° (VideoView sets
+      the plane rotation for 180°) and dropped for 90°/270° in favour
+      of the raster path — see the pi3-64 block below.
 
     * linuxfb (pi2/pi3, Qt5): the plugin reads ``:rotation=N`` from
       QT_QPA_PLATFORM once at QPA init and rotates the framebuffer for
@@ -206,6 +383,50 @@ def _build_webview_env() -> dict[str, str]:
     # inherited value is overwritten.
     env['ANTHIAS_UA_TOKEN'] = get_anthias_product_token()
 
+    # Boards with ~1 GB RAM (Pi 3, plus 1 GB Pi 4 / Pi 5 SKUs) have no
+    # swap head-room, so QtWebEngine's default multi-process Chromium —
+    # tuned for desktops — slowly grows past what the board can hold when
+    # a web-page asset stays up or cycles for hours (forum #6731: black
+    # screen / thrash after long uptime). Chromium only auto-enables its
+    # low-memory profile below ~512 MB, so a ~1 GB board never gets it.
+    # Force it on, cap the per-renderer V8 old-space heap, and collapse to
+    # a single renderer to bound steady-state footprint. Reuse the shared
+    # ``is_low_ram_device`` gate (anthias_common.board) that already drives
+    # the video 1080p cap and the system-info Low-RAM badge, so the viewer,
+    # asset processor and UI all agree on which boards are constrained
+    # rather than each hard-coding a threshold. Each flag is added only
+    # when its switch isn't already present, so an inherited value on a
+    # respawn isn't duplicated and a switch the device set on purpose
+    # (say a different --js-flags) is neither overridden nor doubled —
+    # Chromium keeps only the last occurrence of a switch. The ones we do
+    # add are prepended, so the device's own flags and the dark-mode
+    # --blink-settings switch main.cpp appends still take effect.
+    if is_low_ram_device():
+        # (switch key, full flag). The key identifies an already-present
+        # switch: the ``--name=`` prefix for a valued flag, the whole
+        # token for a bare one.
+        low_mem_flags = (
+            ('--enable-low-end-device-mode', '--enable-low-end-device-mode'),
+            ('--js-flags=', '--js-flags=--max-old-space-size=64'),
+            ('--renderer-process-limit=', '--renderer-process-limit=1'),
+            ('--process-per-site', '--process-per-site'),
+            ('--disable-dev-shm-usage', '--disable-dev-shm-usage'),
+        )
+        existing = env.get('QTWEBENGINE_CHROMIUM_FLAGS', '')
+        existing_tokens = existing.split()
+        to_add = [
+            flag
+            for key, flag in low_mem_flags
+            if not any(
+                token == key or token.startswith(key)
+                for token in existing_tokens
+            )
+        ]
+        if to_add:
+            env['QTWEBENGINE_CHROMIUM_FLAGS'] = (
+                f'{" ".join(to_add)} {existing}'.strip()
+            )
+
     # "Prefer dark mode" applies to every board (the C++ webview turns
     # this into a Chromium blink flag at launch — see applyDarkModePreference
     # in src/anthias_webview/src/main.cpp), so set it before the
@@ -216,20 +437,68 @@ def _build_webview_env() -> dict[str, str]:
     else:
         env.pop('ANTHIAS_PREFER_DARK_MODE', None)
 
+    # pi3-64 (Raspberry Pi 3, VideoCore IV / vc4, GLES2-only) can't
+    # present the QML VideoOutput RHI video path: the scene renders but
+    # the QQuickWidget FBO never reaches the eglfs scanout, so every
+    # video black-screens (issue #3084) while images and webpages —
+    # which composite through the widget backing store — render fine.
+    # Route ONLY this board to the C++ non-VideoOutput presenter: the
+    # GStreamer vc4 overlay-plane path (preferred, ANTHIAS_VIDEO_OVERLAY),
+    # falling back to the CPU-raster blit (QVideoFrame::toImage() →
+    # paintEvent, the same backing-store path images use). Pi 4 (V3D 4.2)
+    # and Pi 5 (V3D 7.x) keep the fast on-GPU VideoOutput path. Gated on the authoritative baked
+    # DEVICE_TYPE (get_device_type() returns 'pi3' on both Pi 3 streams,
+    # so the model string alone can't tell 64-bit from armhf — same
+    # reason media_player.force_mpv keys off DEVICE_TYPE). Pop a stale
+    # value so a re-imaged/re-typed device drops the flag on respawn.
     rotation = _rotation_value()
+    if os.environ.get('DEVICE_TYPE') == 'pi3-64':
+        env['ANTHIAS_VIDEO_RASTER'] = '1'
+        # The hardware overlay-plane path (v4l2h264dec → kmssink on a vc4
+        # overlay plane, HW-composited with the eglfs UI plane) gives
+        # full-rate 30 fps video (#3164) — but that plane is scanned out
+        # independently of the eglfs QOpenGLCompositor, so
+        # QT_QPA_EGLFS_ROTATION does not rotate it: the UI turns while the
+        # video stays landscape (forum 6730). The vc4 plane hardware only
+        # supports 0°/180° rotation (measured: it advertises rotate-0 and
+        # rotate-180 only — no 90/270), so:
+        #   * 0° / 180° — keep the overlay. VideoView sets the plane's
+        #     rotation=180 property for 180° (a free scanout transform:
+        #     measured full 30 fps at ~7% CPU, no thermal cost).
+        #   * 90° / 270° — no HW plane rotation exists, so drop the
+        #     overlay and let VideoView fall back to the eglfs-composited
+        #     CPU-raster blit (QVideoFrame::toImage() → paintEvent), which
+        #     inherits the transform like images/webpages. That path is
+        #     software-bound (~9 fps at 1080p on this SoC) — the only
+        #     option for 90/270 short of a Pi 4/5.
+        if rotation in (0, 180):
+            env['ANTHIAS_VIDEO_OVERLAY'] = '1'
+        else:
+            env.pop('ANTHIAS_VIDEO_OVERLAY', None)
+    else:
+        env.pop('ANTHIAS_VIDEO_RASTER', None)
+        env.pop('ANTHIAS_VIDEO_OVERLAY', None)
+
     if _is_wayland_board():
         return env
     qpa = env.get('QT_QPA_PLATFORM', 'linuxfb')
     if qpa.partition(':')[0] == 'eglfs':
         if rotation:
-            # eglfs only understands 180, 90 and -90. A literal 270
-            # hits the "Invalid rotation" default branch in
-            # QEglFSScreen::geometry(), so the QOpenGLCompositor still
-            # rotates the content but the screen geometry never swaps
-            # to portrait — the window lays out landscape and renders
-            # stretched (issue #2970). Spell 270° as -90 instead.
+            # ``screen_rotation`` is defined CLOCKWISE — that's the
+            # direction the linuxfb (paintEvent / injected CSS) and the
+            # GStreamer ``videoflip`` paths turn. A raw
+            # ``QT_QPA_EGLFS_ROTATION=N`` turns the QOpenGLCompositor the
+            # OTHER way (anticlockwise), so screen_rotation=90 came out
+            # 90° anticlockwise on eglfs boards while a Pi 2 turned it
+            # clockwise — opposite orientation for the same setting.
+            # Negate so every display stack agrees. eglfs only understands
+            # 180, 90 and -90 — a literal 270 hits the "Invalid rotation"
+            # default branch in QEglFSScreen::geometry() (the compositor
+            # still rotates but the geometry never swaps to portrait, so
+            # the window lays out landscape and renders stretched, issue
+            # #2970) — so 90° CW is spelled -90 and 270° CW is spelled 90.
             env['QT_QPA_EGLFS_ROTATION'] = str(
-                -90 if rotation == 270 else rotation
+                {90: -90, 180: 180, 270: 90}[rotation]
             )
         else:
             # Drop a stale value so dialling back to 0 actually
@@ -241,7 +510,11 @@ def _build_webview_env() -> dict[str, str]:
 
 
 def _wlr_transform_value(rotation_deg: int) -> str:
-    return {0: 'normal', 90: '90', 180: '180', 270: '270'}.get(
+    # wlr-randr transforms turn the output ANTICLOCKWISE, the opposite of
+    # screen_rotation's clockwise convention (linuxfb + videoflip). Map a
+    # 90° clockwise turn to wlr transform '270' and 270° CW to '90' so
+    # wayland boards rotate the same way as every other display stack.
+    return {0: 'normal', 90: '270', 180: '180', 270: '90'}.get(
         rotation_deg, 'normal'
     )
 
@@ -281,14 +554,13 @@ def _wlr_output_names(include_disabled: bool = False) -> list[str]:
             capture_output=True,
             text=True,
             timeout=5,
+            check=False,
         )
     except (FileNotFoundError, subprocess.SubprocessError) as exc:
-        logging.debug('wlr-randr unavailable: %s', exc)
+        logger.debug('wlr-randr unavailable: %s', exc)
         return []
     if result.returncode != 0:
-        logging.debug(
-            'wlr-randr exit %d: %s', result.returncode, result.stderr
-        )
+        logger.debug('wlr-randr exit %d: %s', result.returncode, result.stderr)
         return []
     names: list[str] = []
     current: str | None = None
@@ -353,7 +625,7 @@ def _apply_wlr_transform(rotation_deg: int) -> bool:
                 check=False,
             )
         except (FileNotFoundError, subprocess.SubprocessError) as exc:
-            logging.warning(
+            logger.warning(
                 'wlr-randr --transform failed for %s: %s', name, exc
             )
             continue
@@ -364,12 +636,12 @@ def _apply_wlr_transform(rotation_deg: int) -> bool:
         # returncode==0 as success and surface stderr on failure so a
         # silently-broken rotation is debuggable from journald.
         if result.returncode == 0:
-            logging.info(
+            logger.info(
                 'Applied wlroots transform %s to output %s', transform, name
             )
             any_success = True
         else:
-            logging.warning(
+            logger.warning(
                 'wlr-randr --transform %s on %s exited %d: %s',
                 transform,
                 name,
@@ -408,13 +680,13 @@ def _apply_wlr_power(on: bool) -> bool:
                 check=False,
             )
         except (FileNotFoundError, subprocess.SubprocessError) as exc:
-            logging.warning('wlr-randr %s failed for %s: %s', flag, name, exc)
+            logger.warning('wlr-randr %s failed for %s: %s', flag, name, exc)
             continue
         if result.returncode == 0:
-            logging.info('Set output %s %s', name, flag)
+            logger.info('Set output %s %s', name, flag)
             any_success = True
         else:
-            logging.warning(
+            logger.warning(
                 'wlr-randr %s on %s exited %d: %s',
                 flag,
                 name,
@@ -426,7 +698,7 @@ def _apply_wlr_power(on: bool) -> bool:
 
 def send_current_asset_id_to_server(correlation_id: str | None) -> None:
     if not correlation_id:
-        logging.warning(
+        logger.warning(
             'current_asset_id command received without a correlation ID; '
             'dropping reply.'
         )
@@ -439,7 +711,7 @@ def send_current_asset_id_to_server(correlation_id: str | None) -> None:
     # endpoint already treats a falsy id as "no current asset" and
     # returns `[]`, which is the correct answer pre-scheduler-init.
     if scheduler is None:
-        logging.info(
+        logger.info(
             'current_asset_id requested before scheduler was ready; '
             'replying with no current asset.'
         )
@@ -449,6 +721,51 @@ def send_current_asset_id_to_server(correlation_id: str | None) -> None:
     reply_sender.send(
         correlation_id, {'current_asset_id': scheduler.current_asset_id}
     )
+
+
+def _reply_cec_status(correlation_id: str | None) -> None:
+    """Answer a ``display_power_status`` request.
+
+    The viewer owns CEC because it is the only container that can reach
+    ``/dev/cec*`` on every board and every deployment — see
+    ``anthias_server.lib.cec_client`` for why the server cannot.
+    """
+    if not correlation_id:
+        logger.warning(
+            'display_power_status received without a correlation ID; '
+            'dropping reply.'
+        )
+        return
+    try:
+        status = cec.power_status()
+    except cec.CEC_ERRORS as exc:
+        logger.warning('CEC power query failed: %s', exc)
+        status = cec.PowerStatus.ERROR
+    reply_sender.send(correlation_id, {'status': str(status)})
+
+
+def _reply_cec_set_power(correlation_id: str | None, on: bool) -> None:
+    """Answer a ``display_on`` / ``display_off`` request.
+
+    ``busy`` tells the caller nothing was transmitted, so a scheduler
+    retries rather than latching a command that never went out.
+    """
+    if not correlation_id:
+        logger.warning(
+            'display power command received without a correlation ID; '
+            'dropping reply.'
+        )
+        return
+    payload: dict[str, Any]
+    try:
+        acknowledged, attempted = cec.set_power(on)
+        payload = {'acknowledged': acknowledged, 'attempted': attempted}
+    except cec.CecBusyError:
+        payload = {'busy': True, 'acknowledged': 0, 'attempted': 0}
+    except cec.CEC_ERRORS as exc:
+        logger.warning('CEC power command failed: %s', exc)
+        payload = {'acknowledged': 0, 'attempted': 0, 'error': str(exc)}
+    reply_sender.send(correlation_id, payload)
 
 
 def blank_display() -> None:
@@ -514,6 +831,13 @@ commands = {
     'unblank': lambda _: unblank_display(),
     'unknown': lambda _: command_not_found(),
     'current_asset_id': lambda corr: send_current_asset_id_to_server(corr),
+    # HDMI-CEC. Handled here rather than in anthias-server because the
+    # viewer is the only container with access to /dev/cec* on every
+    # board and every deployment (privileged: true in all three compose
+    # templates, balena included).
+    'display_power_status': lambda corr: _reply_cec_status(corr),
+    'display_on': lambda corr: _reply_cec_set_power(corr, True),
+    'display_off': lambda corr: _reply_cec_set_power(corr, False),
 }
 
 
@@ -583,7 +907,7 @@ def _terminate_webview(proc: Any) -> None:
     try:
         proc.terminate()
     except Exception:
-        logging.debug('Could not SIGTERM AnthiasViewer', exc_info=True)
+        logger.debug('Could not SIGTERM AnthiasViewer', exc_info=True)
         return
     deadline = monotonic() + BROWSER_TERMINATE_GRACE_SECONDS
     while monotonic() < deadline:
@@ -593,7 +917,7 @@ def _terminate_webview(proc: Any) -> None:
     try:
         proc.kill()
     except Exception:
-        logging.debug('Could not SIGKILL AnthiasViewer', exc_info=True)
+        logger.debug('Could not SIGKILL AnthiasViewer', exc_info=True)
 
 
 def _wayland_socket_path() -> str | None:
@@ -636,7 +960,7 @@ def _wait_for_wayland_socket(deadline: float) -> None:
     socket_path = _wayland_socket_path()
     if socket_path is None or os.path.exists(socket_path):
         return
-    logging.warning(
+    logger.warning(
         'Wayland socket %s not present yet; waiting (within the spawn '
         'budget) before launching the webview',
         socket_path,
@@ -645,11 +969,88 @@ def _wait_for_wayland_socket(deadline: float) -> None:
         if os.path.exists(socket_path):
             return
         sleep(BROWSER_POLL_INTERVAL_SECONDS)
-    logging.warning(
+    logger.warning(
         'Wayland socket %s still absent; launching anyway (the launch '
         'will fail and retry if cage is truly down)',
         socket_path,
     )
+
+
+# Upper bound on the AnthiasViewer output we retain in memory. sh
+# otherwise keeps the whole stdout+stderr stream for the life of the
+# background process (issue #3138); we keep only the most recent slice —
+# large enough that the startup handshake and any crash tail fall inside
+# the window, small enough to never pressure a 1-2 GB board.
+WEBVIEW_OUTPUT_BUFFER_CHARS = 64 * 1024
+
+
+class _BoundedWebviewOutput:
+    """``_out`` sink that retains only the tail of AnthiasViewer's output.
+
+    Passed as ``_out`` to the background ``sh`` command so sh streams each
+    chunk here instead of aggregating the entire merged stdout+stderr in
+    the viewer process's RAM for the whole session. Without it, a chatty
+    decoder — e.g. ffmpeg's AAC path spamming ``channel element 0.0
+    duplicate`` on every audio frame for certain files — grows the
+    viewer's RSS without bound until a low-memory board (the 2 GB Pi4 in
+    issue #3138) swaps itself to a standstill and the screen sits blank
+    for minutes between assets.
+
+    We keep the last ``maxlen`` characters: the handshake line is emitted
+    early (well inside the window) and a crash tail is the most recent
+    output, so both survive while everything older is dropped.
+
+    Retention is a deque of raw chunks, not a growing-then-sliced string:
+    a chatty decoder can call ``__call__`` per audio frame for the life of
+    the process, and ``buf += chunk`` + slice would re-copy ~``maxlen``
+    characters on *every* such call once the window is full — steady CPU
+    burn on a weak Pi, against the spirit of this fix. Appending a chunk
+    and dropping whole oldest chunks is amortized O(1); the join to a
+    single string happens only in ``text()``, which is read rarely (the
+    startup handshake poll, where the buffer is still small, and
+    ``WEBVIEW_DEBUG``). sh invokes ``__call__`` from its stdout reader
+    thread, so access is lock-guarded.
+    """
+
+    def __init__(self, maxlen: int = WEBVIEW_OUTPUT_BUFFER_CHARS) -> None:
+        self._maxlen = maxlen
+        self._chunks: deque[str] = deque()
+        self._size = 0
+        self._lock = Lock()
+
+    def __call__(self, chunk: str | bytes) -> None:
+        # sh decodes to ``str`` for an ``_out`` callback under the default
+        # encoding (verified with the shipped sh 2.3.0 on a Pi4), but
+        # coerce defensively so an ``_encoding=None`` / raw-bytes
+        # configuration can never turn ``str + bytes`` into a TypeError
+        # that would silently break the handshake scan.
+        if isinstance(chunk, bytes):
+            chunk = chunk.decode('utf-8', errors='replace')
+        # A single chunk larger than the window (a big unbuffered write
+        # from the child) can't add more than the tail we'd keep anyway,
+        # so slice it up front — bounds both the stored chunk and the
+        # transient at ``maxlen``.
+        if len(chunk) > self._maxlen:
+            chunk = chunk[-self._maxlen :]
+        with self._lock:
+            self._chunks.append(chunk)
+            self._size += len(chunk)
+            # Drop whole oldest chunks while the remainder still covers
+            # the window, so retained size stays within [maxlen,
+            # maxlen + newest-dropped-chunk) < 2x maxlen — without ever
+            # re-copying the kept data.
+            while (
+                self._chunks
+                and self._size - len(self._chunks[0]) >= self._maxlen
+            ):
+                self._size -= len(self._chunks.popleft())
+
+    def text(self) -> str:
+        with self._lock:
+            joined = ''.join(self._chunks)
+        # Trim to the exact tail: the front chunk may push the join a
+        # little over ``maxlen`` (see the drop condition above).
+        return joined[-self._maxlen :]
 
 
 def _spawn_webview_once(startup_timeout: float) -> Any:
@@ -667,12 +1068,25 @@ def _spawn_webview_once(startup_timeout: float) -> Any:
     socket and the handshake, so the socket wait can't pile on top of
     ``startup_timeout``.
     """
+    global _webview_output
     deadline = monotonic() + startup_timeout
     # On cage boards, don't race the Wayland socket — a spawn before
     # it exists dies instantly with "Failed to create wl_display" and
     # wastes a retry attempt (Sentry ANTHIAS-19). No-op elsewhere and
     # when the socket is already up (the common case).
     _wait_for_wayland_socket(deadline)
+    # Bounded ``_out`` sink instead of sh's default: sh would otherwise
+    # retain the process's entire stdout+stderr in RAM forever, and a
+    # chatty decoder then leaks the viewer to death on a low-memory board
+    # (issue #3138). With an ``_out`` handler sh stops aggregating
+    # ``.process.stdout`` (it stays empty), so the handshake scan and the
+    # failure message below read the sink instead.
+    #
+    # Publish the sink now, before the spawn: ``_webview_output`` then
+    # mirrors ``browser`` for the live attempt, so a WEBVIEW_DEBUG read
+    # during launch/retry can't surface a previous process's stale tail.
+    output = _BoundedWebviewOutput()
+    _webview_output = output
     try:
         # _bg_exc=False: with the default (True), sh re-raises the exit
         # error (e.g. SignalException_SIGABRT on a Qt init crash, or
@@ -685,6 +1099,7 @@ def _spawn_webview_once(startup_timeout: float) -> Any:
             _bg=True,
             _bg_exc=False,
             _err_to_out=True,
+            _out=output,
             _env=_build_webview_env(),
         )
     except sh.CommandNotFound as exc:
@@ -696,15 +1111,12 @@ def _spawn_webview_once(startup_timeout: float) -> Any:
     # so the whole attempt — socket wait plus handshake — is bounded by
     # ``startup_timeout`` rather than the two stacking.
     while monotonic() < deadline:
-        if BROWSER_HANDSHAKE_LINE in candidate.process.stdout.decode(
-            'utf-8', errors='replace'
-        ):
+        if BROWSER_HANDSHAKE_LINE in output.text():
             return candidate
         if not candidate.is_alive():
             raise WebviewLaunchError(
                 'AnthiasViewer exited before emitting D-Bus handshake; '
-                'stdout: '
-                + candidate.process.stdout.decode('utf-8', errors='replace')
+                'stdout: ' + output.text()
             )
         sleep(BROWSER_POLL_INTERVAL_SECONDS)
 
@@ -730,9 +1142,10 @@ def load_browser(
     persistent failure can't freeze the asset_loop thread for minutes.
     """
     global browser, _webview_supports_set_reload_interval
-    global _last_applied_rotation, current_browser_url
-    global _last_applied_dark_mode
-    logging.info('Loading browser...')
+    global _webview_supports_set_request_headers, _webview_supports_ssl_arg
+    global _last_applied_rotation, current_browser_url, current_browser_headers
+    global _last_applied_dark_mode, current_browser_skip_ssl
+    logger.info('Loading browser...')
 
     # Latch the dark-mode preference the spawned process is about to be
     # launched with (via _build_webview_env), so a later ``reload`` only
@@ -765,6 +1178,11 @@ def load_browser(
     # case. Resetting on every launch keeps the latch tied to the
     # actual running process, not the viewer's lifetime.
     _webview_supports_set_reload_interval = True
+    # Same re-probe for the custom-headers slot (#2215): a webview
+    # restart may bring up a binary that now supports setRequestHeaders.
+    _webview_supports_set_request_headers = True
+    # And the same re-probe for the loadPage/loadImage skipSslVerify arg.
+    _webview_supports_ssl_arg = True
 
     # Apply screen rotation *before* the webview starts so it picks up
     # the rotated geometry on first frame: the wlroots compositor
@@ -800,6 +1218,14 @@ def load_browser(
     # unchanged URL, e.g. a single-asset playlist) never gets the
     # loadImage/loadPage re-sent.
     current_browser_url = None
+    # Likewise drop the applied-headers cache so the next view_webpage
+    # re-sends them to the fresh process (whose interceptor starts empty).
+    current_browser_headers = {}
+    # And drop the skip-SSL cache: a fresh webview defaults to verifying
+    # certificates, so the next view_image/view_webpage must re-assert
+    # the flag rather than assume the previous process's policy carried
+    # over.
+    current_browser_skip_ssl = False
 
     # Retry the spawn with capped exponential backoff so a board that
     # intermittently crashes during Qt/WebEngine init self-heals on a
@@ -816,15 +1242,27 @@ def load_browser(
             raise
         except WebviewLaunchError as exc:
             last_error = exc
+            if _display_device_vanished(str(exc)):
+                # No retry can re-snapshot the container's /dev, so stop
+                # immediately rather than spend the budget (GH #3266).
+                # The distinct message also stops this grouping with
+                # genuine Qt init crashes in Sentry.
+                raise WebviewLaunchError(
+                    'AnthiasViewer cannot start: the display device is '
+                    f'gone ({_linuxfb_device()} absent inside the '
+                    'container, and Qt reports no usable screen). The '
+                    'container needs to restart to re-enumerate /dev; '
+                    f'retrying in-process cannot help. Last error: {exc}'
+                ) from exc
             if attempt == 1:
-                logging.warning(
+                logger.warning(
                     'AnthiasViewer failed to start (attempt %d/%d): %s',
                     attempt,
                     max_attempts,
                     exc,
                 )
             if attempt < max_attempts:
-                logging.warning(
+                logger.warning(
                     'Retrying AnthiasViewer in %ds (attempt %d/%d)',
                     backoff,
                     attempt,
@@ -835,7 +1273,7 @@ def load_browser(
             continue
 
         if attempt > 1:
-            logging.info(
+            logger.info(
                 'AnthiasViewer started on attempt %d/%d',
                 attempt,
                 max_attempts,
@@ -910,7 +1348,7 @@ def _send_to_webview(send: Callable[[], Any]) -> None:
     except Exception as exc:
         if not _is_webview_gone_error(exc):
             raise
-        logging.warning(
+        logger.warning(
             'AnthiasViewer died mid D-Bus call; respawning and retrying '
             'once: %s',
             exc,
@@ -928,7 +1366,149 @@ def _send_to_webview(send: Callable[[], Any]) -> None:
     send()
 
 
-def view_webpage(uri: str, reload_interval_s: int = 0) -> None:
+def _load_via_webview(
+    load_with_skip: Callable[[], Any],
+    load_without_skip: Callable[[], Any],
+) -> None:
+    """Issue a ``loadPage`` / ``loadImage`` that tolerates a
+    version-skewed webview.
+
+    The ``skipSslVerify`` parameter was added to the loadPage/loadImage
+    D-Bus slots in this release. A webview process still running the
+    previous binary (fleet rollout mid-flight: the viewer container has
+    rotated to a newer image but the separate webview process hasn't
+    restarted yet) exposes only the 1-arg slots, so the 2-arg call
+    fails — as ``UnknownMethod`` from QtDBus, or as a pydbus argument
+    marshalling error, depending on when the proxy was introspected.
+
+    Rather than pattern-match the exception (fragile across pydbus/Qt
+    versions), confirm the skew empirically: if the legacy 1-arg call
+    (``load_without_skip``) succeeds where the 2-arg one failed, it was
+    a skew — latch the capability off so the rest of the process skips
+    the doomed 2-arg attempt, and let the asset display (it loses only
+    the per-asset SSL-skip, which that older webview couldn't honour
+    anyway). If the fallback *also* fails, the extra argument wasn't the
+    problem, so re-raise the original error. A webview-gone error is
+    left to ``_send_to_webview``'s respawn-and-retry. The latch is reset
+    on every (re)spawn in ``load_browser``, mirroring the
+    ``setReloadInterval`` / ``setRequestHeaders`` handling.
+    """
+    global _webview_supports_ssl_arg
+    if _webview_supports_ssl_arg:
+        try:
+            _send_to_webview(load_with_skip)
+            return
+        except Exception as exc:
+            if _is_webview_gone_error(exc):
+                raise
+            try:
+                _send_to_webview(load_without_skip)
+            except Exception:
+                # The 1-arg call failed too — not a signature skew.
+                # Re-raise the original 2-arg failure. ``from None`` drops
+                # the fallback exception from the context so the traceback
+                # points at the real cause instead of a confusing "during
+                # handling of the above exception" chain, while ``exc``
+                # keeps its own original traceback.
+                raise exc from None
+            _webview_supports_ssl_arg = False
+            logger.warning(
+                'webview predates the loadPage/loadImage skipSslVerify '
+                'argument (version skew?); per-asset SSL-skip disabled '
+                'until the webview restarts: %s',
+                exc,
+            )
+            return
+    _send_to_webview(load_without_skip)
+
+
+def _cache_busted_url(uri: str) -> str:
+    """Append a unique query parameter so a ``nocache`` webpage is
+    refetched fresh on every rotation.
+
+    Two things otherwise serve stale content for a ``nocache`` asset:
+    QtWebEngine's in-memory HTTP cache (which honours the response's
+    own cache-control headers, so a page that ships a long max-age is
+    reused for the whole session), and view_webpage's unchanged-URL
+    short-circuit (which skips the loadPage D-Bus call entirely when the
+    asset comes back around in the loop). A distinct URL per display
+    defeats both. This restores the per-asset nocache behaviour (refs
+    #11) that the Uzbl→webview migration silently dropped.
+
+    The token is wall-clock milliseconds, matching the original
+    implementation; the key is namespaced so it can't clobber a query
+    parameter the page itself relies on. The existing query string is
+    appended to verbatim — NOT decoded and re-encoded — so a signed or
+    pre-encoded URL (presigned S3, dashboard auth tokens, ``%20`` vs
+    ``+`` distinctions) reaches the origin byte-for-byte as stored.
+    """
+    parts = urlparse(uri)
+    token = f'_anthias_nc={int(time() * 1000)}'
+    new_query = f'{parts.query}&{token}' if parts.query else token
+    return urlunparse(parts._replace(query=new_query))
+
+
+def _apply_request_headers(headers: dict[str, str]) -> bool:
+    """Push the current webpage asset's custom request headers to the
+    webview over D-Bus (#2215). Returns whether the headers are now in
+    effect on the webview.
+
+    The payload is a JSON object string rather than a D-Bus ``a{sv}`` map
+    — passing JSON keeps the marshaling trivial across pydbus versions
+    and matches how the C++ side (``setRequestHeaders``) parses it. Sent
+    on every webpage tick (cheap, idempotent); the C++ interceptor only
+    attaches them to same-origin requests (scheme+host+port).
+
+    Version-skew tolerant, mirroring ``setReloadInterval``: an older
+    AnthiasViewer that predates the slot raises UnknownMethod, which
+    latches the capability off for this viewer process so we don't flood
+    journald or keep paying the round-trip.
+
+    Returns ``True`` when the call succeeded *or* the slot is
+    unsupported (nothing left to retry), and ``False`` on a transient
+    failure. The caller keys navigation off this: on ``False`` it must
+    NOT issue ``loadPage``, because the C++ side still holds the previous
+    asset's staged headers and would scope them to the new asset's origin
+    (a cross-asset credential leak). It instead defers and retries next
+    tick, leaving the URL/header mismatch in place. Observed on real
+    hardware: the very first ``setRequestHeaders`` can lose the race
+    against a just-spawned webview's D-Bus registration.
+    """
+    global _webview_supports_set_request_headers
+    if not _webview_supports_set_request_headers:
+        return True
+    payload = json.dumps(headers or {})
+    try:
+        browser_bus.setRequestHeaders(payload)
+        return True
+    except Exception as exc:
+        message = str(exc)
+        method_missing = (
+            'UnknownMethod' in message or 'no such method' in message.lower()
+        )
+        if method_missing:
+            _webview_supports_set_request_headers = False
+            logger.warning(
+                'setRequestHeaders not supported by webview (version '
+                'skew?); custom headers disabled until viewer restart: %s',
+                exc,
+            )
+            return True
+        logger.debug(
+            'Transient setRequestHeaders failure (will retry next '
+            'rotation): %s',
+            exc,
+        )
+        return False
+
+
+def view_webpage(
+    uri: str,
+    reload_interval_s: int = 0,
+    nocache: bool = False,
+    headers: dict[str, str] | None = None,
+    skip_ssl_verify: bool = False,
+) -> None:
     """Display a webpage and arm its per-asset auto-refresh timer.
 
     ``reload_interval_s`` mirrors ``Asset.metadata['refresh_interval_s']``:
@@ -939,8 +1519,19 @@ def view_webpage(uri: str, reload_interval_s: int = 0) -> None:
     when the URL is unchanged from the previous tick — so an edit that
     only flips the interval (no URI change) takes effect on the next
     asset_loop iteration.
+
+    ``nocache`` mirrors ``Asset.nocache``: when set, the URL is
+    cache-busted (see _cache_busted_url) so the page is fetched fresh
+    each time the asset is shown rather than served from QtWebEngine's
+    HTTP cache or skipped by the unchanged-URL short-circuit below.
     """
-    global current_browser_url
+    global current_browser_url, current_browser_headers
+    global current_browser_skip_ssl
+
+    headers = headers or {}
+
+    if nocache:
+        uri = _cache_busted_url(uri)
 
     if browser is None or not browser.is_alive():
         # Mid-playback respawn on the asset_loop thread: small, short
@@ -951,13 +1542,51 @@ def view_webpage(uri: str, reload_interval_s: int = 0) -> None:
             backoff_cap=BROWSER_SPAWN_INLINE_BACKOFF_CAP_SECONDS,
             startup_timeout=BROWSER_SPAWN_INLINE_TIMEOUT_SECONDS,
         )
+    # Hand the per-asset headers to the webview BEFORE loadPage so the
+    # C++ interceptor has them when the navigation fires. Always sent
+    # (empty {} for header-less assets) so switching away from a
+    # header-carrying asset clears the previous asset's headers.
+    headers_applied = _apply_request_headers(headers)
     # ``!=`` (value comparison): an ``is not`` identity check would
     # only short-circuit when the asset_loop happens to pass the same
     # str object on consecutive ticks, which a JSON-reconstructed URL
-    # would defeat.
-    if current_browser_url != uri:
-        _send_to_webview(lambda: browser_bus.loadPage(uri))
-        current_browser_url = uri
+    # would defeat. Reload when the headers or the skip-SSL flag change
+    # too — a header-only edit must still refetch so the new headers
+    # reach the main document (not just later same-origin XHR), and
+    # flipping skip-SSL on the current page must re-load immediately.
+    if (
+        current_browser_url != uri
+        or current_browser_headers != headers
+        or current_browser_skip_ssl != skip_ssl_verify
+    ):
+        if headers_applied:
+            _load_via_webview(
+                lambda: browser_bus.loadPage(uri, skip_ssl_verify),
+                lambda: browser_bus.loadPage(uri),
+            )
+            current_browser_url = uri
+            # Store a copy, not the caller's dict: aliasing it would let a
+            # later in-place mutation of that dict silently change the
+            # cached value, making the next ``!=`` compare equal and skip
+            # a needed reload. The asset_loop currently hands us a fresh
+            # dict each tick, but the copy keeps that a non-assumption.
+            current_browser_headers = dict(headers)
+            current_browser_skip_ssl = skip_ssl_verify
+        else:
+            # setRequestHeaders failed transiently, so the webview still
+            # holds the PREVIOUS asset's staged headers. Issuing loadPage
+            # now would make the C++ interceptor scope those stale headers
+            # to THIS asset's origin — a cross-asset credential leak (e.g.
+            # the prior asset's Authorization reaching the next asset's
+            # host). Defer navigation and leave current_browser_url /
+            # current_browser_headers / current_browser_skip_ssl stale so
+            # the next tick retries once the D-Bus call succeeds. A
+            # single-asset playlist self-heals the same way (the mismatch
+            # persists until the send lands).
+            logger.debug(
+                'Deferring loadPage until request headers apply '
+                '(transient setRequestHeaders failure)'
+            )
     # ``setReloadInterval`` is a new D-Bus method. A viewer running
     # against an older AnthiasViewer (version skew across a fleet
     # rollout, where the viewer container has rotated to a newer image
@@ -984,23 +1613,28 @@ def view_webpage(uri: str, reload_interval_s: int = 0) -> None:
             )
             if method_missing:
                 _webview_supports_set_reload_interval = False
-                logging.warning(
+                logger.warning(
                     'setReloadInterval not supported by webview '
                     '(version skew?); auto-refresh disabled until '
                     'viewer restart: %s',
                     exc,
                 )
             else:
-                logging.debug(
+                logger.debug(
                     'Transient setReloadInterval failure (will retry '
                     'next rotation): %s',
                     exc,
                 )
-    logging.info('Current url is {0}'.format(current_browser_url))
+    # debug, not info: this fires on every rotation tick — including the
+    # standby image while the playlist is empty — and in production feeds
+    # a ~15 MB volatile journal shared with every other container. The
+    # URL is still available at debug level when diagnosing rotation
+    # (GH #3268).
+    logger.debug(f'Current url is {current_browser_url}')
 
 
-def view_image(uri: str) -> None:
-    global current_browser_url
+def view_image(uri: str, skip_ssl_verify: bool = False) -> None:
+    global current_browser_url, current_browser_skip_ssl
 
     if browser is None or not browser.is_alive():
         # Mid-playback respawn on the asset_loop thread: small, short
@@ -1014,18 +1648,31 @@ def view_image(uri: str) -> None:
     # Value comparison (matches view_webpage): an ``is not`` identity
     # check would only short-circuit when the asset_loop happens to
     # pass the same str object on consecutive ticks, which a JSON-
-    # reconstructed URL would defeat.
-    if current_browser_url != uri:
-        _send_to_webview(lambda: browser_bus.loadImage(uri))
+    # reconstructed URL would defeat. The skip-SSL flag is part of the
+    # key so flipping it on the current asset re-fetches immediately.
+    if (
+        current_browser_url != uri
+        or current_browser_skip_ssl != skip_ssl_verify
+    ):
+        _load_via_webview(
+            lambda: browser_bus.loadImage(uri, skip_ssl_verify),
+            lambda: browser_bus.loadImage(uri),
+        )
         current_browser_url = uri
-    logging.info('Current url is {0}'.format(current_browser_url))
+        current_browser_skip_ssl = skip_ssl_verify
+    # debug, not info: this fires on every rotation tick — including the
+    # standby image while the playlist is empty — and in production feeds
+    # a ~15 MB volatile journal shared with every other container. The
+    # URL is still available at debug level when diagnosing rotation
+    # (GH #3268).
+    logger.debug(f'Current url is {current_browser_url}')
 
-    if string_to_bool(getenv('WEBVIEW_DEBUG', '0')):
-        logging.info(browser.process.stdout)
+    if string_to_bool(getenv('WEBVIEW_DEBUG', '0')) and _webview_output:
+        logger.info(_webview_output.text())
 
 
 def view_video(uri: str, duration: int | str) -> None:
-    logging.debug('Displaying video %s for %s ', uri, duration)
+    logger.debug('Displaying video %s for %s ', uri, duration)
     media_player = MediaPlayerProxy.get_instance()
 
     media_player.set_asset(uri, duration)
@@ -1037,12 +1684,12 @@ def view_video(uri: str, duration: int | str) -> None:
         skip_event = get_skip_event()
         skip_event.clear()
         if skip_event.wait(timeout=int(duration)):
-            logging.info('Skip detected during video playback, stopping video')
+            logger.info('Skip detected during video playback, stopping video')
             media_player.stop()
         else:
             pass
     except sh.ErrorReturnCode_1:
-        logging.info(
+        logger.info(
             'Resource URI is not correct, remote host is not responding or '
             'request was rejected.'
         )
@@ -1058,6 +1705,14 @@ def load_settings() -> None:
     logging.getLogger().setLevel(
         logging.DEBUG if settings['debug_logging'] else logging.INFO
     )
+    # Activate the operator-selected timezone so the scheduler's
+    # timezone.localtime() day-of-week / time-of-day windowing matches
+    # the server. Called at startup and on every `reload`, so a Settings
+    # change reschedules without restarting the viewer.
+    try:
+        timezone.activate(resolve_time_zone())
+    except Exception:
+        timezone.deactivate()
 
 
 def _handle_reload() -> None:
@@ -1101,7 +1756,7 @@ def _maybe_reapply_rotation() -> None:
     if rotation == _last_applied_rotation:
         return
 
-    logging.info(
+    logger.info(
         'Screen rotation changed: %d -> %d',
         _last_applied_rotation,
         rotation,
@@ -1139,7 +1794,7 @@ def _maybe_reapply_rotation() -> None:
         if _apply_wlr_transform(rotation):
             _last_applied_rotation = rotation
         else:
-            logging.warning(
+            logger.warning(
                 'wlr-randr could not apply rotation %d on any output; '
                 'will retry on the next asset_loop tick.',
                 rotation,
@@ -1190,7 +1845,7 @@ def _maybe_reapply_dark_mode() -> None:
     if prefer_dark == _last_applied_dark_mode:
         return
 
-    logging.info(
+    logger.info(
         'Prefer-dark-mode changed: %s -> %s',
         _last_applied_dark_mode,
         prefer_dark,
@@ -1227,6 +1882,320 @@ def _retry_wayland_rotation_if_pending() -> None:
         _last_applied_rotation = rotation
 
 
+def _kernel_has_connected_display() -> bool:
+    """True when a DRM connector reports a strictly ``connected`` status.
+
+    Broader than ``_kernel_has_bindable_display``: it does NOT require a
+    populated ``modes`` list. The headless-boot wedge leaves a real,
+    plugged-in display ``connected`` with an *empty* mode list — cage
+    holds the output disabled so the kernel never re-read its EDID
+    (validated on the Pi 5, issue 3239). A container restart makes cage
+    re-enumerate DRM and the EDID then gets read, so a connected display
+    is worth one recovery restart even before its modes appear.
+
+    Matched as strict ``connected`` (not the looser "not disconnected"
+    used for bindability) so the ``Writeback`` connector — ``unknown``
+    status, always modeless — never counts as a display to recover.
+    """
+    for status_path in glob('/sys/class/drm/*/status'):
+        try:
+            with open(status_path) as status_file:
+                if status_file.read().strip() == 'connected':
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def _recovery_state_path() -> str:
+    return path.join(settings.get_configdir(), '.wayland_recovery')
+
+
+def _current_boot_id() -> str:
+    """A value stable within a boot and different across reboots.
+
+    Prefers the kernel's per-boot UUID. If that's unreadable, falls back
+    to ``btime`` (boot time in epoch seconds) from ``/proc/stat``, which
+    also changes on every reboot — so the per-boot restart cap still
+    resets on a real reboot rather than a stale '' persisting and pinning
+    a give-up forever. '' only if nothing identifying can be read.
+    """
+    try:
+        with open('/proc/sys/kernel/random/boot_id') as boot_id_file:
+            boot_id = boot_id_file.read().strip()
+        if boot_id:
+            return boot_id
+    except OSError:
+        pass
+    try:
+        with open('/proc/stat') as stat_file:
+            for line in stat_file:
+                if line.startswith('btime '):
+                    return 'btime:' + line.split()[1]
+    except (OSError, IndexError):
+        pass
+    return ''
+
+
+def _recovery_restarts_this_boot() -> int:
+    """Recovery restarts recorded for the *current* boot, else 0.
+
+    A boot_id mismatch (real reboot), a missing/corrupt file, or any read
+    error all read as 0 — fail toward allowing a recovery, never toward a
+    permanently dark screen.
+    """
+    try:
+        with open(_recovery_state_path()) as state_file:
+            state = json.load(state_file)
+        if state.get('boot_id') == _current_boot_id():
+            return int(state.get('restarts', 0))
+    except (OSError, ValueError, TypeError):
+        pass
+    return 0
+
+
+def _record_recovery_restart() -> bool:
+    """Persist an incremented boot-scoped restart count.
+
+    Returns False if it could not be written — the caller then must NOT
+    restart, so a filesystem we cannot record against can never become an
+    unbounded restart loop.
+    """
+    state = {
+        'boot_id': _current_boot_id(),
+        'restarts': _recovery_restarts_this_boot() + 1,
+    }
+    try:
+        with open(_recovery_state_path(), 'w') as state_file:
+            json.dump(state, state_file)
+        return True
+    except OSError as exc:
+        logger.error('could not persist wayland recovery counter: %s', exc)
+        return False
+
+
+def _reset_recovery_restarts() -> None:
+    """Clear the recovery budget once the wedge is gone (a display bound,
+    or nothing connected). Only writes when there is something to clear,
+    to avoid churning the file every healthy tick."""
+    global _recovery_gave_up_logged
+    _recovery_gave_up_logged = False
+    if _recovery_restarts_this_boot() == 0:
+        return
+    try:
+        with open(_recovery_state_path(), 'w') as state_file:
+            json.dump(
+                {'boot_id': _current_boot_id(), 'restarts': 0}, state_file
+            )
+    except OSError as exc:
+        logger.debug('could not clear wayland recovery counter: %s', exc)
+
+
+def _kernel_has_bindable_display() -> bool:
+    """True when the kernel exposes a display the compositor could bind.
+
+    A DRM connector is *bindable* when its ``status`` is anything other
+    than ``disconnected`` (or empty/unreadable) AND it has a non-empty
+    ``modes`` list — a display is attached and EDID was read, so cage has
+    a mode to drive. Both are kernel DRM sysfs files under
+    ``/sys/class/drm/<connector>/`` (the viewer container shares the host
+    sysfs, so they're visible in-container).
+
+    Status is matched as "not disconnected" rather than "== connected"
+    on purpose: some HDMI bridges report ``unknown`` for a real display,
+    and bin/start_viewer.sh's own ``eglfs_has_display`` already treats
+    ``unknown`` as present. Keying off ``connected`` alone would miss
+    those and prevent the watchdog from ever self-healing. The mode-list
+    check is what actually gates bindability, so the looser status match
+    is safe.
+
+    A connector present with an *empty* mode list is handled separately,
+    by the watchdog, via ``_kernel_has_connected_display`` plus a bounded
+    restart: on a Wayland board that empty list is usually the wedge
+    itself (cage blocked the EDID re-read), and the restart re-reads it.
+    This function stays the strict "EDID modes are readable right now"
+    check — the watchdog treats that as bindable without spending recovery
+    budget. The ``Writeback`` connector (``unknown`` status, always empty
+    modes) fails both checks and is left alone.
+    """
+    for status_path in glob('/sys/class/drm/*/status'):
+        try:
+            with open(status_path) as status_file:
+                status = status_file.read().strip()
+        except OSError:
+            continue
+        if status in ('disconnected', ''):
+            continue
+        modes_path = path.join(path.dirname(status_path), 'modes')
+        try:
+            with open(modes_path) as modes_file:
+                if modes_file.read().strip():
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def _cage_output_probe() -> str:
+    """Probe whether cage currently owns any output.
+
+    Returns one of:
+      * ``'has-output'`` — cage lists at least one connector (bound,
+        enabled or not).
+      * ``'no-output'`` — wlr-randr ran cleanly and listed nothing, i.e.
+        cage genuinely has zero outputs.
+      * ``'unknown'`` — wlr-randr itself could not be run: missing binary,
+        nonzero exit, or the 5s timeout (e.g. under sustained QtWebEngine
+        GPU load). The caller MUST treat this as "can't tell", never as
+        "no output" — escalating a tooling failure to a container restart
+        would blank a healthy, displaying board.
+
+    Deliberately separate from ``_wlr_output_names``, which collapses both
+    the ``'no-output'`` and ``'unknown'`` cases to ``[]``. That's fine for
+    the rotation/power callers (they only ever degrade to a no-op) but
+    wrong for the watchdog, which restarts the container on the
+    difference.
+    """
+    try:
+        result = subprocess.run(
+            ['wlr-randr'],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError) as exc:
+        logger.debug('wlr-randr unavailable for output probe: %s', exc)
+        return 'unknown'
+    if result.returncode != 0:
+        logger.debug(
+            'wlr-randr output probe exit %d: %s',
+            result.returncode,
+            result.stderr,
+        )
+        return 'unknown'
+    for line in result.stdout.splitlines():
+        # A connector block's first line starts at column 0; indented
+        # lines are that connector's properties (see _wlr_output_names).
+        if line and not line[0].isspace():
+            return 'has-output'
+    return 'no-output'
+
+
+def _wayland_output_watchdog() -> None:
+    """Self-heal a headless-boot display wedge on Wayland (cage) boards.
+
+    Cage enumerates DRM connectors once at startup. Boot it with no
+    connected+enabled output (display off / unplugged / slow to sync)
+    and it binds zero wl_outputs — then never recovers when the display
+    later appears, because the viewer container has no udev to deliver
+    the hotplug uevent to wlroots. Validated on the Pi 5 testbed: after
+    a headless boot the kernel reports HDMI ``connected`` (with EDID
+    modes) but cage still has no output and the screen stays black until
+    the container is restarted.
+
+    eglfs/linuxfb boards get this recovery for free — Qt exits non-zero
+    when there's no framebuffer and Docker's ``restart: always`` policy
+    recreates the process, which re-enumerates the display. Cage does
+    NOT exit on zero output; it runs headless forever. So replicate the
+    eglfs behaviour explicitly: when a Wayland board has no wl_output
+    while a display is connected, and that state persists past
+    WAYLAND_OUTPUT_GRACE_S, exit non-zero so the container restarts and
+    cage re-enumerates the now-present display. The restart is also what
+    forces the kernel to re-read EDID, so a display that powered on after
+    a headless boot — ``connected`` but with an empty mode list, because
+    cage held the output disabled — recovers too (issue 3239).
+
+    Crash-loop safety is the load-bearing part. Restarts are capped per
+    boot at WAYLAND_MAX_RECOVERY_RESTARTS: a real display binds on the
+    first restart and clears the count, but a connector we can never bind
+    (dead cable, a display asserting hotplug but never delivering EDID)
+    would otherwise churn forever. After the cap we log once and stay
+    quiet for the rest of the boot, so a failed display can't keep the
+    SoC warm through an unattended 8h. The budget is boot-scoped (a real
+    reboot starts fresh) and cleared the moment a display binds or nothing
+    is connected. Three further guards avoid spurious restarts: the
+    ``Writeback`` connector never counts (it's ``unknown`` + modeless);
+    ``_cage_output_probe`` returning ``'unknown'`` (wlr-randr missing /
+    nonzero / 5s timeout under GPU load) is a no-op, never a restart; and
+    the grace window rides out cage's brief startup socket race.
+    """
+    global _headless_wedge_since, _recovery_gave_up_logged
+    if not _is_wayland_board():
+        return
+
+    # Cheap sysfs check first (before the wlr-randr subprocess): is there
+    # a display worth recovering at all? Either a bindable connector
+    # (EDID modes readable now) or a strictly-``connected`` one whose
+    # modes are still empty — the headless-boot wedge. Nothing connected
+    # is a headless unit: clear the timer AND the recovery budget so a
+    # display plugged in later gets a fresh set of attempts.
+    if not (_kernel_has_bindable_display() or _kernel_has_connected_display()):
+        _headless_wedge_since = None
+        _reset_recovery_restarts()
+        return
+
+    # A display is present — did cage actually bind it? Only a definitive
+    # "cage lists zero outputs" is a wedge. 'has-output' is healthy;
+    # 'unknown' means wlr-randr itself failed — treat as "can't tell" and
+    # no-op rather than restarting a display that is probably fine. Either
+    # non-wedge reading ends the episode: clear the timer and the budget.
+    if _cage_output_probe() != 'no-output':
+        _headless_wedge_since = None
+        _reset_recovery_restarts()
+        return
+
+    # Wedge: a display is present but cage bound no output. Start (or
+    # continue) the grace timer; act only once it's clear cage will not
+    # bind the output on its own.
+    now = monotonic()
+    if _headless_wedge_since is None:
+        _headless_wedge_since = now
+        logger.warning(
+            'Display present but cage has no wl_output; will restart to '
+            're-enumerate if this persists past %ss.',
+            WAYLAND_OUTPUT_GRACE_S,
+        )
+        return
+    if now - _headless_wedge_since < WAYLAND_OUTPUT_GRACE_S:
+        return
+
+    # Persisted past the grace. Restart to recover — but only up to the
+    # per-boot cap, so a connector we can never bind can't loop.
+    restarts = _recovery_restarts_this_boot()
+    if restarts >= WAYLAND_MAX_RECOVERY_RESTARTS:
+        if not _recovery_gave_up_logged:
+            logger.error(
+                'Display still not bound after %d recovery restarts this '
+                'boot; giving up until it binds, is unplugged, or the '
+                'device reboots — not restarting further, to avoid a loop.',
+                restarts,
+            )
+            _recovery_gave_up_logged = True
+        return
+    if not _record_recovery_restart():
+        # The restart count could not be persisted (unwritable counter),
+        # so the per-boot cap can't be enforced — refuse to restart rather
+        # than risk an unbounded loop.
+        return
+    # WARNING, not ERROR: this is the recovery *working*. The Sentry
+    # logging integration promotes ERROR records to events, so logging a
+    # successful self-heal at ERROR filed a Sentry issue on every
+    # recovery and made designed behaviour indistinguishable from a
+    # failure (GH #3265). The give-up-after-cap branch above stays at
+    # ERROR — that is the point where recovery has failed and a human is
+    # genuinely needed.
+    logger.warning(
+        'Cage has had no wl_output for %.0fs while a display is connected '
+        '(headless-boot wedge). Exiting so the container restarts and '
+        're-enumerates the display (recovery restart %d/%d).',
+        now - _headless_wedge_since,
+        restarts + 1,
+        WAYLAND_MAX_RECOVERY_RESTARTS,
+    )
+    sys.exit(1)
+
+
 def _consume_pending_rotation_bounce() -> None:
     """Main-thread half of the linuxfb rotation handoff.
 
@@ -1239,16 +2208,16 @@ def _consume_pending_rotation_bounce() -> None:
     the value-comparison short-circuit so the fresh webview actually
     gets a loadPage/loadImage on its first asset.
     """
-    global _rotation_bounce_pending, browser, current_browser_url
+    global _rotation_bounce_pending, current_browser_url
     if not _rotation_bounce_pending:
         return
     _rotation_bounce_pending = False
-    logging.info('Consuming pending rotation bounce on main thread')
+    logger.info('Consuming pending rotation bounce on main thread')
     if browser is not None:
         try:
             browser.terminate()
         except Exception as exc:
-            logging.warning(
+            logger.warning(
                 'Could not terminate AnthiasViewer for rotation change: %s',
                 exc,
             )
@@ -1276,13 +2245,13 @@ def _skip_if_current_asset_inactive() -> None:
     try:
         asset = Asset.objects.filter(asset_id=current_id).first()
     except Exception:
-        logging.exception(
+        logger.exception(
             'reload: failed to check current asset %s; skipping skip-decision',
             current_id,
         )
         return
     if asset is None or not asset.is_active():
-        logging.info(
+        logger.info(
             'Current asset %s is no longer active; signalling skip',
             current_id,
         )
@@ -1333,7 +2302,7 @@ def _trigger_asset_recheck(asset_id: str | None) -> None:
         return
     token = internal_auth_token(settings)
     if not token:
-        logging.debug(
+        logger.debug(
             'Skipping recheck for %s: internal token unavailable', asset_id
         )
         return
@@ -1354,7 +2323,7 @@ def _trigger_asset_recheck(asset_id: str | None) -> None:
             headers={INTERNAL_AUTH_HEADER: token},
         )
     except requests.RequestException as e:
-        logging.debug('Failed to trigger recheck for %s: %s', asset_id, e)
+        logger.debug('Failed to trigger recheck for %s: %s', asset_id, e)
         return
 
     if response.status_code != 202:
@@ -1364,7 +2333,7 @@ def _trigger_asset_recheck(asset_id: str | None) -> None:
         # means the recheck didn't actually enqueue. Log at debug so the
         # operator can see the chain is silently broken without spamming
         # the loop on every rotation past the unreachable asset.
-        logging.debug(
+        logger.debug(
             'Recheck request for %s returned unexpected status %s',
             asset_id,
             response.status_code,
@@ -1372,6 +2341,7 @@ def _trigger_asset_recheck(asset_id: str | None) -> None:
 
 
 def asset_loop(scheduler: Any) -> None:
+    global _empty_playlist_logged, _unavailable_asset_logged
     # Issue #2856 — consume any pending rotation bounce queued by the
     # subscriber thread BEFORE we do anything else this tick. The
     # subscriber can only set the flag (it doesn't own ``browser`` or
@@ -1387,32 +2357,70 @@ def asset_loop(scheduler: Any) -> None:
     # Cheap early-return when nothing's pending.
     _retry_wayland_rotation_if_pending()
 
+    # Self-heal a headless-boot display wedge (Wayland/cage): if cage
+    # came up with no output but a display is now connected, restart so
+    # it re-enumerates the display. Cheap no-op on healthy/non-Wayland
+    # boards. See _wayland_output_watchdog().
+    _wayland_output_watchdog()
+
     asset = scheduler.get_next_asset()
 
     if asset is None:
-        logging.info(
-            'Playlist is empty. Sleeping for %s seconds', EMPTY_PL_DELAY
-        )
+        # Log the *transition* into an empty playlist, not every tick.
+        # In production the docker journald driver feeds a volatile
+        # journal capped at ~10% of /run — about 15 MB on an 800 MB
+        # board — and this line plus its sibling below emitted ~1250
+        # lines/hour on a wholly idle device, evicting crash
+        # diagnostics inside ~8 hours (GH #3268). The steady state
+        # carries no information; the edges do.
+        if not _empty_playlist_logged:
+            logger.info(
+                'Playlist is empty. Sleeping for %s seconds between '
+                'checks; will log again when an asset appears.',
+                EMPTY_PL_DELAY,
+            )
+            _empty_playlist_logged = True
         view_image(STANDBY_SCREEN)
         skip_event = get_skip_event()
         skip_event.clear()
         if skip_event.wait(timeout=EMPTY_PL_DELAY):
             # Skip was triggered, continue immediately to next iteration
-            logging.info(
-                'Skip detected during empty playlist wait, continuing'
-            )
+            logger.info('Skip detected during empty playlist wait, continuing')
         else:
             # Duration elapsed normally, continue to next iteration
             pass
 
     elif _asset_is_displayable(asset):
+        if _empty_playlist_logged:
+            logger.info('Playlist is no longer empty; resuming rotation.')
+            _empty_playlist_logged = False
+        # A playable asset means whatever was unavailable is no longer the
+        # thing blocking rotation, so let the next failure speak up again.
+        _unavailable_asset_logged = None
         name, mime, uri = asset['name'], asset['mimetype'], asset['uri']
-        logging.info('Showing asset %s (%s)', name, mime)
-        logging.debug('Asset URI %s', uri)
+        # Both waits below feed this into ``threading.Event.wait``,
+        # where an out-of-range timeout raises OverflowError and
+        # crash-loops the whole viewer (Sentry ANTHIAS-3E). The API
+        # rejects such values on write, but a pre-existing row must
+        # not take the screen down.
+        duration = clamp_duration(asset['duration'])
+        logger.info('Showing asset %s (%s)', name, mime)
+        logger.debug('Asset URI %s', uri)
         watchdog()
 
+        # Effective SSL policy for this asset: the C++ webview should
+        # skip certificate verification when the operator disabled it
+        # device-wide (settings['verify_ssl'] off) OR opted this asset
+        # out (Asset.skip_ssl_verify). Only images and web pages route
+        # through the webview's cert-verifying stacks
+        # (QNetworkAccessManager / QWebEngine); video plays via FFmpeg,
+        # which doesn't verify self-signed certs, so it needs no flag.
+        skip_ssl = (not settings['verify_ssl']) or bool(
+            asset.get('skip_ssl_verify')
+        )
+
         if 'image' in mime:
-            view_image(uri)
+            view_image(uri, skip_ssl_verify=skip_ssl)
         elif 'web' in mime:
             # Per-asset auto-refresh — feature #2813. ``metadata`` is a
             # JSONField (defaults to {}); the column was historically
@@ -1427,41 +2435,69 @@ def asset_loop(scheduler: Any) -> None:
             interval = clamp_refresh_interval(
                 metadata.get('refresh_interval_s')
             )
-            view_webpage(uri, reload_interval_s=interval)
+            # Per-asset custom request headers (#2215). Sanitised on read
+            # for the same reason as the interval: a hand-crafted DB row
+            # could hold junk, and the C++ interceptor trusts what it's
+            # handed, so this is the last gate before the wire.
+            headers = normalize_asset_headers(metadata.get('headers'))
+            view_webpage(
+                uri,
+                reload_interval_s=interval,
+                nocache=bool(asset.get('nocache')),
+                headers=headers,
+                skip_ssl_verify=skip_ssl,
+            )
         elif 'video' in mime or 'streaming' in mime:
             # ``'video' or 'streaming' in mime`` parses as ``'video'
             # or ('streaming' in mime)`` — the truthy literal short-
             # circuits and the branch runs for every mimetype, making
             # the ``else: Unknown MimeType`` arm below unreachable.
-            view_video(uri, asset['duration'])
+            view_video(uri, duration)
         else:
-            logging.error('Unknown MimeType %s', mime)
+            logger.error('Unknown MimeType %s', mime)
 
         if 'image' in mime or 'web' in mime:
-            duration = int(asset['duration'])
-            logging.info('Sleeping for %s', duration)
+            logger.info('Sleeping for %s', duration)
             skip_event = get_skip_event()
             skip_event.clear()
             if skip_event.wait(timeout=duration):
                 # Skip was triggered, continue immediately to next iteration
-                logging.info('Skip detected, moving to next asset immediately')
+                logger.info('Skip detected, moving to next asset immediately')
             else:
                 # Duration elapsed normally, continue to next asset
                 pass
 
     else:
-        logging.info(
-            'Asset %s at %s is not available, skipping.',
-            asset['name'],
-            asset['uri'],
-        )
+        # Same journal-budget problem as the empty-playlist arm above, but
+        # worse: this one loops on a 0.5s wait, so a single unreachable
+        # asset emitted ~7180 lines/hour (measured on the arm64 testbed) —
+        # roughly 5x the idle-playlist rate this change set out to fix, and
+        # enough on its own to evict crash diagnostics from the ~15 MB
+        # volatile journal. Log once per distinct asset, then stay quiet
+        # until the offender changes (GH #3268).
+        # The playlist is NOT empty here — there is an asset, it just
+        # isn't displayable — so clear the empty-playlist latch. Without
+        # this, "empty -> unavailable asset appears -> empty again" left
+        # the latch stuck and the notice was never logged again: exactly
+        # the permanently-silent failure the latch is supposed to avoid.
+        # Caught on the armhf testbed.
+        _empty_playlist_logged = False
+        asset_key = f'{asset.get("asset_id")}:{asset["uri"]}'
+        if _unavailable_asset_logged != asset_key:
+            logger.info(
+                'Asset %s at %s is not available, skipping. Will stay quiet '
+                'about this one until a different asset is unavailable.',
+                asset['name'],
+                asset['uri'],
+            )
+            _unavailable_asset_logged = asset_key
         if not _asset_is_local_file(asset):
             _trigger_asset_recheck(asset.get('asset_id'))
         skip_event = get_skip_event()
         skip_event.clear()
         if skip_event.wait(timeout=0.5):
             # Skip was triggered, continue immediately to next iteration
-            logging.info(
+            logger.info(
                 'Skip detected during asset unavailability wait, continuing'
             )
         else:
@@ -1473,7 +2509,7 @@ def setup() -> None:
     global HOME, browser_bus
     HOME = getenv('HOME')
     if not HOME:
-        logging.error('No HOME variable')
+        logger.error('No HOME variable')
 
         # Alternatively, we can raise an Exception using a custom message,
         # or we can create a new class that extends Exception.
@@ -1499,7 +2535,7 @@ def setup() -> None:
         # we're still at startup, so spend the generous budget.
         if not _is_webview_gone_error(exc):
             raise
-        logging.warning(
+        logger.warning(
             'AnthiasViewer died between handshake and bus.get; '
             'respawning and retrying once: %s',
             exc,
@@ -1522,9 +2558,8 @@ def setup() -> None:
 
 
 def start_loop() -> None:
-    global loop_is_stopped
 
-    logging.debug('Entering infinite loop.')
+    logger.debug('Entering infinite loop.')
     while True:
         if loop_is_stopped:
             # Paint black once from the main thread (the owner of the
@@ -1542,6 +2577,13 @@ def start_loop() -> None:
 DISPLAY_RESOLUTION_KEY = 'viewer:display_resolution'
 DISPLAY_RESOLUTION_INTERVAL_S = 60
 DISPLAY_RESOLUTION_TTL_S = 180
+
+# SMART sampling cadence. Hourly because none of it moves faster than
+# that -- wear is a months-long trend and power-on hours tick once an
+# hour by definition -- and because each sample is an ATA/NVMe command
+# to a device that may already be struggling. Comfortably inside
+# smart.TTL_S so an ordinary slow sample never expires the fact.
+SMART_INTERVAL_S = 3600
 
 
 def _publish_display_resolution_once() -> None:
@@ -1565,13 +2607,13 @@ def _publish_display_resolution_once() -> None:
         # semantics already make the System Info card fall back
         # gracefully. Warning, not exception: an ERROR-level log with
         # a traceback would land in Sentry (ANTHIAS-M / ANTHIAS-H).
-        logging.warning(
+        logger.warning(
             'publish_display_resolution skipped, redis unreachable '
             '(will retry): %s',
             exc,
         )
     except Exception:
-        logging.exception('publish_display_resolution failed')
+        logger.exception('publish_display_resolution failed')
 
 
 def _publish_display_resolution_loop() -> None:
@@ -1596,6 +2638,76 @@ def _publish_display_resolution_loop() -> None:
     t.start()
 
 
+def _publish_smart_loop() -> None:
+    """Background reporter -- sample SMART and publish it for the server.
+
+    anthias-server renders the storage card but cannot read SMART: the
+    ioctl needs privilege it deliberately does not have, and on Balena
+    it cannot be handed the device node at all. This container is
+    ``privileged: true`` everywhere, so it does the reading. Same
+    division of labour as CEC (see anthias_server/lib/cec_client.py),
+    but published as a plain Redis fact rather than answered over the
+    request-reply bus, because SMART moves over hours and the server
+    reads it during a page render.
+
+    The disk is whichever one backs the data directory, resolved the
+    same way the server resolves it, so the two cannot disagree about
+    which device they are describing.
+    """
+    import threading
+
+    def tick() -> None:
+        while True:
+            try:
+                # settings.get_configdir() rather than letting probe()
+                # fall back to $HOME. HOME is /data in every compose
+                # template and survives start_viewer.sh's `sudo -E -u
+                # viewer` (verified on the x86 testbed), so the two
+                # agree today -- but resolving the disk the server
+                # reports on must not hinge on an env var surviving a
+                # shell script. anthias-celery passes the same thing
+                # to the storage watcher for the same reason.
+                facts = storage_health.probe(settings.get_configdir())
+                disk = facts.get('disk')
+                # Only ever a real answer on SATA/NVMe. SD and eMMC
+                # have their own registers and smartctl has nothing to
+                # say about them, so most of the fleet skips this.
+                if disk and facts['media']['kind'] == 'disk':
+                    smart.publish(r, smart.collect(f'/dev/{disk}'))
+            except Exception:
+                # A diagnostic must never take the viewer down; the
+                # display pipeline matters more.
+                logger.warning('Could not sample SMART', exc_info=True)
+            sleep(SMART_INTERVAL_S)
+
+    t = threading.Thread(target=tick, name='smart-reporter', daemon=True)
+    t.start()
+
+
+def _publish_cec_availability() -> None:
+    """Tell anthias-server whether this device has a CEC adapter.
+
+    The server gates its settings UI and its display-power endpoint on
+    this, and cannot answer it itself — it has no CEC device nodes. It is
+    published as a Redis fact rather than answered over the request-reply
+    bus because it gates a page render and must stay cheap; enumerating
+    costs 0.0-0.1 ms per adapter, so doing it once at startup is ample.
+    """
+    try:
+        adapters = cec.CecAdapter.enumerate()
+        cec_client.publish_availability(bool(adapters))
+        logger.info(
+            'CEC: %d adapter(s) present: %s',
+            len(adapters),
+            ', '.join(f'{a.node} ({a.physical_address_str})' for a in adapters)
+            or 'none',
+        )
+    except Exception:
+        # Never let a CEC probe stop the viewer starting — it is a
+        # peripheral feature and the display pipeline matters more.
+        logger.warning('Could not publish CEC availability', exc_info=True)
+
+
 def main() -> None:
     global scheduler
 
@@ -1605,7 +2717,11 @@ def main() -> None:
     subscriber.daemon = True
     subscriber.start()
 
+    _publish_cec_availability()
+
     _publish_display_resolution_loop()
+
+    _publish_smart_loop()
 
     # This will prevent white screen from happening before showing the
     # splash screen with IP addresses.

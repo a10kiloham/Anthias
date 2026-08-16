@@ -7,13 +7,20 @@ from os import getenv, path
 from typing import Any
 
 import django
+import requests
 import sh
 from celery import Celery, Task
 from celery.exceptions import SoftTimeLimitExceeded
-from celery.signals import worker_init
+from celery.signals import worker_init, worker_ready
 from django.apps import apps as _django_apps
 from PIL import UnidentifiedImageError
-from tenacity import Retrying, stop_after_attempt, wait_fixed
+from tenacity import (
+    RetryError,
+    Retrying,
+    retry_if_exception_type,
+    stop_after_delay,
+    wait_exponential,
+)
 
 # ``django.setup()`` is not reentrant — calling it while
 # ``apps.populate()`` is still running (e.g. when an ``AppConfig.ready``
@@ -32,10 +39,7 @@ if not _django_apps.apps_ready:
 
 # Place imports that uses Django in this block.
 
-from anthias_server.app.models import Asset  # noqa: E402
-from anthias_server.lib import diagnostics  # noqa: E402
-from anthias_server.lib.telemetry import send_telemetry  # noqa: E402
-from anthias_common.utils import (  # noqa: E402
+from anthias_common.utils import (
     connect_to_redis,
     get_video_duration,
     is_balena_app,
@@ -43,9 +47,18 @@ from anthias_common.utils import (  # noqa: E402
     shutdown_via_balena_supervisor,
     url_fails,
 )
-from anthias_common.youtube import youtube_destination_path  # noqa: E402
-from anthias_server.settings import settings  # noqa: E402
+from anthias_common.youtube import youtube_destination_path
+from anthias_server.app.models import Asset
+from anthias_server.lib import (
+    diagnostics,
+    display_power,
+    storage_watcher,
+    undervoltage_watcher,
+)
+from anthias_server.lib.telemetry import send_telemetry
+from anthias_server.settings import settings
 
+logger = logging.getLogger(__name__)
 
 __author__ = 'Screenly, Inc'
 __copyright__ = 'Copyright 2012-2026, Screenly, Inc'
@@ -158,6 +171,50 @@ ASSET_REVALIDATION_SOFT_TIME_LIMIT_S = ASSET_REVALIDATION_TIME_LIMIT_S - 60
 PERIODIC_POKE_SOFT_TIME_LIMIT_S = 30
 PERIODIC_POKE_TIME_LIMIT_S = 60
 
+# How often the scheduled display-power tick runs. One minute is the
+# resolution of the schedule itself (times are HH:MM), so a coarser
+# interval would make the display switch late by up to that interval.
+DISPLAY_POWER_SCHEDULE_INTERVAL_S = 60
+
+# Redis key holding the last power state the scheduler actually applied
+# ('on'/'off'). The tick acts only when the desired state differs from
+# this, so a command goes out at the schedule boundary rather than every
+# single minute.
+DISPLAY_POWER_STATE_KEY = 'display_power_schedule_state'
+
+# ...but the key expires, so the state is re-asserted periodically.
+#
+# The viewer's blanked flag is an in-process global that is lost on
+# every viewer restart (OOM, upgrade, host reboot), and redis is
+# persisted across those restarts. Without an expiry, a viewer that
+# restarted at 22:00 would come back lit and playing while this key
+# still said 'off', and the tick would return early every minute until
+# morning — the screen stays on all night.
+#
+# Re-asserting is cheap and idempotent: a standby to an already-off TV
+# and a blank to an already-blank viewer are both no-ops. The cost is
+# that an operator who manually turns the screen on mid-off-period sees
+# it go back off within this window, which is the correct behaviour for
+# a schedule anyway.
+DISPLAY_POWER_STATE_TTL_S = 60 * 10
+
+# Time budget for the stuck-row reconciler sweep. It was the last
+# periodic task still carrying a bare ``time_limit=300`` with no soft
+# companion: its inner loop makes unbounded per-row calls (a SQLite
+# SELECT/UPDATE, a kombu ``.delay()`` publish to the Redis broker, and
+# ``r.set``/``r.eval``), so on a memory-pressured board a wedged Redis
+# publish or SQLite lock can push the sweep past 300s. Tripping the
+# *hard* limit SIGKILLs the pool child, which Sentry groups by the kill
+# signature — the same ANTHIAS-A / ANTHIAS-9 / ANTHIAS-B trio the sibling
+# pokes (#3017/#3063) already closed, leaving this task as the last
+# contributor. The soft limit raises ``SoftTimeLimitExceeded`` *inside*
+# the sweep so it aborts cleanly (releasing its Redis lock via the
+# existing ``finally``) and the next tick retries; the hard limit stays
+# as the backstop for a call stuck in C code where the soft signal can't
+# be delivered.
+RECONCILE_STUCK_TIME_LIMIT_S = 300
+RECONCILE_STUCK_SOFT_TIME_LIMIT_S = RECONCILE_STUCK_TIME_LIMIT_S - 30
+
 # Redis key for the sweep singleton lock. Whoever sets it first runs
 # the sweep; later beat ticks observe the key and exit. The TTL matches
 # the time_limit so a worker that crashes mid-sweep doesn't lock the
@@ -226,15 +283,15 @@ def _migrations_ready() -> bool:
     fails fast instead of waiting forever.
     """
     from django.db import connections
-    from django.db.utils import DatabaseError
     from django.db.migrations.executor import MigrationExecutor
+    from django.db.utils import DatabaseError
 
     connection = connections['default']
     try:
         executor = MigrationExecutor(connection)
         plan = executor.migration_plan(executor.loader.graph.leaf_nodes())
     except DatabaseError:
-        logging.debug(
+        logger.debug(
             'Migration-readiness probe failed; treating as not ready',
             exc_info=True,
         )
@@ -270,7 +327,7 @@ def wait_for_migrations(**kwargs: Any) -> None:
         # warning per poll. Tracked as an explicit next-log threshold
         # so the cadence holds whatever the two constants are set to.
         if waited >= next_log_at:
-            logging.warning(
+            logger.warning(
                 'Database is not migrated yet; delaying celery worker '
                 'startup (%ss elapsed; probe errors are logged at '
                 'DEBUG)',
@@ -301,6 +358,55 @@ def setup_periodic_tasks(sender: Any, **kwargs: Any) -> None:
         reconcile_stuck_processing.s(),
         name='reconcile_stuck_processing',
     )
+    # Every minute, so a schedule boundary lands within 60s of the
+    # configured time. The task itself is nearly free when the schedule
+    # is disabled or the desired state has not changed.
+    sender.add_periodic_task(
+        DISPLAY_POWER_SCHEDULE_INTERVAL_S,
+        apply_display_power_schedule.s(),
+        name='display_power_schedule',
+    )
+
+
+@worker_ready.connect
+def start_undervoltage_watcher(**kwargs: Any) -> None:
+    """Begin watching the hwmon under-voltage alarm.
+
+    ``worker_ready`` rather than ``worker_init``: the latter is
+    already occupied by ``wait_for_migrations``, which blocks
+    indefinitely, and handler ordering there is not guaranteed. The
+    watcher touches only sysfs and Redis, never the database, so
+    starting it after the migration wait costs nothing.
+
+    A no-op on hardware without the sensor, and it never raises: a
+    diagnostic that can take down the celery worker is worse than
+    the problem it reports.
+    """
+    try:
+        undervoltage_watcher.start(r)
+    except Exception:
+        logger.exception('Could not start the under-voltage watcher.')
+
+
+@worker_ready.connect
+def start_storage_watcher(**kwargs: Any) -> None:
+    """Begin watching the storage the device runs from.
+
+    Same placement and same reasoning as the under-voltage watcher
+    above: ``worker_ready`` because ``worker_init`` is occupied by
+    ``wait_for_migrations``, and swallowing the exception because a
+    diagnostic that can take down the celery worker is worse than
+    the problem it reports.
+
+    Pointed at the config directory rather than left to its own
+    default so the watcher measures the filesystem Anthias actually
+    depends on -- the one holding the SQLite database -- whatever
+    ``HOME`` happens to be in this container.
+    """
+    try:
+        storage_watcher.start(r, settings.get_configdir())
+    except Exception:
+        logger.exception('Could not start the storage-health watcher.')
 
 
 @celery.task(
@@ -308,43 +414,149 @@ def setup_periodic_tasks(sender: Any, **kwargs: Any) -> None:
     time_limit=PERIODIC_POKE_TIME_LIMIT_S,
 )
 def get_display_power() -> None:
-    # diagnostics.get_display_power() returns ``str | bool`` (bool for
-    # a clean CEC True/False, str for the error fallbacks). redis-py
-    # refuses a bool — ``DataError: Invalid input of type: 'bool'`` —
-    # so every successful power query crashed this task and left the
-    # key unset (Sentry ANTHIAS-2C). Coerce to str: the v2 System Info
-    # API exposes ``display_power`` as ``string | null`` and just
-    # passes the value through, so 'True'/'False'/'CEC error' all fit
-    # — and the on/off state now actually populates instead of only
-    # the error cases ever landing.
+    # diagnostics.get_display_power() returns ``str | bool`` — bool for a
+    # clean on/off reading, str for every diagnostic case. redis-py
+    # refuses a bool outright (``DataError: Invalid input of type:
+    # 'bool'``), so every *successful* power query used to crash this task
+    # and leave the key unset (Sentry ANTHIAS-2C); the ``str()`` below is
+    # what fixes that and is load-bearing, not decorative. The v2 System
+    # Info API exposes ``display_power`` as ``string | null`` and passes
+    # the value through, so 'True'/'False' and the diagnostic strings all
+    # fit. (Copilot review of #3264 caught this comment claiming the
+    # function had been changed to return str always — it was not.)
     #
-    # Boards without a CEC adapter (x86, and any host that doesn't pass
-    # /dev/cec0 or /dev/vchiq into the container — e.g. Pi 5) can only
-    # ever fail the libcec probe, which used to surface on the System
-    # Info card and the v2 /info API as 'CEC error' — reading like a
-    # fault when CEC simply isn't a thing on the hardware. Short-circuit
-    # on the same cec_available() gate the settings UI and the display-
-    # power SET endpoint already use: record a clear 'Not available'
-    # rather than spawning a doomed subprocess every tick.
-    if not diagnostics.cec_available():
-        r.set('display_power', 'Not available', ex=3600)
-        return
+    # Boards with no CEC adapter at all (x86 without a dongle) record a
+    # clear 'Not available' rather than asking. cec_available() is a
+    # single redis GET of the fact the viewer publishes at startup — it
+    # no longer counts /dev/vchiq and no longer probes device nodes from
+    # this container, so the boards that used to burn a full 10s libcec
+    # timeout on every tick (#3267) take this branch for free instead.
+    #
+    # The short-circuit is now a correctness nicety rather than a
+    # necessity: the query below is a redis round trip to the viewer,
+    # not a subprocess, so skipping it saves one hop rather than ten
+    # seconds. It stays because 'Not available' is a more honest reading
+    # than whatever a device with no hardware would report.
     try:
+        if not diagnostics.cec_available():
+            # This SET used to sit outside the handler below, which made
+            # it the one unprotected blocking call in the task — on
+            # exactly the boards that take this branch (x86, Pi 5).
+            #
+            # It is not unbounded: redis-py 8.0.1 defaults
+            # socket_timeout=5. But the default Retry(retries=10) means a
+            # blackhole redis costs 11 x 5s plus backoff — measured at
+            # 58.83s on the x86 testbed. That blows the 30s soft limit
+            # and clears the 60s hard limit by only ~1.2s, and because
+            # the call was outside the try the soft limit escaped
+            # uncaught, failing the task and filing a Sentry event: the
+            # very noise this change set is removing.
+            r.set('display_power', 'Not available', ex=3600)
+            return
         # Single SET with ex= so the value and its TTL are written
         # atomically — a soft-limit signal landing between a separate
         # SET and EXPIRE would otherwise leave the key without a TTL
         # (a stale display_power that never expires).
         r.set('display_power', str(diagnostics.get_display_power()), ex=3600)
     except SoftTimeLimitExceeded:
-        # The CEC query is meant to be bounded by its own
-        # subprocess timeout, but a child wedged in libcec can keep
-        # the pipe open past it. Skip this tick rather than let the
-        # hard limit SIGKILL the worker (ANTHIAS-A / 9 / B); the next
-        # beat tick re-queries.
-        logging.warning(
+        # The CEC query bounds itself (each operation runs under
+        # lib.cec's own wall-clock guard, and the kernel bounds every
+        # transmit), so reaching this handler now points at redis rather
+        # than at CEC. Skip the tick either way rather than let the hard
+        # limit SIGKILL the worker (ANTHIAS-A / 9 / B); the next beat
+        # tick re-queries.
+        logger.warning(
             'get_display_power: CEC query exceeded %ss; skipping this tick',
             PERIODIC_POKE_SOFT_TIME_LIMIT_S,
         )
+
+
+@celery.task(
+    soft_time_limit=PERIODIC_POKE_SOFT_TIME_LIMIT_S,
+    time_limit=PERIODIC_POKE_TIME_LIMIT_S,
+)
+def apply_display_power_schedule() -> None:
+    """Turn the display on/off per the operator's daily schedule.
+
+    Edge-triggered: the desired state is compared against the last state
+    the scheduler applied (in Redis) and a command only goes out when
+    they differ. Re-asserting every minute would spam the CEC bus and,
+    worse, fight an operator who deliberately switched the screen on
+    outside its hours.
+    """
+    # Imported inside the task, matching the other Django-touching
+    # tasks in this module — see the app-registry note at the top.
+    from django.utils import timezone
+
+    try:
+        settings.load()
+        if not settings['display_power_schedule_enabled']:
+            # Turning the schedule off must not strand a screen the
+            # schedule had already switched off. Nothing else would ever
+            # bring it back: the manual controls are CEC-only and hidden
+            # entirely on a device with no CEC adapter, so a plain
+            # monitor would stay black with no way out of the UI.
+            if _decoded(r.get(DISPLAY_POWER_STATE_KEY)) == 'off':
+                display_power.apply_power(True)
+                logger.info(
+                    'Display power schedule disabled while off; '
+                    'restoring the display'
+                )
+            r.delete(DISPLAY_POWER_STATE_KEY)
+            return
+
+        desired = display_power.should_be_on(
+            timezone.localtime(),
+            display_power.parse_hhmm(settings['display_power_on_time']),
+            display_power.parse_hhmm(settings['display_power_off_time']),
+            display_power.parse_days(settings['display_power_days']),
+        )
+        if desired is None:
+            # Unusable schedule (missing or identical times). Leave the
+            # display alone rather than guessing at the operator's
+            # intent.
+            return
+
+        wanted = 'on' if desired else 'off'
+        if _decoded(r.get(DISPLAY_POWER_STATE_KEY)) == wanted:
+            return
+
+        how = display_power.apply_power(desired)
+        # Recorded only after the command was actually issued, so a
+        # failure mid-way (including a contended CEC bus, which raises)
+        # retries on the next tick instead of being latched as done.
+        r.set(DISPLAY_POWER_STATE_KEY, wanted, ex=DISPLAY_POWER_STATE_TTL_S)
+        logger.info('Display power schedule: turned %s via %s', wanted, how)
+    except SoftTimeLimitExceeded:
+        logger.warning(
+            'apply_display_power_schedule exceeded %ss; skipping this tick',
+            PERIODIC_POKE_SOFT_TIME_LIMIT_S,
+        )
+    except Exception:
+        # Deliberately warning, not exception: this runs every 60s, and
+        # because a failure does not latch the state the next tick
+        # retries immediately. Letting it raise would file an ERROR (and
+        # so a Sentry event) every single minute for as long as the
+        # underlying fault lasts — the same runaway-noise pattern
+        # #3017/#3063 removed from the sibling periodic tasks. The
+        # warning still reaches journald for diagnosis.
+        logger.warning(
+            'apply_display_power_schedule failed; will retry next tick',
+            exc_info=True,
+        )
+
+
+def _decoded(value: Any) -> str | None:
+    """Normalise a redis-py reply to ``str``.
+
+    ``decode_responses`` is not guaranteed to be set on the shared
+    connection, so the reply may arrive as ``bytes``.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value.decode('utf-8', errors='replace')
+    return str(value)
 
 
 @celery.task(
@@ -360,7 +572,7 @@ def send_telemetry_task() -> None:
         # Skip this tick instead of being SIGKILLed by the hard limit
         # (ANTHIAS-A / 9 / B); send_telemetry didn't set its cooldown,
         # so the next beat tick retries.
-        logging.warning(
+        logger.warning(
             'send_telemetry_task: telemetry POST exceeded %ss; '
             'skipping this tick',
             PERIODIC_POKE_SOFT_TIME_LIMIT_S,
@@ -430,7 +642,7 @@ def cleanup() -> None:
                 continue
             os.remove(entry.path)
         except OSError as e:
-            logging.warning('cleanup: could not remove %s: %s', entry.path, e)
+            logger.warning('cleanup: could not remove %s: %s', entry.path, e)
 
 
 class _ProbeVideoTask(Task):  # type: ignore[type-arg]
@@ -466,7 +678,7 @@ class _ProbeVideoTask(Task):  # type: ignore[type-arg]
 
             notify_asset_update(asset_id)
         except Exception:
-            logging.exception(
+            logger.exception(
                 'probe_video_duration on_failure cleanup failed for %s',
                 asset_id,
             )
@@ -523,7 +735,7 @@ def probe_video_duration(asset_id: str) -> None:
     except (sh.TimeoutException, sh.ErrorReturnCode, OSError):
         raise
     except Exception:
-        logging.exception(
+        logger.exception(
             'probe_video_duration: unexpected failure for %s', asset_id
         )
         td = None
@@ -591,7 +803,7 @@ class _DownloadAssetTask(Task):  # type: ignore[type-arg]
             _set_processing_error(asset_id, f'{type(exc).__name__}: {exc}')
             _notify(asset_id)
         except Exception:
-            logging.exception(
+            logger.exception(
                 '%s on_failure cleanup failed for %s',
                 self._failure_log_prefix,
                 asset_id,
@@ -730,13 +942,11 @@ def download_youtube_asset(asset_id: str, uri: str) -> None:
         'noplaylist': True,
     }
 
-    try:
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(uri, download=True)
-    except DownloadError:
-        # Permanent failure surface — let it bubble to on_failure.
-        # autoretry_for excludes DownloadError specifically.
-        raise
+    # DownloadError is a permanent failure that bubbles to on_failure;
+    # autoretry_for excludes it specifically, so there is no
+    # wrap-and-reraise here.
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(uri, download=True)
 
     if info is None:
         # Should not happen with a successful extract_info, but
@@ -897,7 +1107,7 @@ _REMOTE_VIDEO_MANIFEST_CONTENT_TYPES = frozenset(
 # Module-level session — same UA convention as the HEAD probe in
 # ``anthias_common.remote_video``. Tests patch ``_session.get``.
 # Lazy import so the symbol resolves after Django's apps_ready.
-from anthias_common.http import AnthiasSession  # noqa: E402
+from anthias_common.http import AnthiasSession
 
 _session = AnthiasSession()
 
@@ -1131,34 +1341,89 @@ def download_remote_video_asset(asset_id: str, uri: str) -> None:
     dispatch_normalize_video(asset_id)
 
 
-@celery.task
+# Retry budget for the balena supervisor power commands. The
+# supervisor is routinely down for a stretch exactly when these fire —
+# a reboot often follows an OTA apply, which restarts the supervisor
+# itself — so the old 5 x 1s window was far too tight and the task
+# died in an unhandled RetryError with the command silently dropped
+# (Sentry ANTHIAS-3F). Each HTTP attempt is individually bounded so a
+# hung supervisor socket can't pin the worker, and the task-level
+# limits below stay comfortably above window + one full attempt as
+# the SIGKILL backstop.
+SUPERVISOR_CMD_RETRY_WINDOW_S = 120
+SUPERVISOR_CMD_REQUEST_TIMEOUT_S = 10
+SUPERVISOR_CMD_WAIT_MAX_S = 15
+SUPERVISOR_CMD_SOFT_TIME_LIMIT_S = (
+    SUPERVISOR_CMD_RETRY_WINDOW_S + 2 * SUPERVISOR_CMD_REQUEST_TIMEOUT_S
+)
+SUPERVISOR_CMD_TIME_LIMIT_S = SUPERVISOR_CMD_SOFT_TIME_LIMIT_S + 30
+
+
+def _run_supervisor_command(command: Any, action: str) -> None:
+    """Post a power command to the balena supervisor, retrying with
+    backoff while it's down/restarting. Terminal failure is logged at
+    warning — a down supervisor is an expected transient (the operator
+    can retry from the UI), not a crash worth a Sentry event.
+    """
+    try:
+        for attempt in Retrying(
+            stop=stop_after_delay(SUPERVISOR_CMD_RETRY_WINDOW_S),
+            wait=wait_exponential(multiplier=1, max=SUPERVISOR_CMD_WAIT_MAX_S),
+            # Only transport/HTTP failures are retryable. Anything
+            # else (a TypeError, celery's SoftTimeLimitExceeded)
+            # must propagate immediately instead of being masked as
+            # "supervisor didn't accept the command" — retrying it
+            # would also pin the worker until the hard limit.
+            retry=retry_if_exception_type(
+                requests.exceptions.RequestException
+            ),
+        ):
+            with attempt:
+                response = command(timeout=SUPERVISOR_CMD_REQUEST_TIMEOUT_S)
+                # A 5xx from a half-started supervisor must retry too,
+                # not read as "command accepted".
+                response.raise_for_status()
+    except RetryError as exc:
+        # Surface the terminal failure's cause (connection refused vs
+        # an HTTP 503, say) — it's the difference between "supervisor
+        # restarting" and "supervisor misconfigured" when diagnosing.
+        last_error = exc.last_attempt.exception()
+        logger.warning(
+            'Balena supervisor did not accept the %s command within '
+            '%s seconds (last error: %r); giving up. The supervisor '
+            'may be restarting (e.g. mid-OTA) — retry from the UI if '
+            'the device does not %s on its own.',
+            action,
+            SUPERVISOR_CMD_RETRY_WINDOW_S,
+            last_error,
+            action,
+        )
+
+
+@celery.task(
+    soft_time_limit=SUPERVISOR_CMD_SOFT_TIME_LIMIT_S,
+    time_limit=SUPERVISOR_CMD_TIME_LIMIT_S,
+)
 def reboot_anthias() -> None:
     """
     Background task to reboot Anthias
     """
     if is_balena_app():
-        for attempt in Retrying(
-            stop=stop_after_attempt(5),
-            wait=wait_fixed(1),
-        ):
-            with attempt:
-                reboot_via_balena_supervisor()
+        _run_supervisor_command(reboot_via_balena_supervisor, 'reboot')
     else:
         r.publish('hostcmd', 'reboot')
 
 
-@celery.task
+@celery.task(
+    soft_time_limit=SUPERVISOR_CMD_SOFT_TIME_LIMIT_S,
+    time_limit=SUPERVISOR_CMD_TIME_LIMIT_S,
+)
 def shutdown_anthias() -> None:
     """
     Background task to shutdown Anthias
     """
     if is_balena_app():
-        for attempt in Retrying(
-            stop=stop_after_attempt(5),
-            wait=wait_fixed(1),
-        ):
-            with attempt:
-                shutdown_via_balena_supervisor()
+        _run_supervisor_command(shutdown_via_balena_supervisor, 'shutdown')
     else:
         r.publish('hostcmd', 'shutdown')
 
@@ -1169,13 +1434,20 @@ def _check_asset_reachability(asset: Asset) -> bool:
     Local files: existence check. Remote URIs: defer to ``url_fails``,
     which knows about both HTTP(S) and streaming (RTSP/RTMP) probes.
     Trust ``skip_asset_check`` — operator opted out of validation.
+
+    TLS verification for the remote probe composes the device-wide
+    ``verify_ssl`` setting with the per-asset ``skip_ssl_verify``
+    override: verification is skipped when the global setting is off OR
+    the asset opts out, so a trusted self-signed host isn't marked
+    unreachable (which would make the viewer silently skip the asset).
     """
     if asset.skip_asset_check:
         return True
     uri = asset.uri or ''
     if uri.startswith('/'):
         return path.isfile(uri)
-    return not url_fails(uri)
+    verify_ssl = settings['verify_ssl'] and not asset.skip_ssl_verify
+    return not url_fails(uri, verify_ssl=verify_ssl)
 
 
 @celery.task(
@@ -1218,7 +1490,7 @@ def revalidate_asset_urls() -> None:
         nx=True,
         ex=ASSET_REVALIDATION_TIME_LIMIT_S,
     ):
-        logging.info(
+        logger.info(
             'revalidate_asset_urls: previous sweep still running, skipping'
         )
         return
@@ -1248,7 +1520,7 @@ def revalidate_asset_urls() -> None:
             except Exception:
                 # url_fails should swallow its own exceptions, but a
                 # surprise from sh/requests shouldn't kill the whole sweep.
-                logging.exception(
+                logger.exception(
                     'revalidate_asset_urls: probe crashed for %s',
                     asset.asset_id,
                 )
@@ -1265,7 +1537,7 @@ def revalidate_asset_urls() -> None:
         # ``finally`` below releases the lock; rows updated so far
         # keep their fresh state) instead of letting the hard limit
         # SIGKILL the pool child. The next beat tick starts over.
-        logging.warning(
+        logger.warning(
             'revalidate_asset_urls: sweep exceeded %ss; '
             'aborting until the next beat tick',
             ASSET_REVALIDATION_SOFT_TIME_LIMIT_S,
@@ -1307,7 +1579,10 @@ def _parse_processing_started_at(value: Any) -> datetime | None:
     return parsed
 
 
-@celery.task(time_limit=300)
+@celery.task(
+    time_limit=RECONCILE_STUCK_TIME_LIMIT_S,
+    soft_time_limit=RECONCILE_STUCK_SOFT_TIME_LIMIT_S,
+)
 def reconcile_stuck_processing() -> None:
     """Recover ``Asset`` rows stuck at ``is_processing=True``.
 
@@ -1371,9 +1646,9 @@ def reconcile_stuck_processing() -> None:
         RECONCILE_STUCK_LOCK_KEY,
         token,
         nx=True,
-        ex=300,  # matches the task's time_limit
+        ex=RECONCILE_STUCK_TIME_LIMIT_S,  # matches the task's hard time_limit
     ):
-        logging.info(
+        logger.info(
             'reconcile_stuck_processing: previous sweep still running, '
             'skipping'
         )
@@ -1406,7 +1681,7 @@ def reconcile_stuck_processing() -> None:
             # Stuck past the threshold. Route by mimetype.
             mimetype = (asset.mimetype or '').lower()
             if mimetype == 'image':
-                logging.warning(
+                logger.warning(
                     'reconcile_stuck_processing: re-dispatching image '
                     'normalize for %s (stuck since %s)',
                     asset.asset_id,
@@ -1414,7 +1689,7 @@ def reconcile_stuck_processing() -> None:
                 )
                 dispatch_normalize_image(asset.asset_id)
             elif mimetype == 'video':
-                logging.warning(
+                logger.warning(
                     'reconcile_stuck_processing: re-dispatching video '
                     'normalize for %s (stuck since %s)',
                     asset.asset_id,
@@ -1432,7 +1707,7 @@ def reconcile_stuck_processing() -> None:
                 # original watch URL on a backup-restored YouTube
                 # row, but video-pipeline re-dispatch is the best we
                 # can do without re-querying yt-dlp.
-                logging.warning(
+                logger.warning(
                     'reconcile_stuck_processing: clearing flag on '
                     'unknown-mimetype row %s '
                     '(mimetype=%r, stuck since %s)',
@@ -1445,6 +1720,17 @@ def reconcile_stuck_processing() -> None:
                     'Processing stalled past threshold; flag cleared '
                     'by reconciler. Re-upload the asset to retry.',
                 )
+    except SoftTimeLimitExceeded:
+        # A per-row Redis publish or SQLite lock wedged the sweep past
+        # the soft budget. Abort this tick rather than let the hard
+        # limit SIGKILL the worker (ANTHIAS-A / 9 / B); the finally
+        # below still releases the lock and the next beat tick resumes
+        # from wherever the rows now stand.
+        logger.warning(
+            'reconcile_stuck_processing: sweep exceeded %ss; '
+            'skipping the rest of this tick',
+            RECONCILE_STUCK_SOFT_TIME_LIMIT_S,
+        )
     finally:
         # Compare-and-delete via the shared Lua script: only release
         # if the lock still holds *our* token. If our TTL expired and
@@ -1520,7 +1806,7 @@ def revalidate_asset_url(asset_id: str) -> None:
             # bailing) keeps the viewer's _asset_is_displayable in
             # sync with reality and the cooldown lock prevents an
             # immediate re-probe storm.
-            logging.warning(
+            logger.warning(
                 'revalidate_asset_url: probe for %s exceeded %ss; '
                 'marking unreachable',
                 asset_id,
@@ -1528,7 +1814,7 @@ def revalidate_asset_url(asset_id: str) -> None:
             )
             reachable = False
         except Exception:
-            logging.exception(
+            logger.exception(
                 'revalidate_asset_url: probe crashed for %s', asset_id
             )
             return
@@ -1537,7 +1823,7 @@ def revalidate_asset_url(asset_id: str) -> None:
             last_reachability_check=timezone.now(),
         )
     except SoftTimeLimitExceeded:
-        logging.warning(
+        logger.warning(
             'revalidate_asset_url: soft time limit hit while '
             'finalising the probe for %s; giving up this recheck',
             asset_id,
@@ -1554,7 +1840,7 @@ def revalidate_asset_url(asset_id: str) -> None:
 # directly without going through Celery). The thin wrappers below are
 # the actual celery.task entry points so the task names register on
 # the worker and ``apply_async`` works out of the box.
-from anthias_server import processing  # noqa: E402
+from anthias_server import processing
 
 
 @celery.task(

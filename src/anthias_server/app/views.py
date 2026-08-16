@@ -2,6 +2,7 @@ import logging
 import re
 import tarfile
 import uuid
+from contextlib import suppress
 from datetime import datetime, time
 from mimetypes import guess_extension, guess_type
 from os import path, remove
@@ -13,6 +14,7 @@ from django.contrib.auth import authenticate
 from django.contrib.auth import login as django_login
 from django.http import (
     FileResponse,
+    Http404,
     HttpRequest,
     HttpResponse,
     StreamingHttpResponse,
@@ -27,18 +29,25 @@ from django.utils.http import (
 )
 from django.views.decorators.http import require_http_methods
 
+from anthias_common.utils import (
+    DISK_FULL_ERROR,
+    clamp_screen_rotation,
+    connect_to_redis,
+    is_disk_full,
+)
 from anthias_server.app import page_context
-from anthias_server.app.models import clamp_refresh_interval
+from anthias_server.app.models import (
+    clamp_duration,
+    clamp_refresh_interval,
+    parse_header_lines,
+)
 from anthias_server.celery_tasks import reboot_anthias, shutdown_anthias
+from anthias_server.django_project.settings import is_valid_time_zone
 from anthias_server.lib import backup_helper, diagnostics
 from anthias_server.lib.auth import (
     AuthSettingsError,
     apply_auth_settings,
     authorized,
-)
-from anthias_common.utils import (
-    clamp_screen_rotation,
-    connect_to_redis,
 )
 from anthias_server.settings import ViewerPublisher, settings
 
@@ -88,7 +97,8 @@ def _parse_local_datetime(value: str) -> datetime:
     candidates = [f'{date_fmt} {time_fmt}', f'{date_fmt} %H:%M']
     for fmt in candidates:
         try:
-            return timezone.make_aware(datetime.strptime(value, fmt))
+            # Naive strptime is deliberate — make_aware attaches the tz.
+            return timezone.make_aware(datetime.strptime(value, fmt))  # noqa: DTZ007
         except ValueError:
             continue
     return timezone.make_aware(datetime.fromisoformat(value))
@@ -109,7 +119,8 @@ def _parse_local_time(value: str) -> time:
     value = value.strip()
     for fmt in ('%H:%M', '%I:%M %p'):
         try:
-            return datetime.strptime(value, fmt).time()
+            # Time-of-day only, no date or tz involved.
+            return datetime.strptime(value, fmt).time()  # noqa: DTZ007
         except ValueError:
             continue
     return time.fromisoformat(value)
@@ -168,6 +179,27 @@ def migrate_to_screenly(request: HttpRequest) -> HttpResponse:
     )
 
 
+@authorized
+@require_http_methods(['GET'])
+def import_content(request: HttpRequest, provider: str) -> HttpResponse:
+    """Render the import wizard for a given provider.
+
+    Provider display copy (label, token help) comes from the registry so
+    the same template serves every registered provider. An unknown key
+    404s.
+    """
+    from anthias_server.lib.integrations.registry import get_provider_meta
+
+    meta = get_provider_meta(provider)
+    if meta is None:
+        raise Http404('Unknown import provider.')
+    return template(
+        request,
+        'import_content.html',
+        {'active_nav': 'settings', 'provider': meta},
+    )
+
+
 # --- /home (Schedule Overview) ----------------------------------------------
 
 
@@ -203,6 +235,8 @@ def assets_create(request: HttpRequest) -> HttpResponse:
     queued to fetch the file. The "Processing" pill on the table row
     clears once the worker completes.
     """
+    from datetime import timedelta
+
     from anthias_common.remote_video import is_streaming_uri
     from anthias_common.utils import validate_url
     from anthias_common.youtube import (
@@ -211,7 +245,6 @@ def assets_create(request: HttpRequest) -> HttpResponse:
         youtube_destination_path,
     )
     from anthias_server.app.models import Asset
-    from datetime import timedelta
 
     uri = (request.POST.get('uri') or '').strip()
     if not uri or not validate_url(uri):
@@ -367,10 +400,10 @@ def assets_create_app(request: HttpRequest) -> HttpResponse:
     plays.
     """
     import json
+    from datetime import timedelta
 
     from anthias_common.utils import validate_url
     from anthias_server.app.models import Asset
-    from datetime import timedelta
 
     # The launch URL / values are posted as app_uri / app_values (not
     # uri / values) so the Apps form's hidden inputs don't collide with
@@ -460,10 +493,20 @@ def assets_upload(request: HttpRequest) -> HttpResponse:
     """File upload tab. Mirrors api.views.mixins.FileAssetViewMixin.post:
     move the upload into assetdir, create an Asset row, return the
     table partial so HTMX can swap straight in."""
-    from anthias_server.app.models import Asset
     from datetime import timedelta
 
-    file_upload = request.FILES.get('file_upload')
+    from anthias_server.app.models import Asset
+
+    # ``request.FILES`` triggers the (lazy) multipart parse, which
+    # spools the body to a temp file — on a full disk that write is
+    # where ENOSPC actually surfaces (Sentry ANTHIAS-3K). Turn it
+    # into an actionable toast instead of a 500.
+    try:
+        file_upload = request.FILES.get('file_upload')
+    except OSError as exc:
+        if not is_disk_full(exc):
+            raise
+        return _asset_table_response(request, toast=('error', DISK_FULL_ERROR))
     if file_upload is None or not file_upload.name:
         return _asset_table_response(
             request, toast=('error', 'No file uploaded.')
@@ -615,9 +658,17 @@ def assets_upload(request: HttpRequest) -> HttpResponse:
     # overwriting the older one.
     final_name = uuid.uuid4().hex
     final_path = path.join(settings['assetdir'], f'{final_name}{src_ext}')
-    with open(final_path, 'wb') as f:
-        for chunk in file_upload.chunks():
-            f.write(chunk)
+    try:
+        with open(final_path, 'wb') as f:
+            f.writelines(file_upload.chunks())
+    except OSError as exc:
+        if not is_disk_full(exc):
+            raise
+        # Don't leave a truncated file squatting on the last free
+        # bytes of an already-full disk.
+        with suppress(OSError):
+            remove(final_path)
+        return _asset_table_response(request, toast=('error', DISK_FULL_ERROR))
 
     # Decide which Celery task — if any — needs to run before the
     # viewer can play the row.
@@ -634,13 +685,15 @@ def assets_upload(request: HttpRequest) -> HttpResponse:
     #     The set lives in one place so adding a new format only
     #     touches that constant — this comment is intentionally
     #     not the source of truth.
-    from anthias_server.processing import needs_image_normalisation
+    from anthias_server.processing import needs_image_processing
 
     is_video = mimetype == 'video'
-    needs_image_normalize = mimetype == 'image' and needs_image_normalisation(
+    # Either reason earns the Celery hop: a format that needs converting
+    # to WebP, or a JPEG/PNG too large for a low-RAM board to render.
+    needs_image_pipeline = mimetype == 'image' and needs_image_processing(
         final_path
     )
-    is_processing = is_video or needs_image_normalize
+    is_processing = is_video or needs_image_pipeline
 
     duration = settings['default_duration']
 
@@ -689,7 +742,7 @@ def assets_upload(request: HttpRequest) -> HttpResponse:
             ),
             offer_review_cta=True,
         )
-    if needs_image_normalize:
+    if needs_image_pipeline:
         from anthias_server.processing import dispatch_normalize_image
 
         dispatch_normalize_image(asset.asset_id)
@@ -733,7 +786,10 @@ def assets_update(request: HttpRequest, asset_id: str) -> HttpResponse:
         # that try to write a duration anyway.
         pass
     else:
-        asset.duration = int(
+        # Clamp (rather than reject) like the refresh-interval handler
+        # below — an out-of-range duration would crash-loop the
+        # viewer's Event.wait (Sentry ANTHIAS-3E).
+        asset.duration = clamp_duration(
             request.POST.get('duration') or asset.duration or 0
         )
     start = request.POST.get('start_date')
@@ -753,6 +809,7 @@ def assets_update(request: HttpRequest, asset_id: str) -> HttpResponse:
         )
     asset.nocache = _checkbox(request, 'nocache')
     asset.skip_asset_check = _checkbox(request, 'skip_asset_check')
+    asset.skip_ssl_verify = _checkbox(request, 'skip_ssl_verify')
 
     # Day-of-week filter — POST sends one value per checked weekday
     # (1=Mon..7=Sun, ISO). Empty / unchecked-all means "every day", same
@@ -800,8 +857,10 @@ def assets_update(request: HttpRequest, asset_id: str) -> HttpResponse:
             request,
             toast=(
                 'error',
-                'Set both play from and until times, or clear both '
-                '— not saved',
+                (
+                    'Set both play from and until times, or clear both '
+                    '— not saved'
+                ),
             ),
         )
     else:
@@ -827,6 +886,22 @@ def assets_update(request: HttpRequest, asset_id: str) -> HttpResponse:
         )
         asset.metadata = metadata
 
+    # Per-asset custom request headers — feature #2215. Same
+    # ``metadata``-backed, webpage-only posture as refresh_interval_s: a
+    # missing field means "non-webpage edit, leave the bag alone"; an
+    # empty textarea means "operator cleared the headers" and pops the
+    # key. The form clamps (drops malformed lines via parse_header_lines)
+    # rather than 400ing — the strict reject lives in the v2 API.
+    raw_headers = request.POST.get('custom_headers')
+    if raw_headers is not None:
+        metadata = dict(asset.metadata or {})
+        headers = parse_header_lines(raw_headers)
+        if headers:
+            metadata['headers'] = headers
+        else:
+            metadata.pop('headers', None)
+        asset.metadata = metadata
+
     # Store-app reconfiguration. When editing an app asset (one carrying
     # ``metadata.app``), the modal re-renders the manifest config form
     # and rebuilds the launch URL client-side, posting the new URL and
@@ -848,8 +923,10 @@ def assets_update(request: HttpRequest, asset_id: str) -> HttpResponse:
                 request,
                 toast=(
                     'error',
-                    'That app URL is not from a recognised '
-                    'app store — not saved',
+                    (
+                        'That app URL is not from a recognised '
+                        'app store — not saved'
+                    ),
                 ),
             )
         try:
@@ -1034,8 +1111,7 @@ def playlists_group(request: HttpRequest, playlist_id: str) -> HttpResponse:
             request,
             toast=(
                 'info',
-                'Grouping needs at least two enabled assets '
-                'in the playlist',
+                'Grouping needs at least two enabled assets in the playlist',
             ),
         )
     member_set = set(member_ids)
@@ -1254,11 +1330,12 @@ def assets_bulk_update(request: HttpRequest) -> HttpResponse:
     """Apply common schedule fields to a set of assets at once.
 
     Mirrors the per-asset ``assets_update`` parsing for dates,
-    duration, time-of-day, and weekday filters, but each group is
-    opt-in via an ``apply_*`` flag so an operator only overwrites the
-    fields they ticked — an unticked group is left untouched on every
-    selected asset. Everything is parsed before any row is mutated so a
-    bad date/time toasts without leaving a half-applied batch (#3046).
+    duration, time-of-day, weekday filters, and the No cache /
+    Skip asset check flags (#3137), but each group is opt-in via an
+    ``apply_*`` flag so an operator only overwrites the fields they
+    ticked — an unticked group is left untouched on every selected
+    asset. Everything is parsed before any row is mutated so a bad
+    date/time toasts without leaving a half-applied batch (#3046).
     """
     import json as _json
 
@@ -1290,8 +1367,17 @@ def assets_bulk_update(request: HttpRequest) -> HttpResponse:
     apply_duration = request.POST.get('apply_duration') == 'true'
     apply_time = request.POST.get('apply_time') == 'true'
     apply_days = request.POST.get('apply_days') == 'true'
+    apply_nocache = request.POST.get('apply_nocache') == 'true'
+    apply_skip = request.POST.get('apply_skip_asset_check') == 'true'
 
-    if not (apply_dates or apply_duration or apply_time or apply_days):
+    if not (
+        apply_dates
+        or apply_duration
+        or apply_time
+        or apply_days
+        or apply_nocache
+        or apply_skip
+    ):
         return _asset_table_response(
             request,
             toast=('info', 'Nothing to change — pick a field to edit'),
@@ -1360,8 +1446,10 @@ def assets_bulk_update(request: HttpRequest) -> HttpResponse:
                     request,
                     toast=(
                         'error',
-                        'Could not read the play from/until times '
-                        '— nothing changed',
+                        (
+                            'Could not read the play from/until times '
+                            '— nothing changed'
+                        ),
                     ),
                 )
         elif play_from or play_to:
@@ -1369,8 +1457,10 @@ def assets_bulk_update(request: HttpRequest) -> HttpResponse:
                 request,
                 toast=(
                     'error',
-                    'Set both play from and until times, or clear both '
-                    '— nothing changed',
+                    (
+                        'Set both play from and until times, or clear both '
+                        '— nothing changed'
+                    ),
                 ),
             )
         else:
@@ -1408,6 +1498,16 @@ def assets_bulk_update(request: HttpRequest) -> HttpResponse:
         shared['play_time_to'] = None if clear_time else new_time_to
     if apply_days and new_play_days is not None:
         shared['play_days'] = new_play_days
+    # Boolean flags: when a group is applied, its On/Off segmented radio
+    # POSTs the target state ('true'/'false'), so a group can clear the
+    # flag as well as set it. When the group isn't applied the field is
+    # absent (radios disabled) and the stored value is left untouched.
+    if apply_nocache:
+        shared['nocache'] = request.POST.get('nocache') == 'true'
+    if apply_skip:
+        shared['skip_asset_check'] = (
+            request.POST.get('skip_asset_check') == 'true'
+        )
 
     if not shared and not apply_duration:
         # e.g. apply_dates ticked but both date fields left blank.
@@ -1438,8 +1538,10 @@ def assets_bulk_update(request: HttpRequest) -> HttpResponse:
             request,
             toast=(
                 'info',
-                'Duration applies to images and web pages only '
-                '— nothing changed',
+                (
+                    'Duration applies to images and web pages only '
+                    '— nothing changed'
+                ),
             ),
         )
     ViewerPublisher.get_instance().send_to_viewer('reload')
@@ -1528,15 +1630,23 @@ def assets_download(request: HttpRequest, asset_id: str) -> HttpResponseBase:
     asset = Asset.objects.filter(asset_id=asset_id).first()
     if asset is None or not asset.uri:
         return redirect(reverse('anthias_app:home'))
-    if asset.mimetype in ('webpage', 'streaming'):
-        safe = _safe_redirect_uri(asset.uri)
+    # Any asset whose content lives at a remote http(s) URL — a webpage,
+    # a stream, or a remote-hosted image/video — has no local file to
+    # stream, so we redirect the browser to the source. Only locally
+    # uploaded assets (uri is a filesystem path) are served from disk.
+    # Keying off the URI scheme rather than the mimetype is what fixes
+    # the blank preview/download for remote image/video assets (forum
+    # "web content doesn't display"): those are stored mimetype
+    # image/video but their uri is an http(s) URL, so the old
+    # mimetype-only branch fell through to the local-path lookup, found
+    # nothing, and bounced to the home page.
+    safe = _safe_redirect_uri(asset.uri)
+    if safe is not None:
         # `safe` is whitelisted to http(s):// schemes by _safe_redirect_uri,
         # and the endpoint is gated by @authorized (only operators with a
         # session reach this). The redirect target is the operator's own
         # asset URI — that's the feature, not a sink.
-        return (  # lgtm [py/url-redirection]
-            redirect(safe) if safe else redirect(reverse('anthias_app:home'))
-        )
+        return redirect(safe)  # lgtm [py/url-redirection]
     safe_path = _safe_local_asset_path(asset.uri)
     if safe_path is None:
         return redirect(reverse('anthias_app:home'))
@@ -1559,15 +1669,18 @@ def assets_preview(request: HttpRequest, asset_id: str) -> HttpResponseBase:
     asset = Asset.objects.filter(asset_id=asset_id).first()
     if asset is None or not asset.uri:
         return redirect(reverse('anthias_app:home'))
-    if asset.mimetype in ('webpage', 'streaming'):
-        safe = _safe_redirect_uri(asset.uri)
+    # Remote http(s) assets (webpage, streaming, or a remote-hosted
+    # image/video) redirect to the source; the modal renders those in an
+    # <img>/<video>/<iframe>. Keying off the URI scheme rather than the
+    # mimetype is what makes remote image/video previews work — see
+    # assets_download for the full rationale.
+    safe = _safe_redirect_uri(asset.uri)
+    if safe is not None:
         # `safe` is whitelisted to http(s):// schemes by _safe_redirect_uri,
         # and the endpoint is gated by @authorized (only operators with a
         # session reach this). The redirect target is the operator's own
         # asset URI — that's the feature, not a sink.
-        return (  # lgtm [py/url-redirection]
-            redirect(safe) if safe else redirect(reverse('anthias_app:home'))
-        )
+        return redirect(safe)  # lgtm [py/url-redirection]
     safe_path = _safe_local_asset_path(asset.uri)
     if safe_path is None:
         return redirect(reverse('anthias_app:home'))
@@ -1760,11 +1873,52 @@ def review_cta_snooze(request: HttpRequest) -> HttpResponse:
     return HttpResponse(status=204)
 
 
+def _apply_display_power_schedule_settings(request: HttpRequest) -> None:
+    """Persist the scheduled display-power fields from the settings form.
+
+    Times are normalised through ``parse_hhmm`` so a malformed value is
+    rejected here and the stored setting keeps its previous value —
+    the Celery beat must never read a time it cannot parse.
+    """
+    from anthias_server.lib import display_power
+
+    settings['display_power_schedule_enabled'] = _checkbox(
+        request, 'display_power_schedule_enabled'
+    )
+
+    for field in ('display_power_on_time', 'display_power_off_time'):
+        raw = (request.POST.get(field) or '').strip()
+        parsed = display_power.parse_hhmm(raw)
+        if parsed is not None:
+            settings[field] = parsed.strftime('%H:%M')
+        elif raw:
+            # Keep the previous value, but say so. Silently discarding
+            # the edit while still reporting "successfully saved" would
+            # show the operator the old time with no sign it was
+            # rejected.
+            messages.error(
+                request, f'Ignored invalid display schedule time: {raw}'
+            )
+
+    # An empty selection means "every day" rather than "no days", which
+    # would leave an enabled schedule silently inert.
+    days = [d for d in request.POST.getlist('display_power_days') if d.strip()]
+    parsed_days = display_power.parse_days(','.join(days))
+    settings['display_power_days'] = ','.join(
+        str(d) for d in sorted(parsed_days)
+    )
+
+
 @authorized
 @require_http_methods(['GET'])
 def settings_view(request: HttpRequest) -> HttpResponse:
+    from anthias_server.lib.integrations.registry import list_provider_meta
+
     context = page_context.device_settings()
     context['active_nav'] = 'settings'
+    # Data-driven so a newly registered provider appears in Settings with
+    # no template edit.
+    context['import_providers'] = list_provider_meta()
     return template(request, 'settings.html', context)
 
 
@@ -1780,6 +1934,20 @@ def settings_save(request: HttpRequest) -> HttpResponse:
     auth_backend = request.POST.get('auth_backend', '')
     current_password = request.POST.get('current_password', '')
 
+    # Reject a bad timezone up front (mirrors the v2 serializer's
+    # validate_timezone). Blank defers to the resolved default (TZ env
+    # -> /etc/timezone -> UTC). Handled here rather
+    # than inside the try so it stays operator-input (warning-level, no
+    # Sentry event) and can't half-write a value that would crash-loop
+    # the settings module on the next read.
+    tz_value = (request.POST.get('timezone') or '').strip()
+    if tz_value and not is_valid_time_zone(tz_value):
+        logger.warning('Settings save rejected: unknown timezone %r', tz_value)
+        messages.error(
+            request, f'Unknown or unavailable timezone: {tz_value}.'
+        )
+        return redirect(reverse('anthias_app:settings'))
+
     try:
         prev_auth_backend = settings['auth_backend']
         apply_auth_settings(
@@ -1794,14 +1962,18 @@ def settings_save(request: HttpRequest) -> HttpResponse:
         settings['auth_backend'] = auth_backend
 
         settings['player_name'] = request.POST.get('player_name', '')
-        settings['default_duration'] = int(
+        # Clamped for the same reason as the per-asset duration: these
+        # defaults get copied onto new asset rows and would reach the
+        # viewer's Event.wait (Sentry ANTHIAS-3E).
+        settings['default_duration'] = clamp_duration(
             request.POST.get('default_duration') or 0
         )
-        settings['default_streaming_duration'] = int(
+        settings['default_streaming_duration'] = clamp_duration(
             request.POST.get('default_streaming_duration') or 0
         )
         settings['audio_output'] = request.POST.get('audio_output', 'hdmi')
         settings['date_format'] = request.POST.get('date_format', 'mm/dd/yyyy')
+        settings['timezone'] = tz_value
 
         new_default_assets = _checkbox(request, 'default_assets')
         if new_default_assets and not settings['default_assets']:
@@ -1815,6 +1987,7 @@ def settings_save(request: HttpRequest) -> HttpResponse:
         settings['prefer_dark_mode'] = _checkbox(request, 'prefer_dark_mode')
         settings['use_24_hour_clock'] = _checkbox(request, 'use_24_hour_clock')
         settings['debug_logging'] = _checkbox(request, 'debug_logging')
+        settings['verify_ssl'] = _checkbox(request, 'verify_ssl')
 
         # Restrict to the four cardinal angles via the shared
         # clamp_screen_rotation() helper. The Qt linuxfb plugin only
@@ -1826,6 +1999,8 @@ def settings_save(request: HttpRequest) -> HttpResponse:
         settings['screen_rotation'] = clamp_screen_rotation(
             request.POST.get('screen_rotation')
         )
+
+        _apply_display_power_schedule_settings(request)
 
         settings.save()
         ViewerPublisher.get_instance().send_to_viewer('reload')
@@ -1899,13 +2074,16 @@ def settings_recover(request: HttpRequest) -> HttpResponse:
     try:
         publisher.send_to_viewer('stop')
         with open(location, 'wb') as f:
-            for chunk in file_upload.chunks():
-                f.write(chunk)
+            f.writelines(file_upload.chunks())
         try:
             backup_helper.recover(location)
             messages.success(request, 'Recovery successful.')
-        except (backup_helper.BackupRecoverError, tarfile.TarError):
-            logger.exception('Backup recovery failed')
+        except (backup_helper.BackupRecoverError, tarfile.TarError) as exc:
+            # Same operator-input case as the API recover view: a bad /
+            # non-backup upload is validation, not a bug (the error
+            # message below already tells them). Warning, not exception,
+            # so it doesn't page Sentry (ANTHIAS-3W).
+            logger.warning('Backup recovery failed: %s', exc)
             messages.error(request, 'Invalid backup archive.')
     finally:
         if path.isfile(location):

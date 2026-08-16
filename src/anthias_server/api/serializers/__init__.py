@@ -1,6 +1,6 @@
-from datetime import timezone
+from datetime import UTC
 from os import path
-from typing import Any
+from typing import Any, ClassVar
 
 from rest_framework.exceptions import ValidationError
 from rest_framework.serializers import (
@@ -12,8 +12,31 @@ from rest_framework.serializers import (
     Serializer,
 )
 
-from anthias_server.app.models import Asset
 from anthias_common.utils import validate_url
+from anthias_server.app.models import DURATION_S_MAX, Asset
+
+DURATION_RANGE_ERROR = (
+    f'duration must be between 0 and {DURATION_S_MAX} seconds.'
+)
+
+
+def parse_duration(value: Any) -> int:
+    """Parse and bound a client-supplied asset duration (seconds).
+
+    Shared by the v1-family write paths, which model ``duration`` as a
+    CharField for back-compat. Raises DRF ``ValidationError`` (plain
+    message — callers decide the field key) so out-of-range values
+    become a 400 instead of landing in the DB, where the viewer would
+    feed them to ``threading.Event.wait`` and crash-loop on
+    OverflowError (Sentry ANTHIAS-3E).
+    """
+    try:
+        duration = int(value)
+    except (TypeError, ValueError):
+        raise ValidationError('A valid integer is required.')
+    if not 0 <= duration <= DURATION_S_MAX:
+        raise ValidationError(DURATION_RANGE_ERROR)
+    return duration
 
 
 def get_unique_name(name: str) -> str:
@@ -79,7 +102,7 @@ class AssetSerializer(ModelSerializer[Asset]):
 
     class Meta:
         model = Asset
-        fields = [
+        fields: ClassVar = [
             'asset_id',
             'name',
             'uri',
@@ -97,7 +120,7 @@ class AssetSerializer(ModelSerializer[Asset]):
             'last_reachability_check',
             'metadata',
         ]
-        read_only_fields = [
+        read_only_fields: ClassVar = [
             'is_reachable',
             'last_reachability_check',
             # Owned by the upload-pipeline tasks; v1 exposes it read-only
@@ -116,8 +139,8 @@ class UpdateAssetSerializer(Serializer[Asset]):
     # NOT widen any other field "for consistency" — only widen those that
     # are actually overridden in subclasses.
     name = CharField()
-    start_date = DateTimeField(default_timezone=timezone.utc)
-    end_date = DateTimeField(default_timezone=timezone.utc)
+    start_date = DateTimeField(default_timezone=UTC)
+    end_date = DateTimeField(default_timezone=UTC)
     duration: Field[Any, Any, Any, Any] = CharField()
     is_enabled: Field[Any, Any, Any, Any] = IntegerField(
         min_value=0, max_value=1
@@ -132,6 +155,11 @@ class UpdateAssetSerializer(Serializer[Asset]):
     skip_asset_check: Field[Any, Any, Any, Any] = IntegerField(
         min_value=0, max_value=1, required=False
     )
+
+    def validate_duration(self, value: Any) -> int:
+        # Runs for v2's IntegerField override too — redundant there
+        # (the field bounds already reject), but harmless.
+        return parse_duration(value)
 
     def update(
         self,
@@ -155,6 +183,9 @@ class UpdateAssetSerializer(Serializer[Asset]):
         )
         instance.skip_asset_check = validated_data.get(
             'skip_asset_check', instance.skip_asset_check
+        )
+        instance.skip_ssl_verify = validated_data.get(
+            'skip_ssl_verify', instance.skip_ssl_verify
         )
 
         if 'video' not in (instance.mimetype or ''):
