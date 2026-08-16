@@ -72,6 +72,32 @@ urlpatterns = [
         name='assets_bulk_update',
     ),
     path(
+        'assets/bulk/playlist/',
+        views.assets_bulk_playlist,
+        name='assets_bulk_playlist',
+    ),
+    path('playlists/new/', views.playlists_create, name='playlists_create'),
+    path(
+        'playlists/<str:playlist_id>/rename/',
+        views.playlists_rename,
+        name='playlists_rename',
+    ),
+    path(
+        'playlists/<str:playlist_id>/toggle/',
+        views.playlists_toggle,
+        name='playlists_toggle',
+    ),
+    path(
+        'playlists/<str:playlist_id>/group/',
+        views.playlists_group,
+        name='playlists_group',
+    ),
+    path(
+        'playlists/<str:playlist_id>/delete/',
+        views.playlists_delete,
+        name='playlists_delete',
+    ),
+    path(
         'assets/control/<str:command>/',
         views.assets_control,
         name='assets_control',

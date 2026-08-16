@@ -865,6 +865,25 @@ def assets_update(request: HttpRequest, asset_id: str) -> HttpResponse:
         asset.metadata = metadata
         asset.uri = app_uri
 
+    # Playlist membership from the edit modal's select. A missing key
+    # means the form didn't render the field (older cached page) —
+    # leave membership untouched. An empty value is the explicit
+    # "No playlist" choice. An unknown id (playlist deleted while the
+    # modal was open) is ignored rather than erroring the whole save.
+    raw_playlist = request.POST.get('playlist_id')
+    if raw_playlist is not None:
+        raw_playlist = raw_playlist.strip()
+        if not raw_playlist:
+            asset.playlist = None
+        else:
+            from anthias_server.app.models import Playlist
+
+            playlist = Playlist.objects.filter(
+                playlist_id=raw_playlist
+            ).first()
+            if playlist is not None:
+                asset.playlist = playlist
+
     asset.save()
     ViewerPublisher.get_instance().send_to_viewer('reload')
     return _asset_table_response(request, toast=('success', 'Changes saved'))
@@ -906,6 +925,206 @@ def assets_duplicate(request: HttpRequest, asset_id: str) -> HttpResponse:
         except AssetDuplicationError as exc:
             toast = ('error', str(exc))
     return _asset_table_response(request, toast=toast)
+
+
+# --- Playlists (Schedule Overview management) --------------------------------
+
+
+@authorized
+@require_http_methods(['POST'])
+def playlists_create(request: HttpRequest) -> HttpResponse:
+    """Create a named playlist from the Add-playlist modal."""
+    from anthias_server.app.models import Playlist
+
+    name = (request.POST.get('name') or '').strip()
+    if not name:
+        return _asset_table_response(
+            request, toast=('error', 'Enter a playlist name.')
+        )
+    Playlist.objects.create(name=name)
+    return _asset_table_response(
+        request, toast=('success', f'Playlist "{name}" created')
+    )
+
+
+@authorized
+@require_http_methods(['POST'])
+def playlists_rename(request: HttpRequest, playlist_id: str) -> HttpResponse:
+    from anthias_server.app.models import Playlist
+
+    playlist = Playlist.objects.filter(playlist_id=playlist_id).first()
+    if playlist is None:
+        return _asset_table_response(
+            request, toast=('error', 'Playlist not found')
+        )
+    name = (request.POST.get('name') or '').strip()
+    if not name:
+        return _asset_table_response(
+            request, toast=('error', 'Enter a playlist name.')
+        )
+    playlist.name = name
+    playlist.save()
+    return _asset_table_response(
+        request, toast=('success', 'Playlist renamed')
+    )
+
+
+@authorized
+@require_http_methods(['POST'])
+def playlists_toggle(request: HttpRequest, playlist_id: str) -> HttpResponse:
+    """Enable/disable every member asset in one action.
+
+    Mirrors the per-asset Activity toggle semantics at the group
+    level: if any member is disabled the action enables all, only a
+    fully-enabled playlist gets disabled — so a mixed state always
+    converges to "all playing" first.
+    """
+    from anthias_server.app.models import Asset, Playlist
+
+    playlist = Playlist.objects.filter(playlist_id=playlist_id).first()
+    if playlist is None:
+        return _asset_table_response(
+            request, toast=('error', 'Playlist not found')
+        )
+    members = Asset.objects.filter(playlist=playlist)
+    if not members.count():
+        return _asset_table_response(
+            request,
+            toast=('info', 'Playlist has no assets yet — nothing to toggle'),
+        )
+    enable = members.filter(is_enabled=False).exists()
+    members.update(is_enabled=enable)
+    ViewerPublisher.get_instance().send_to_viewer('reload')
+    verb = 'enabled' if enable else 'disabled'
+    return _asset_table_response(
+        request, toast=('success', f'Playlist "{playlist.name}" {verb}')
+    )
+
+
+@authorized
+@require_http_methods(['POST'])
+def playlists_group(request: HttpRequest, playlist_id: str) -> HttpResponse:
+    """Reorder the enabled schedule so this playlist plays back-to-back.
+
+    Playback order is still plain ``play_order`` (the viewer knows
+    nothing about playlists), so "play together" is an explicit
+    reordering: the playlist's enabled members are pulled into one
+    contiguous block anchored where its first member currently sits,
+    keeping their relative order; everything else keeps its order too.
+    """
+    from anthias_server.api.helpers import save_active_assets_ordering
+    from anthias_server.app.models import Asset, Playlist
+
+    playlist = Playlist.objects.filter(playlist_id=playlist_id).first()
+    if playlist is None:
+        return _asset_table_response(
+            request, toast=('error', 'Playlist not found')
+        )
+    active = list(
+        Asset.objects.filter(is_enabled=True, is_processing=False).order_by(
+            'play_order'
+        )
+    )
+    ids = [a.asset_id for a in active]
+    member_ids = [
+        a.asset_id for a in active if a.playlist_id == playlist.playlist_id
+    ]
+    if len(member_ids) < 2:
+        return _asset_table_response(
+            request,
+            toast=(
+                'info',
+                'Grouping needs at least two enabled assets '
+                'in the playlist',
+            ),
+        )
+    member_set = set(member_ids)
+    first_index = ids.index(member_ids[0])
+    # Anchor the block at the first member's position, measured against
+    # the non-member sequence (how many non-members precede it).
+    prefix = sum(1 for i in ids[:first_index] if i not in member_set)
+    remaining = [i for i in ids if i not in member_set]
+    new_order = remaining[:prefix] + member_ids + remaining[prefix:]
+    save_active_assets_ordering(new_order)
+    ViewerPublisher.get_instance().send_to_viewer('reload')
+    return _asset_table_response(
+        request,
+        toast=(
+            'success',
+            f'"{playlist.name}" now plays back-to-back',
+        ),
+    )
+
+
+@authorized
+@require_http_methods(['POST'])
+def playlists_delete(request: HttpRequest, playlist_id: str) -> HttpResponse:
+    """Delete the playlist row only — member assets are released back
+    to standalone (the FK is SET_NULL), never deleted with the group."""
+    from anthias_server.app.models import Playlist
+
+    playlist = Playlist.objects.filter(playlist_id=playlist_id).first()
+    if playlist is None:
+        return _asset_table_response(
+            request, toast=('error', 'Playlist not found')
+        )
+    count = playlist.assets.count()
+    name = playlist.name
+    playlist.delete()
+    if count:
+        toast_msg = (
+            f'Playlist "{name}" deleted — its {count} '
+            f'asset{_pluralize(count)} were kept'
+        )
+    else:
+        toast_msg = f'Playlist "{name}" deleted'
+    return _asset_table_response(request, toast=('success', toast_msg))
+
+
+@authorized
+@require_http_methods(['POST'])
+def assets_bulk_playlist(request: HttpRequest) -> HttpResponse:
+    """Assign the bulk-bar selection to a playlist (or clear it).
+
+    ``ids`` is the comma-joined selection (same wire shape as the
+    other bulk endpoints); ``playlist_id`` picks the target, empty
+    means "remove from playlist". Membership doesn't change what the
+    viewer plays, so no reload nudge is sent.
+    """
+    from anthias_server.app.models import Asset, Playlist
+
+    ids = _bulk_ids(request)
+    if not ids:
+        return _asset_table_response(
+            request, toast=('info', 'No assets selected')
+        )
+    raw_pid = (request.POST.get('playlist_id') or '').strip()
+    playlist = None
+    # '__remove' is the bulk bar's clear-membership sentinel (a select
+    # can't post an empty value for a real choice while also using ''
+    # as its disabled placeholder). Empty means the same thing.
+    if raw_pid and raw_pid != '__remove':
+        playlist = Playlist.objects.filter(playlist_id=raw_pid).first()
+        if playlist is None:
+            return _asset_table_response(
+                request, toast=('error', 'Playlist not found')
+            )
+    qs = Asset.objects.filter(asset_id__in=ids)
+    count = qs.count()
+    if not count:
+        return _asset_table_response(
+            request, toast=('info', 'No matching assets selected')
+        )
+    qs.update(playlist=playlist)
+    if playlist is not None:
+        toast_msg = (
+            f'{count} asset{_pluralize(count)} added to "{playlist.name}"'
+        )
+    else:
+        toast_msg = (
+            f'{count} asset{_pluralize(count)} removed from their playlist'
+        )
+    return _asset_table_response(request, toast=('success', toast_msg))
 
 
 @authorized

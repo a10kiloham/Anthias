@@ -3291,3 +3291,386 @@ def test_review_cta_suppressed_while_snoozed(
         )
     assert response.status_code == 200
     assert 'review-cta' not in response.headers.get('HX-Trigger', '')
+
+
+# ---------------------------------------------------------------------------
+# Playlists (Schedule Overview management)
+
+
+def _make_playlist(name: str = 'Morning loop') -> Any:
+    from anthias_server.app.models import Playlist
+
+    return Playlist.objects.create(name=name)
+
+
+def _make_assets(count: int, **overrides: Any) -> list[Asset]:
+    now = timezone.now()
+    fields = {
+        'uri': 'https://example.com',
+        'mimetype': 'webpage',
+        'duration': 10,
+        'is_enabled': True,
+        'is_processing': False,
+        'start_date': now,
+        'end_date': now + timedelta(days=30),
+    }
+    fields.update(overrides)
+    return [
+        Asset.objects.create(name=f'asset-{i}', play_order=i, **fields)
+        for i in range(count)
+    ]
+
+
+@pytest.mark.django_db
+def test_home_renders_add_playlist_button(client: Client) -> None:
+    response = client.get(reverse('anthias_app:home'))
+    body = response.content.decode()
+    assert 'id="add-playlist-button"' in body
+    assert 'Add Playlist' in body
+    # The create/rename modal + delete confirmation ship with the page.
+    assert 'openPlaylistCreate()' in body
+    assert 'Delete playlist?' in body
+
+
+@pytest.mark.django_db
+def test_playlists_create_and_section_renders(client: Client) -> None:
+    from anthias_server.app.models import Playlist
+
+    response = client.post(
+        reverse('anthias_app:playlists_create'),
+        data={'name': 'Morning loop'},
+        HTTP_HX_REQUEST='true',
+    )
+    assert response.status_code == 200
+    playlist = Playlist.objects.get()
+    assert playlist.name == 'Morning loop'
+    body = response.content.decode()
+    assert 'id="playlists-section"' in body
+    assert 'Morning loop' in body
+    # The partial republishes the playlist list into Alpine state so
+    # the bulk bar / edit modal (outside the partial) stay current.
+    assert 'syncPlaylists(' in body
+    assert playlist.playlist_id in body
+
+
+@pytest.mark.django_db
+def test_playlists_section_hidden_without_playlists(client: Client) -> None:
+    response = client.get(reverse('anthias_app:assets_table'))
+    assert 'id="playlists-section"' not in response.content.decode()
+
+
+@pytest.mark.django_db
+def test_playlists_create_requires_name(client: Client) -> None:
+    from anthias_server.app.models import Playlist
+
+    response = client.post(
+        reverse('anthias_app:playlists_create'),
+        data={'name': '   '},
+        HTTP_HX_REQUEST='true',
+    )
+    assert response.status_code == 200
+    assert Playlist.objects.count() == 0
+    assert 'error' in response.headers.get('HX-Trigger', '')
+
+
+@pytest.mark.django_db
+def test_playlists_rename(client: Client) -> None:
+    playlist = _make_playlist('Old name')
+    response = client.post(
+        reverse(
+            'anthias_app:playlists_rename',
+            kwargs={'playlist_id': playlist.playlist_id},
+        ),
+        data={'name': 'New name'},
+        HTTP_HX_REQUEST='true',
+    )
+    assert response.status_code == 200
+    playlist.refresh_from_db()
+    assert playlist.name == 'New name'
+
+
+@pytest.mark.django_db
+def test_playlists_rename_unknown_toasts_error(client: Client) -> None:
+    response = client.post(
+        reverse(
+            'anthias_app:playlists_rename',
+            kwargs={'playlist_id': 'nope'},
+        ),
+        data={'name': 'New name'},
+        HTTP_HX_REQUEST='true',
+    )
+    assert response.status_code == 200
+    assert 'error' in response.headers.get('HX-Trigger', '')
+
+
+@pytest.mark.django_db
+def test_playlists_toggle_enables_mixed_then_disables(
+    client: Client,
+) -> None:
+    playlist = _make_playlist()
+    members = _make_assets(2, playlist=playlist)
+    members[1].is_enabled = False
+    members[1].save()
+    url = reverse(
+        'anthias_app:playlists_toggle',
+        kwargs={'playlist_id': playlist.playlist_id},
+    )
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        client.post(url)
+        for a in members:
+            a.refresh_from_db()
+        # Mixed state converges to "all enabled" first…
+        assert all(a.is_enabled for a in members)
+        client.post(url)
+        for a in members:
+            a.refresh_from_db()
+        # …and a fully-enabled playlist disables.
+        assert not any(a.is_enabled for a in members)
+
+
+@pytest.mark.django_db
+def test_playlists_toggle_empty_playlist_is_noop(client: Client) -> None:
+    playlist = _make_playlist()
+    response = client.post(
+        reverse(
+            'anthias_app:playlists_toggle',
+            kwargs={'playlist_id': playlist.playlist_id},
+        ),
+        HTTP_HX_REQUEST='true',
+    )
+    assert response.status_code == 200
+    assert 'info' in response.headers.get('HX-Trigger', '')
+
+
+@pytest.mark.django_db
+def test_playlists_group_reorders_contiguously(client: Client) -> None:
+    """Members scattered through the enabled schedule pull together
+    into one block anchored at the first member's position; everything
+    else keeps its relative order."""
+    playlist = _make_playlist()
+    assets = _make_assets(4)
+    # Members at positions 1 and 3: expect [other0, m1, m3, other2].
+    for member in (assets[1], assets[3]):
+        member.playlist = playlist
+        member.save()
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        response = client.post(
+            reverse(
+                'anthias_app:playlists_group',
+                kwargs={'playlist_id': playlist.playlist_id},
+            ),
+            HTTP_HX_REQUEST='true',
+        )
+    assert response.status_code == 200
+    for a in assets:
+        a.refresh_from_db()
+    ordered = sorted(assets, key=lambda a: a.play_order)
+    assert [a.name for a in ordered] == [
+        'asset-0',
+        'asset-1',
+        'asset-3',
+        'asset-2',
+    ]
+
+
+@pytest.mark.django_db
+def test_playlists_group_needs_two_enabled_members(client: Client) -> None:
+    playlist = _make_playlist()
+    _make_assets(1, playlist=playlist)
+    response = client.post(
+        reverse(
+            'anthias_app:playlists_group',
+            kwargs={'playlist_id': playlist.playlist_id},
+        ),
+        HTTP_HX_REQUEST='true',
+    )
+    assert response.status_code == 200
+    assert 'info' in response.headers.get('HX-Trigger', '')
+
+
+@pytest.mark.django_db
+def test_playlists_delete_keeps_assets(client: Client) -> None:
+    from anthias_server.app.models import Playlist
+
+    playlist = _make_playlist()
+    members = _make_assets(2, playlist=playlist)
+    response = client.post(
+        reverse(
+            'anthias_app:playlists_delete',
+            kwargs={'playlist_id': playlist.playlist_id},
+        ),
+        HTTP_HX_REQUEST='true',
+    )
+    assert response.status_code == 200
+    assert Playlist.objects.count() == 0
+    for a in members:
+        a.refresh_from_db()
+        assert a.playlist_id is None
+    assert Asset.objects.count() == 2
+
+
+@pytest.mark.django_db
+def test_assets_bulk_playlist_assign_and_remove(client: Client) -> None:
+    playlist = _make_playlist()
+    assets = _make_assets(3)
+    ids = ','.join(a.asset_id for a in assets[:2])
+    response = client.post(
+        reverse('anthias_app:assets_bulk_playlist'),
+        data={'ids': ids, 'playlist_id': playlist.playlist_id},
+        HTTP_HX_REQUEST='true',
+    )
+    assert response.status_code == 200
+    for a in assets:
+        a.refresh_from_db()
+    assert assets[0].playlist_id == playlist.playlist_id
+    assert assets[1].playlist_id == playlist.playlist_id
+    assert assets[2].playlist_id is None
+
+    # The bulk bar's "Remove from playlist" sentinel clears membership.
+    response = client.post(
+        reverse('anthias_app:assets_bulk_playlist'),
+        data={'ids': ids, 'playlist_id': '__remove'},
+        HTTP_HX_REQUEST='true',
+    )
+    assert response.status_code == 200
+    for a in assets[:2]:
+        a.refresh_from_db()
+        assert a.playlist_id is None
+
+
+@pytest.mark.django_db
+def test_assets_bulk_playlist_unknown_playlist_toasts(
+    client: Client,
+) -> None:
+    assets = _make_assets(1)
+    response = client.post(
+        reverse('anthias_app:assets_bulk_playlist'),
+        data={'ids': assets[0].asset_id, 'playlist_id': 'nope'},
+        HTTP_HX_REQUEST='true',
+    )
+    assert response.status_code == 200
+    assert 'error' in response.headers.get('HX-Trigger', '')
+    assets[0].refresh_from_db()
+    assert assets[0].playlist_id is None
+
+
+@pytest.mark.django_db
+def test_assets_update_sets_and_clears_playlist(
+    client: Client, asset: Asset
+) -> None:
+    playlist = _make_playlist()
+    url = reverse(
+        'anthias_app:assets_update', kwargs={'asset_id': asset.asset_id}
+    )
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        client.post(
+            url,
+            data={
+                'name': asset.name,
+                'duration': '10',
+                'playlist_id': playlist.playlist_id,
+            },
+        )
+        asset.refresh_from_db()
+        assert asset.playlist_id == playlist.playlist_id
+
+        # Explicit empty value = "No playlist".
+        client.post(
+            url,
+            data={'name': asset.name, 'duration': '10', 'playlist_id': ''},
+        )
+        asset.refresh_from_db()
+        assert asset.playlist_id is None
+
+
+@pytest.mark.django_db
+def test_assets_update_ignores_unknown_playlist(
+    client: Client, asset: Asset
+) -> None:
+    playlist = _make_playlist()
+    asset.playlist = playlist
+    asset.save()
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        client.post(
+            reverse(
+                'anthias_app:assets_update',
+                kwargs={'asset_id': asset.asset_id},
+            ),
+            data={
+                'name': asset.name,
+                'duration': '10',
+                'playlist_id': 'deleted-meanwhile',
+            },
+        )
+    asset.refresh_from_db()
+    # Unknown id (playlist deleted while modal open) leaves membership.
+    assert asset.playlist_id == playlist.playlist_id
+
+
+@pytest.mark.django_db
+def test_asset_row_renders_playlist_badge(client: Client) -> None:
+    playlist = _make_playlist('Lobby screens')
+    _make_assets(1, playlist=playlist)
+    body = client.get(reverse('anthias_app:assets_table')).content.decode()
+    assert 'schedule-chip--playlist' in body
+    assert 'Lobby screens' in body
+
+
+@pytest.mark.django_db
+def test_to_json_includes_playlist_id(asset: Asset) -> None:
+    import json as _json
+
+    playlist = _make_playlist()
+    asset.playlist = playlist
+    asset.save()
+    blob = _json.loads(str(to_json(asset)))
+    assert blob['playlist_id'] == playlist.playlist_id
+
+
+@pytest.mark.django_db
+def test_playlist_options_filter_escapes_for_attribute() -> None:
+    from anthias_server.app.templatetags.asset_filters import (
+        playlist_options,
+    )
+
+    playlist = _make_playlist('A "quoted" & <named> playlist')
+    rendered = playlist_options([playlist])
+    # Plain str (not SafeString) so Django autoescaping keeps the
+    # double-quoted x-init attribute valid.
+    from django.utils.safestring import SafeString
+
+    assert not isinstance(rendered, SafeString)
+    import json as _json
+
+    parsed = _json.loads(rendered)
+    assert parsed == [
+        {
+            'id': playlist.playlist_id,
+            'name': 'A "quoted" & <named> playlist',
+        }
+    ]
+
+
+@pytest.mark.django_db
+def test_page_context_playlist_counts() -> None:
+    playlist = _make_playlist()
+    members = _make_assets(3, playlist=playlist)
+    members[2].is_enabled = False
+    members[2].save()
+    context = page_context.assets()
+    row = context['playlists'][0]
+    assert row.member_count == 3
+    assert row.enabled_count == 2
+    assert row.all_enabled is False

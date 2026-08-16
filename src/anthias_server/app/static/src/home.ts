@@ -40,6 +40,18 @@ interface AssetEdit {
   play_days_list: number[]
   play_time_from: string | null
   play_time_to: string | null
+  playlist_id: string | null
+}
+
+interface PlaylistOption {
+  id: string
+  name: string
+}
+
+interface PlaylistModalState {
+  mode: 'create' | 'rename'
+  id: string
+  name: string
 }
 
 type UploadState = null | 'sending' | 'processing'
@@ -67,6 +79,10 @@ interface HomeAppData {
   visibleIds: Record<SectionKey, string[]>
   bulkEditOpen: boolean
   bulkDeleteOpen: boolean
+  // Playlists (managed from the Schedule Overview)
+  playlists: PlaylistOption[]
+  playlistModal: PlaylistModalState | null
+  pendingPlaylistDelete: { id: string; name: string } | null
   init(): void
   openAdd(): void
   openEdit(asset: AssetEdit): void
@@ -82,6 +98,11 @@ interface HomeAppData {
   isSelected(id: string): boolean
   toggleSelect(id: string): void
   syncVisibleIds(activeIds: string[], inactiveIds: string[]): void
+  syncPlaylists(playlists: PlaylistOption[]): void
+  openPlaylistCreate(): void
+  openPlaylistRename(id: string, name: string): void
+  closePlaylistModal(): void
+  openPlaylistDelete(id: string, name: string): void
   sectionAllSelected(section: SectionKey): boolean
   sectionSomeSelected(section: SectionKey): boolean
   toggleSection(section: SectionKey, checked: boolean): void
@@ -143,6 +164,9 @@ function homeApp(): HomeAppData {
     visibleIds: { active: [], inactive: [] },
     bulkEditOpen: false,
     bulkDeleteOpen: false,
+    playlists: [],
+    playlistModal: null,
+    pendingPlaylistDelete: null,
 
     init(this: HomeAppData & { $watch: (k: string, cb: () => void) => void }) {
       // Re-bind Flatpickr every time the edit modal opens. The
@@ -294,6 +318,27 @@ function homeApp(): HomeAppData {
       this.visibleIds.inactive = inactiveIds
       const all = new Set([...activeIds, ...inactiveIds])
       this.selectedIds = this.selectedIds.filter((id) => all.has(id))
+    },
+
+    // --- Playlists -----------------------------------------------------
+    // Published from every table-partial render (same x-init hook as
+    // syncVisibleIds) so the bulk bar's select and the edit modal —
+    // which live outside the swapped partial — always offer the
+    // current playlist list.
+    syncPlaylists(playlists) {
+      this.playlists = playlists
+    },
+    openPlaylistCreate() {
+      this.playlistModal = { mode: 'create', id: '', name: '' }
+    },
+    openPlaylistRename(id, name) {
+      this.playlistModal = { mode: 'rename', id, name: name || '' }
+    },
+    closePlaylistModal() {
+      this.playlistModal = null
+    },
+    openPlaylistDelete(id, name) {
+      this.pendingPlaylistDelete = { id, name: name || '' }
     },
     // Build a Set for membership so these stay O(visible + selected)
     // rather than O(visible × selected) — a selection of thousands (the

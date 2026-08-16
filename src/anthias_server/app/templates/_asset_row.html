@@ -20,8 +20,14 @@
       </span>
       <span class="asset-cell-name__title">
         <span class="asset-cell-name__primary" title="{{ asset.name }}">{{ asset.name }}</span>
-        {% if pills %}
+        {% if pills or asset.playlist %}
         <span class="schedule-chips">
+          {% if asset.playlist %}
+          <span class="schedule-chip schedule-chip--playlist" title="In playlist {{ asset.playlist.name }}">
+            <i class="ti ti-playlist"></i>
+            <span>{{ asset.playlist.name }}</span>
+          </span>
+          {% endif %}
           {% for pill in pills %}
           <span class="schedule-chip schedule-chip--{{ pill.kind }}">
             {% if pill.kind == 'all' %}<i class="ti ti-calendar-check"></i>

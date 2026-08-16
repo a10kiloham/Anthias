@@ -1,0 +1,72 @@
+{% comment %} One playlist management row in the Schedule Overview's
+   Playlists section. `playlist` carries member_count / enabled_count /
+   all_enabled stamped by page_context.assets(). The toggle mirrors the
+   per-asset Activity switch pattern (plain form POST, server decides
+   the direction: any-disabled → enable all, else disable all).
+{% endcomment %}
+<tr data-playlist-id="{{ playlist.playlist_id }}" data-name="{{ playlist.name|default:''|escape }}">
+  <td data-label="Name" data-no-label>
+    <div class="asset-cell-name">
+      <span class="asset-cell-name__icon"><i class="ti ti-playlist"></i></span>
+      <span class="asset-cell-name__title">
+        <span class="asset-cell-name__primary" title="{{ playlist.name }}">{{ playlist.name }}</span>
+      </span>
+    </div>
+  </td>
+  <td data-label="Assets">
+    {% if playlist.member_count %}
+    {{ playlist.member_count }} asset{{ playlist.member_count|pluralize }}
+    {% if playlist.enabled_count != playlist.member_count %}
+    <span class="muted-label">· {{ playlist.enabled_count }} enabled</span>
+    {% endif %}
+    {% else %}
+    <span class="muted-label">Empty — select assets below and use “Add to playlist”</span>
+    {% endif %}
+  </td>
+  <td data-label="Enabled">
+    <form method="post" action="{% url 'anthias_app:playlists_toggle' playlist_id=playlist.playlist_id %}" class="m-0">
+      {% csrf_token %}
+      <div class="app-check app-switch activity-toggle m-0">
+        <input
+          type="checkbox"
+          class="app-check-input"
+          {% if playlist.all_enabled %}checked{% endif %}
+          {% if not playlist.member_count %}disabled{% endif %}
+          aria-label="Toggle all assets in {{ playlist.name|default:'playlist'|escape }}"
+          onchange="this.form.requestSubmit()"
+        >
+      </div>
+    </form>
+  </td>
+  <td class="text-right" data-label="Actions">
+    <div class="action-group">
+      <form
+        method="post"
+        action="{% url 'anthias_app:playlists_group' playlist_id=playlist.playlist_id %}"
+        hx-post="{% url 'anthias_app:playlists_group' playlist_id=playlist.playlist_id %}"
+        hx-target="#asset-table"
+        hx-swap="outerHTML"
+        class="inline m-0"
+      >
+        {% csrf_token %}
+        <button
+          type="submit"
+          class="app-btn app-btn-icon"
+          title="Play together — reorder the schedule so this playlist's assets play back-to-back"
+        ><i class="ti ti-stack-2"></i></button>
+      </form>
+      <button
+        type="button"
+        class="app-btn app-btn-icon"
+        title="Rename"
+        @click="openPlaylistRename('{{ playlist.playlist_id }}', '{{ playlist.name|default:''|escapejs }}')"
+      ><i class="ti ti-pencil"></i></button>
+      <button
+        type="button"
+        class="app-btn app-btn-icon"
+        title="Delete playlist (keeps its assets)"
+        @click="openPlaylistDelete('{{ playlist.playlist_id }}', '{{ playlist.name|default:''|escapejs }}')"
+      ><i class="ti ti-trash"></i></button>
+    </div>
+  </td>
+</tr>

@@ -17,7 +17,36 @@
      scope after every swap (x-init re-fires when this element is
      re-inserted). Drives the bulk select-all state + prunes a
      selection of rows that have since disappeared. {% endcomment %}
-  <div x-init="syncVisibleIds({{ active_assets|asset_ids }}, {{ inactive_assets|asset_ids }})" hidden></div>
+  <div x-init="syncVisibleIds({{ active_assets|asset_ids }}, {{ inactive_assets|asset_ids }}); syncPlaylists({{ playlists|playlist_options }})" hidden></div>
+
+  {% if playlists %}
+  <section id="playlists-section" class="surface">
+    <header class="surface__header">
+      <div class="surface__header-left">
+        <h2><i class="ti ti-playlist mr-2"></i>Playlists</h2>
+      </div>
+      <span class="surface__count">{{ playlists|length }} playlist{{ playlists|length|pluralize }}</span>
+    </header>
+    <table class="asset-table">
+      <thead>
+        <tr>
+          <th scope="col">Name</th>
+          <th scope="col" style="width: 32%">Assets</th>
+          <th scope="col" style="width: 8%">Enabled</th>
+          {% comment %} Same fixed-rem convention as the asset tables:
+             three 2.25rem icon buttons + two 0.35rem gaps + 2×0.75rem
+             cell padding ≈ 8.95rem. {% endcomment %}
+          <th scope="col" style="width: 9rem" class="text-right">Actions</th>
+        </tr>
+      </thead>
+      <tbody id="playlist-rows">
+        {% for playlist in playlists %}
+        {% include "_playlist_row.html" with playlist=playlist %}
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+  {% endif %}
 
   <section id="active-assets-section" class="surface surface--active">
     <header class="surface__header">

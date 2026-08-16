@@ -61,6 +61,39 @@
         <i class="ti ti-pencil"></i><span>Edit</span>
       </button>
 
+      {% comment %} Add-to-playlist select. Options come from the Alpine
+         `playlists` state (synced from every table-partial swap) rather
+         than a server render, because the bar itself never re-renders.
+         Auto-submits on choose; the placeholder is disabled so it can't
+         fire. '__remove' is the server-recognised clear-membership
+         sentinel. Hidden entirely while no playlists exist. {% endcomment %}
+      <form
+        method="post"
+        action="{% url 'anthias_app:assets_bulk_playlist' %}"
+        hx-post="{% url 'anthias_app:assets_bulk_playlist' %}"
+        hx-target="#asset-table"
+        hx-swap="outerHTML"
+        hx-on::after-request="if (window.bulkSucceeded(event)) { window.dispatchEvent(new CustomEvent('bulk-done')); } this.querySelector('select').selectedIndex = 0"
+        class="inline m-0"
+        x-show="playlists.length"
+      >
+        {% csrf_token %}
+        <input type="hidden" name="ids" :value="selectedIds.join(',')">
+        <label class="sr-only" for="bulk-playlist-select">Add to playlist</label>
+        <select
+          id="bulk-playlist-select"
+          name="playlist_id"
+          class="app-select bulk-bar__select"
+          @change="if ($event.target.value) $event.target.form.requestSubmit()"
+        >
+          <option value="" disabled selected>Add to playlist…</option>
+          <template x-for="p in playlists" :key="p.id">
+            <option :value="p.id" x-text="p.name"></option>
+          </template>
+          <option value="__remove">Remove from playlist</option>
+        </select>
+      </form>
+
       <button type="button" class="app-btn app-btn-danger app-btn-pill" @click="bulkDeleteOpen = true">
         <i class="ti ti-trash"></i><span>Delete</span>
       </button>

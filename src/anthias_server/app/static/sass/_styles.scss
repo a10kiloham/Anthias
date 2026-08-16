@@ -613,6 +613,11 @@ label { text-align: left; }
   --chip-all-bg:         var(--color-success-wash);
   --chip-all-text:       var(--color-success-text-on-wash);
   --chip-all-edge:       var(--color-success-edge);
+  // Playlist-membership badge: a stronger purple wash than the day
+  // chips so "grouping" reads differently from "schedule".
+  --chip-playlist-bg:    rgba(102, 51, 160, 0.14);
+  --chip-playlist-text:  var(--color-link);
+  --chip-playlist-edge:  rgba(102, 51, 160, 0.35);
 }
 .surface--active {
   // On the dark purple gradient: time-window neutral chips lift to
@@ -626,6 +631,11 @@ label { text-align: left; }
   --chip-all-edge:       var(--color-success-edge-strong);
   // --chip-day-* inherits the light-surface defaults; that palette
   // already reads cleanly on the gradient.
+  // Playlist badge flips to a light scrim so it stays legible on the
+  // dark purple gradient (the light-surface purple wash vanishes).
+  --chip-playlist-bg:    var(--scrim-on-dark-10);
+  --chip-playlist-text:  var(--color-text-on-dark);
+  --chip-playlist-edge:  var(--color-border-on-dark);
 }
 
 .schedule-chip {
@@ -652,6 +662,11 @@ label { text-align: left; }
   background: var(--chip-all-bg);
   color: var(--chip-all-text);
   border-color: var(--chip-all-edge);
+}
+.schedule-chip--playlist {
+  background: var(--chip-playlist-bg);
+  color: var(--chip-playlist-text);
+  border-color: var(--chip-playlist-edge);
 }
 
 // Schedule-window cell — replaces the prior pair of raw start/end
@@ -2554,6 +2569,28 @@ body.auth-body {
   align-items: center;
   gap: var(--space-2);
   flex-wrap: wrap;
+}
+// Add-to-playlist select: restyle .app-select for the dark pill bar
+// (compact height, pill radius, on-dark text) so it sits flush with
+// the neighbouring .app-btn-pill buttons.
+.bulk-bar__select {
+  width: auto;
+  height: auto;
+  padding: 0.45rem 2rem 0.45rem 0.9rem;
+  border-radius: var(--radius-pill);
+  font-size: 0.85rem;
+  font-weight: 600;
+  background-color: transparent;
+  color: var(--color-text-on-dark);
+  border: 1px solid var(--color-border-on-dark);
+  // White chevron — the default .app-select arrow is grey-on-light
+  // and disappears against the dark pill bar.
+  background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3e%3cpath fill='none' stroke='%23ffffff' stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='m2 5 6 6 6-6'/%3e%3c/svg%3e");
+
+  option {
+    // The dropdown list itself renders on the OS-native light panel.
+    color: var(--color-text);
+  }
 }
 .bulk-bar__clear {
   color: var(--color-text-on-dark);

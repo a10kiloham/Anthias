@@ -47,6 +47,31 @@ def _default_play_days() -> str:
     return json.dumps(ALL_DAYS)
 
 
+class Playlist(models.Model):
+    """A named group of assets managed from the Schedule Overview.
+
+    Membership lives on the Asset row (``Asset.playlist``) — the
+    playlist itself is just the label plus creation timestamp. The
+    viewer keeps playing whatever ``play_order`` says; grouping a
+    playlist's members so they play back-to-back is an explicit
+    operator action (the "Play together" button), not something the
+    model enforces.
+    """
+
+    playlist_id = models.TextField(
+        primary_key=True, default=generate_asset_id, editable=False
+    )
+    name = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'playlists'
+        ordering = ['name']
+
+    def __str__(self) -> str:
+        return str(self.name)
+
+
 class Asset(models.Model):
     asset_id = models.TextField(
         primary_key=True, default=generate_asset_id, editable=False
@@ -77,6 +102,17 @@ class Asset(models.Model):
     # None) so callers can ``asset.metadata['k'] = v`` without an
     # ``or {}`` guard.
     metadata = models.JSONField(default=dict, blank=True)
+    # Optional playlist membership. SET_NULL so deleting a playlist
+    # releases its members back to standalone assets instead of
+    # cascading the media away with the grouping.
+    playlist = models.ForeignKey(
+        Playlist,
+        blank=True,
+        null=True,
+        on_delete=models.SET_NULL,
+        related_name='assets',
+        db_column='playlist_id',
+    )
 
     class Meta:
         db_table = 'assets'
