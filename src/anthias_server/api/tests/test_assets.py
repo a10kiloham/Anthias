@@ -18,6 +18,7 @@ from anthias_server.api.tests.test_common import (
     ASSET_UPDATE_DATA_V2,
     get_request_data,
 )
+from anthias_server.app.models import DURATION_S_MAX
 
 
 @pytest.fixture
@@ -86,7 +87,11 @@ def _patched_youtube_dispatch() -> Iterator[dict[str, Any]]:
             'anthias_server.api.views.v1_2.dispatch_download'
         ) as v1_2_dispatch,
         mock.patch(
-            'anthias_server.api.views.v2.dispatch_download'
+            # v2's create view delegates persistence + dispatch to
+            # ``api.helpers.persist_new_asset`` (shared with the content
+            # importer), so the download hand-off is patched there rather
+            # than in the view module.
+            'anthias_server.api.helpers.dispatch_download'
         ) as v2_dispatch,
         mock.patch(
             'anthias_server.api.serializers.mixins.url_fails',
@@ -470,6 +475,182 @@ def test_v2_patch_refresh_interval_out_of_range_rejected(
 
 
 @pytest.mark.django_db
+@pytest.mark.parametrize(
+    'value',
+    [-1, DURATION_S_MAX + 1],
+    ids=['negative', 'over-one-year-cap'],
+)
+def test_v2_patch_duration_out_of_range_rejected(
+    api_client: APIClient, v2_asset_detail_url: str, value: int
+) -> None:
+    """Both bounds of the 0..DURATION_S_MAX range must 400 on write.
+    A stored duration past C ``PyTime_t`` range crash-loops the
+    viewer's ``Event.wait`` (Sentry ANTHIAS-3E — an operator entered
+    9999999999999 to mean "forever" and took the screen down)."""
+    response = api_client.patch(
+        v2_asset_detail_url,
+        data={'duration': value},
+        format='json',
+    )
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert 'duration' in response.data
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('version', ['v1', 'v1_1', 'v1_2', 'v2'])
+def test_create_asset_duration_out_of_range_rejected(
+    api_client: APIClient, version: str
+) -> None:
+    """Every create path must bound duration — the v1 family models it
+    as a CharField, so the range check lives in the prepare_asset
+    paths rather than on the field (Sentry ANTHIAS-3E)."""
+    response = api_client.post(
+        reverse(f'api:asset_list_{version}'),
+        data=get_request_data(
+            {**ASSET_CREATION_DATA, 'duration': 9999999999999}, version
+        ),
+    )
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('version', ['v1', 'v1_1', 'v1_2', 'v2'])
+def test_create_asset_non_integer_duration_rejected(
+    api_client: APIClient, version: str
+) -> None:
+    """A non-integer duration must be a keyed 400, not a 500 — the
+    v1.2 path used to let ``int('abc')`` escape as an unhandled
+    ValueError."""
+    response = api_client.post(
+        reverse(f'api:asset_list_{version}'),
+        data=get_request_data(
+            {**ASSET_CREATION_DATA, 'duration': 'abc'}, version
+        ),
+    )
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+
+@pytest.mark.django_db
+def test_v1_1_create_video_clamps_absurd_probed_duration(
+    api_client: APIClient,
+) -> None:
+    """A corrupted container header can advertise an out-of-range
+    length; the probe-inferred duration must be bounded like operator
+    input would be — clamped rather than rejected, since the file
+    itself is playable (Sentry ANTHIAS-3E)."""
+    from datetime import timedelta
+
+    from anthias_server.app.models import Asset
+
+    payload = {
+        **ASSET_CREATION_DATA,
+        'uri': '/data/anthias_assets/test-video.mp4',
+        'mimetype': 'video',
+        'duration': 0,
+    }
+    with (
+        mock.patch('anthias_server.processing.dispatch_normalize_video'),
+        mock.patch('anthias_server.processing.stamp_processing_start'),
+        mock.patch('anthias_server.api.serializers.v1_1.rename'),
+        mock.patch(
+            'anthias_server.api.serializers.v1_1.validate_uri',
+            return_value=True,
+        ),
+        mock.patch(
+            'anthias_server.api.serializers.v1_1.url_fails',
+            return_value=False,
+        ),
+        mock.patch(
+            'anthias_server.api.serializers.v1_1.get_video_duration',
+            return_value=timedelta(seconds=9999999999999),
+        ),
+    ):
+        response = api_client.post(
+            reverse('api:asset_list_v1_1'),
+            data=get_request_data(payload, 'v1_1'),
+        )
+    assert response.status_code == status.HTTP_201_CREATED
+    assert Asset.objects.get().duration == DURATION_S_MAX
+
+
+@pytest.mark.django_db
+def test_v1_2_create_stream_clamps_absurd_probed_duration(
+    api_client: APIClient,
+) -> None:
+    """Same as above for the mixin's probe path (v1.2/v2), reached via
+    a non-downloadable remote video URI."""
+    from datetime import timedelta
+
+    from anthias_server.app.models import Asset
+
+    payload = {
+        **ASSET_CREATION_DATA,
+        'uri': 'rtsp://example.com/stream',
+        'mimetype': 'video',
+        'duration': 0,
+    }
+    with (
+        mock.patch(
+            'anthias_server.api.serializers.mixins.url_fails',
+            return_value=False,
+        ),
+        mock.patch(
+            'anthias_server.api.serializers.mixins.get_video_duration',
+            return_value=timedelta(seconds=9999999999999),
+        ),
+    ):
+        response = api_client.post(
+            reverse('api:asset_list_v1_2'),
+            data=get_request_data(payload, 'v1_2'),
+        )
+    assert response.status_code == status.HTTP_201_CREATED
+    assert Asset.objects.get().duration == DURATION_S_MAX
+
+
+@pytest.mark.django_db
+def test_v1_2_create_video_non_integer_duration_rejected(
+    api_client: APIClient,
+) -> None:
+    """The video branch's zero-check parses the raw CharField value —
+    ``'abc'`` must be a keyed 400, not an unhandled ValueError."""
+    payload = {
+        **ASSET_CREATION_DATA,
+        'uri': 'rtsp://example.com/stream',
+        'mimetype': 'video',
+        'duration': 'abc',
+    }
+    with mock.patch(
+        'anthias_server.api.serializers.mixins.url_fails',
+        return_value=False,
+    ):
+        response = api_client.post(
+            reverse('api:asset_list_v1_2'),
+            data=get_request_data(payload, 'v1_2'),
+        )
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert 'duration' in str(response.data)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('version', ['v1', 'v1_1', 'v1_2', 'v2'])
+def test_update_asset_duration_out_of_range_rejected(
+    api_client: APIClient, version: str
+) -> None:
+    asset = _create_asset(api_client, ASSET_CREATION_DATA, version)
+
+    if version == 'v2':
+        data = ASSET_UPDATE_DATA_V2
+    else:
+        data = ASSET_UPDATE_DATA_V1_2
+
+    response = api_client.put(
+        reverse(f'api:asset_detail_{version}', args=[asset['asset_id']]),
+        data=get_request_data({**data, 'duration': 9999999999999}, version),
+    )
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+
+@pytest.mark.django_db
 def test_v2_patch_refresh_interval_preserves_pipeline_metadata(
     api_client: APIClient, v2_asset_detail_url: str
 ) -> None:
@@ -582,6 +763,193 @@ def test_v2_patch_refresh_interval_zero_disables(
     )
     assert response.status_code == status.HTTP_200_OK
     assert response.data['refresh_interval_s'] == 0
+
+
+# --- Per-asset custom HTTP request headers (feature #2215) -----------------
+
+
+@pytest.mark.django_db
+def test_v2_post_with_custom_headers_round_trips(
+    api_client: APIClient,
+) -> None:
+    """POST round-trip for per-asset custom request headers. Like
+    ``refresh_interval_s`` the value lives inside ``Asset.metadata``
+    (under ``headers``) but is surfaced as a top-level ``custom_headers``
+    field and accepted as a write field on create. Verify it lands on
+    the persisted row, not just on the echoed response."""
+    headers = {'Authorization': 'Bearer abc123', 'X-Env': 'prod'}
+    response = api_client.post(
+        reverse('api:asset_list_v2'),
+        data={**ASSET_CREATION_DATA, 'custom_headers': headers},
+        format='json',
+    )
+    assert response.status_code == status.HTTP_201_CREATED
+    assert response.data['custom_headers'] == headers
+    assert response.data['metadata'] == {'headers': headers}
+
+    asset_id = response.data['asset_id']
+    detail = api_client.get(reverse('api:asset_detail_v2', args=[asset_id]))
+    assert detail.status_code == status.HTTP_200_OK
+    assert detail.data['custom_headers'] == headers
+
+
+@pytest.mark.django_db
+def test_v2_post_without_custom_headers_defaults_to_empty(
+    api_client: APIClient,
+) -> None:
+    """A create without ``custom_headers`` reads back as ``{}`` and does
+    not stamp a ``headers`` key into ``metadata``."""
+    response = api_client.post(
+        reverse('api:asset_list_v2'),
+        data=ASSET_CREATION_DATA,
+        format='json',
+    )
+    assert response.status_code == status.HTTP_201_CREATED
+    assert response.data['custom_headers'] == {}
+    assert 'headers' not in response.data['metadata']
+
+
+@pytest.mark.django_db
+def test_v2_patch_custom_headers_round_trips(
+    api_client: APIClient, v2_asset_detail_url: str
+) -> None:
+    """PATCH a single ``custom_headers`` object and read it back."""
+    headers = {'Authorization': 'Bearer xyz'}
+    response = api_client.patch(
+        v2_asset_detail_url,
+        data={'custom_headers': headers},
+        format='json',
+    )
+    assert response.status_code == status.HTTP_200_OK
+    assert response.data['custom_headers'] == headers
+    assert response.data['metadata']['headers'] == headers
+
+
+@pytest.mark.django_db
+def test_v2_patch_custom_headers_empty_clears(
+    api_client: APIClient, v2_asset_detail_url: str
+) -> None:
+    """An empty object clears the headers: the ``headers`` key is popped
+    from ``metadata`` rather than stored as ``{}``."""
+    api_client.patch(
+        v2_asset_detail_url,
+        data={'custom_headers': {'Authorization': 'Bearer xyz'}},
+        format='json',
+    )
+    response = api_client.patch(
+        v2_asset_detail_url,
+        data={'custom_headers': {}},
+        format='json',
+    )
+    assert response.status_code == status.HTTP_200_OK
+    assert response.data['custom_headers'] == {}
+    assert 'headers' not in response.data['metadata']
+
+
+@pytest.mark.django_db
+def test_v2_patch_custom_headers_preserves_pipeline_metadata(
+    api_client: APIClient, v2_asset_detail_url: str
+) -> None:
+    """Setting headers must merge into ``metadata`` rather than clobber
+    the upload-pipeline-owned keys — same contract as
+    ``refresh_interval_s``."""
+    from anthias_server.app.models import Asset
+
+    asset_id = v2_asset_detail_url.rstrip('/').split('/')[-1]
+    asset = Asset.objects.get(asset_id=asset_id)
+    asset.metadata = {'original_ext': '.png', 'transcoded': True}
+    asset.save(update_fields=['metadata'])
+
+    response = api_client.patch(
+        v2_asset_detail_url,
+        data={'custom_headers': {'X-Token': 'v'}},
+        format='json',
+    )
+    assert response.status_code == status.HTTP_200_OK
+    assert response.data['metadata'] == {
+        'original_ext': '.png',
+        'transcoded': True,
+        'headers': {'X-Token': 'v'},
+    }
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'headers',
+    [
+        {'Bad Name': 'v'},  # space in name (not a token)
+        {'X-Inject': 'a\r\nEvil: 1'},  # CRLF injection in value
+        {'': 'v'},  # empty name
+        {'X-Colon:': 'v'},  # colon in name
+        {'X-Num': 123},  # non-string value must be rejected, not coerced
+        {'X-Bool': True},  # non-string value must be rejected, not coerced
+        {'X-Null': None},  # non-string value must be rejected
+    ],
+    ids=[
+        'space-in-name',
+        'crlf-in-value',
+        'empty-name',
+        'colon-in-name',
+        'numeric-value',
+        'bool-value',
+        'null-value',
+    ],
+)
+def test_v2_custom_headers_malformed_rejected(
+    api_client: APIClient,
+    v2_asset_detail_url: str,
+    headers: dict[str, Any],
+) -> None:
+    """The strict API write path 400s on any malformed header rather
+    than silently dropping it. CRLF-in-value is the security-critical
+    case (header/response splitting); the non-string cases guard against
+    DRF CharField coercing e.g. 123 -> "123" instead of rejecting it."""
+    response = api_client.patch(
+        v2_asset_detail_url,
+        data={'custom_headers': headers},
+        format='json',
+    )
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert 'custom_headers' in response.data
+
+
+@pytest.mark.django_db
+def test_v2_custom_headers_over_count_cap_rejected(
+    api_client: APIClient, v2_asset_detail_url: str
+) -> None:
+    """More than MAX_ASSET_HEADERS entries is a 400 (typo / abuse
+    guard on the D-Bus payload and header block size)."""
+    from anthias_server.app.models import MAX_ASSET_HEADERS
+
+    too_many = {f'X-H{i}': 'v' for i in range(MAX_ASSET_HEADERS + 1)}
+    response = api_client.patch(
+        v2_asset_detail_url,
+        data={'custom_headers': too_many},
+        format='json',
+    )
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert 'custom_headers' in response.data
+
+
+@pytest.mark.django_db
+def test_v2_get_sanitises_legacy_headers(
+    api_client: APIClient, v2_asset_detail_url: str
+) -> None:
+    """A hand-edited / legacy row with an unsafe header value must not
+    echo it back — the read path drops it via normalize_asset_headers."""
+    from anthias_server.app.models import Asset
+
+    asset_id = v2_asset_detail_url.rstrip('/').split('/')[-1]
+    asset = Asset.objects.get(asset_id=asset_id)
+    asset.metadata = {
+        'headers': {'Good': 'ok', 'Bad': 'x\r\ny', 'sp ace': 'v'}
+    }
+    asset.save(update_fields=['metadata'])
+
+    detail = api_client.get(reverse('api:asset_detail_v2', args=[asset_id]))
+    assert detail.status_code == status.HTTP_200_OK
+    assert detail.data['custom_headers'] == {'Good': 'ok'}
+    assert detail.data['metadata']['headers'] == {'Good': 'ok'}
 
 
 @pytest.mark.django_db
@@ -883,7 +1251,9 @@ def test_create_remote_video_url_dispatches_download_task(
     }
     asset_list_url = reverse(f'api:asset_list_{version}')
     dispatch_target = (
-        f'anthias_server.api.views.{version}.dispatch_remote_video_download'
+        'anthias_server.api.helpers.dispatch_remote_video_download'
+        if version == 'v2'
+        else f'anthias_server.api.views.{version}.dispatch_remote_video_download'
     )
     with (
         mock.patch(dispatch_target) as mock_dispatch,
@@ -985,7 +1355,9 @@ def test_create_stream_uri_stays_as_literal(
     }
     asset_list_url = reverse(f'api:asset_list_{version}')
     dispatch_target = (
-        f'anthias_server.api.views.{version}.dispatch_remote_video_download'
+        'anthias_server.api.helpers.dispatch_remote_video_download'
+        if version == 'v2'
+        else f'anthias_server.api.views.{version}.dispatch_remote_video_download'
     )
     with (
         mock.patch(dispatch_target) as mock_dispatch,

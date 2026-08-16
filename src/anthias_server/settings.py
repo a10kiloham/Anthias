@@ -1,6 +1,3 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
 import configparser
 import json
 import logging
@@ -12,6 +9,8 @@ from anthias_common.errors import ReplyTimeoutError
 
 if TYPE_CHECKING:
     import redis
+
+logger = logging.getLogger(__name__)
 
 VIEWER_CHANNEL = 'anthias.viewer'
 REPLY_KEY_PREFIX = 'anthias.reply.'
@@ -25,6 +24,13 @@ DEFAULTS = {
         'database': CONFIG_DIR + 'anthias.db',
         'date_format': 'mm/dd/yyyy',
         'splash_logo_url': '/static/img/logo-full-splash.svg',
+        # Operator-selected IANA timezone. Empty defers to the resolved
+        # default — see resolve_time_zone() in django_project/settings.py
+        # for the config -> TZ env -> /etc/timezone -> UTC precedence. Kept
+        # userspace on purpose: balenaOS has no host timezone (always
+        # UTC), so this is the only way to schedule/display in local
+        # time there.
+        'timezone': '',
         'use_24_hour_clock': False,
         'use_ssl': False,
         'auth_backend': '',
@@ -39,6 +45,16 @@ DEFAULTS = {
         # until it passes.
         'review_cta_dismissed': False,
         'review_cta_snooze_until': '',
+        # Scheduled display power (see lib/display_power.py). Times are
+        # 'HH:MM' in the device's configured timezone; days is a
+        # comma-separated list of Python weekday numbers (Monday=0)
+        # selecting the days an on-period *begins*. Off by default —
+        # a device that has always stayed on must not start switching
+        # itself off after an upgrade.
+        'display_power_schedule_enabled': False,
+        'display_power_on_time': '08:00',
+        'display_power_off_time': '18:00',
+        'display_power_days': '0,1,2,3,4,5,6',
     },
     'viewer': {
         'audio_output': 'hdmi',
@@ -60,8 +76,9 @@ CONFIGURABLE_SETTINGS['use_24_hour_clock'] = DEFAULTS['main'][
     'use_24_hour_clock'
 ]
 CONFIGURABLE_SETTINGS['date_format'] = DEFAULTS['main']['date_format']
+CONFIGURABLE_SETTINGS['timezone'] = DEFAULTS['main']['timezone']
 
-PORT = int(getenv('PORT', 8080))
+PORT = int(getenv('PORT', '8080'))
 LISTEN = getenv('LISTEN', '127.0.0.1')
 
 # Initiate logging
@@ -74,7 +91,7 @@ logging.basicConfig(
 requests_log = logging.getLogger('requests')
 requests_log.setLevel(logging.WARNING)
 
-logging.debug('Starting viewer')
+logger.debug('Starting viewer')
 
 
 class AnthiasSettings(UserDict[str, Any]):
@@ -87,14 +104,14 @@ class AnthiasSettings(UserDict[str, Any]):
             # Without HOME, all config/state paths (config file, DB,
             # asset dir) would silently resolve relative to the cwd.
             # Fail loudly instead of writing to unexpected locations.
-            raise EnvironmentError(
+            raise OSError(
                 'HOME environment variable must be set for AnthiasSettings.'
             )
         self.home = home
         self.conf_file = self.get_configfile()
 
         if not path.isfile(self.conf_file):
-            logging.error(
+            logger.error(
                 'Config-file %s missing. Using defaults.', self.conf_file
             )
             self.use_defaults()
@@ -117,7 +134,7 @@ class AnthiasSettings(UserDict[str, Any]):
             else:
                 self[field] = config.get(section, field)
         except configparser.Error as e:
-            logging.debug(
+            logger.debug(
                 "Could not parse setting '%s.%s': %s. "
                 "Using default value: '%s'.",
                 section,
@@ -145,7 +162,7 @@ class AnthiasSettings(UserDict[str, Any]):
 
     def load(self) -> None:
         """Loads the latest settings from anthias.conf into memory."""
-        logging.debug('Reading config-file...')
+        logger.debug('Reading config-file...')
         config = configparser.ConfigParser()
         config.read(self.conf_file)
 
@@ -188,7 +205,7 @@ class ViewerPublisher:
 
         from anthias_common.utils import connect_to_redis
 
-        self._redis: 'redis.Redis' = connect_to_redis()
+        self._redis: redis.Redis = connect_to_redis()
 
     @classmethod
     def get_instance(cls) -> 'ViewerPublisher':
@@ -197,7 +214,7 @@ class ViewerPublisher:
         return cls.INSTANCE
 
     def send_to_viewer(self, msg: str) -> None:
-        self._redis.publish(VIEWER_CHANNEL, 'viewer {}'.format(msg))
+        self._redis.publish(VIEWER_CHANNEL, f'viewer {msg}')
 
 
 class ReplySender:
@@ -230,7 +247,7 @@ class ReplyCollector:
 
         from anthias_common.utils import connect_to_redis
 
-        self._redis: 'redis.Redis' = connect_to_redis()
+        self._redis: redis.Redis = connect_to_redis()
 
     @classmethod
     def get_instance(cls) -> 'ReplyCollector':

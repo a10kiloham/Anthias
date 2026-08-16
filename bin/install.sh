@@ -22,6 +22,13 @@ DOCKER_TAG="latest"
 UPGRADE_SCRIPT_PATH="${ANTHIAS_REPO_DIR}/bin/upgrade_containers.sh"
 ARCHITECTURE=$(uname -m)
 
+# HTTP proxy support (GH #3239). Seeded from the environment and/or the
+# proxy prompt in configure_proxy(), then propagated to apt, Ansible, the
+# Docker daemon, and the containers. Empty means "no proxy".
+PROXY_HTTP=""
+PROXY_HTTPS=""
+PROXY_NO=""
+
 # Refresh the apt lists at most once. install.sh touches apt in two
 # places (install_prerequisites + install_packages), so without this
 # guard a minimal image missing whiptail would run two back-to-back
@@ -87,6 +94,17 @@ VERSION_PROMPT=(
 )
 SYSTEM_UPGRADE_PROMPT=(
     "Would you like to perform a full system upgrade as well?"
+)
+PROXY_PROMPT=(
+    "If this host reaches the internet only through an HTTP proxy, enter"
+    "its URL (for example http://proxy.example.com:3128). It is used for"
+    "both HTTP and HTTPS and applied across apt, Docker, and the Anthias"
+    "services. Leave blank if the host has direct internet access."
+)
+PROXY_NO_PROMPT=(
+    "Hosts or domains that should bypass the proxy, comma-separated"
+    "(optional). Anthias already excludes localhost and its own internal"
+    "services, so this is only for extra sites on your network."
 )
 
 TITLE_TEXT=$(cat <<EOF
@@ -340,6 +358,16 @@ function clone_repo() {
         echo "error: '${BRANCH}' is neither a tag nor a remote branch" >&2
         exit 1
     fi
+
+    # Warn before discarding local edits to tracked files (GH #3239
+    # point 3). The installer treats this checkout as disposable, but a
+    # silent reset --hard has surprised users mid-iteration. Untracked
+    # files are left untouched (no git clean).
+    if ! git -C "${ANTHIAS_REPO_DIR}" diff --quiet HEAD 2>/dev/null; then
+        echo "warning: discarding local changes to tracked files in" >&2
+        echo "         ${ANTHIAS_REPO_DIR} (git reset --hard ${RESET_REF})." >&2
+        echo "         Untracked files are left in place." >&2
+    fi
     git -C "${ANTHIAS_REPO_DIR}" reset --hard "${RESET_REF}"
 }
 
@@ -472,10 +500,20 @@ function run_ansible_playbook() {
 
     cd "${ANTHIAS_REPO_DIR}/ansible"
 
-    # If the user doesn't have NOPASSWD sudo yet (first install), Ansible
-    # needs --ask-become-pass to elevate. The blanket NOPASSWD rule is
-    # written by modify_permissions later in this script.
-    if [ ! -f "/etc/sudoers.d/010_${USER}-nopasswd" ]; then
+    # If the user can't elevate without a password, Ansible needs
+    # --ask-become-pass. Probe the actual sudo capability instead of
+    # looking for our own sudoers file (the blanket NOPASSWD rule that
+    # modify_permissions writes later): stock Raspberry Pi OS already
+    # grants the first user passwordless sudo via
+    # /etc/sudoers.d/010_pi-nopasswd — a fixed filename whatever the
+    # username — so a filename check misfires there and leaves Ansible
+    # prompting for a password that unattended runs can never type.
+    # `sudo -K` first drops any cached credential so a password typed
+    # for an earlier apt call can't masquerade as passwordless sudo;
+    # without it the playbook outlives the sudo timestamp and dies
+    # mid-run with "Missing sudo password" instead.
+    sudo -K
+    if ! sudo -n true 2>/dev/null; then
         ANSIBLE_PLAYBOOK_ARGS+=("--ask-become-pass")
         echo "Note: Ansible may prompt for your sudo password below."
         echo
@@ -486,6 +524,24 @@ function run_ansible_playbook() {
     # arm64 fallback (non-Pi 64-bit ARM SBCs).
     if [ "$ARCHITECTURE" == "x86_64" ] || [ "$DEVICE_TYPE" == "arm64" ]; then
         ANSIBLE_PLAYBOOK_ARGS+=("--skip-tags" "raspberry-pi")
+    fi
+
+    # Pass the install user explicitly rather than relying on the play's
+    # lookup('env','USER'): under sudo/become that env can resolve to root
+    # and render the host-agent unit with /home/root paths that don't
+    # exist, crash-looping it (GH #3239 point 5).
+    local ev="--extra-vars"
+    ANSIBLE_PLAYBOOK_ARGS+=("${ev}" "anthias_user=${USER}")
+
+    # Carry the proxy into the play (get_url/apt tasks) and the persistent
+    # host + runtime layers. An explicit -e is robust against sudo stripping
+    # the proxy env across the become boundary (GH #3239).
+    if [[ -n "${PROXY_HTTP}${PROXY_HTTPS}" ]]; then
+        ANSIBLE_PLAYBOOK_ARGS+=(
+            "${ev}" "anthias_http_proxy=${PROXY_HTTP}"
+            "${ev}" "anthias_https_proxy=${PROXY_HTTPS}"
+            "${ev}" "anthias_no_proxy=${PROXY_NO}"
+        )
     fi
 
     # Point Ansible at the venv's Python — we no longer install
@@ -499,6 +555,40 @@ function run_ansible_playbook() {
     sudo -E -u "${USER}" \
         "${INSTALLER_VENV}/bin/ansible-playbook" \
         site.yml "${ANSIBLE_PLAYBOOK_ARGS[@]}"
+}
+
+function stop_docker_stack() {
+    # Free the RAM held by the previous-version stack (server, viewer,
+    # webview, celery, redis) before the memory-intensive host work in
+    # the Ansible play: the apt dist-upgrade and, right after it,
+    # `swapoff --all`. With the stack resident, swapoff faults all swap
+    # back into RAM at once and the OOM-killer aborts the upgrade on
+    # memory-tight boards (issue #3165). Taking the stack down here also
+    # de-risks the dist-upgrade itself. upgrade_docker_containers brings
+    # everything back up (`up -d`) once the host work is done, and the
+    # install ends in a reboot regardless.
+    #
+    # No-op on a fresh install: there is no rendered compose file and
+    # nothing is running yet.
+    local compose_file="${ANTHIAS_REPO_DIR}/docker-compose.yml"
+    if [ ! -f "${compose_file}" ]; then
+        return 0
+    fi
+
+    display_section "Stop Docker Containers (free memory for the upgrade)"
+
+    local compose_files=(-f "${compose_file}")
+    local ssl_override="${ANTHIAS_REPO_DIR}/docker-compose.ssl.override.yml"
+    if [ -f "${ssl_override}" ]; then
+        compose_files+=(-f "${ssl_override}")
+    fi
+
+    # Best-effort: a leftover/mismatched compose file from an older
+    # release must not abort the upgrade, so tolerate a non-zero exit.
+    # --remove-orphans also sweeps containers from services since renamed
+    # or removed from the compose file.
+    sudo docker compose "${compose_files[@]}" down --remove-orphans \
+        || true
 }
 
 function upgrade_docker_containers() {
@@ -630,9 +720,83 @@ function set_custom_version() {
     fi
 }
 
+# Write (or remove) the apt proxy config so install.sh's own `sudo apt-get`
+# calls go through the proxy. Those run via bare `sudo` (no -E), so they
+# never see the shell's proxy env — apt needs its own config. This is the
+# same path the ansible system role manages (proxy.yml), so the two stay
+# consistent.
+function apply_proxy_apt_conf() {
+    local conf=/etc/apt/apt.conf.d/00anthias-proxy
+    if [[ -n "${PROXY_HTTP}${PROXY_HTTPS}" ]]; then
+        # Reuse whichever scheme is set for the other if only one is given.
+        local http_p="${PROXY_HTTP:-${PROXY_HTTPS}}"
+        local https_p="${PROXY_HTTPS:-${PROXY_HTTP}}"
+        sudo tee "${conf}" >/dev/null <<EOF
+// Managed by Anthias — HTTP proxy support (GH #3239).
+Acquire::http::Proxy "${http_p}";
+Acquire::https::Proxy "${https_p}";
+EOF
+    elif [[ -f "${conf}" ]]; then
+        sudo rm -f "${conf}"
+    fi
+}
+
+# HTTP proxy support (GH #3239). Seed the proxy from the environment, let
+# the user enter/confirm it (when whiptail is available), then propagate:
+# export both-case vars so this script's curl/git/uv honour them, write the
+# apt proxy config, and stash the values for the Ansible extra-vars (see
+# run_ansible_playbook), which carry them to every host/runtime layer.
+#
+# Runs before install_prerequisites/require_network so a proxied host can
+# fetch prerequisites and reach GitHub. A proxy-only host that does not yet
+# have whiptail must export the proxy before running install.sh; that env
+# is honoured here regardless of the prompt.
+function configure_proxy() {
+    PROXY_HTTP="${HTTP_PROXY:-${http_proxy:-}}"
+    PROXY_HTTPS="${HTTPS_PROXY:-${https_proxy:-}}"
+    PROXY_NO="${NO_PROXY:-${no_proxy:-}}"
+
+    if command -v whiptail >/dev/null 2>&1; then
+        local prefill="${PROXY_HTTP:-${PROXY_HTTPS}}"
+        local entered
+        # Cancel/Esc keeps the seeded value rather than wiping it.
+        entered=$(
+            whiptail \
+                --title "Anthias Installer" \
+                --inputbox "${PROXY_PROMPT[*]}" 13 78 "${prefill}" \
+                3>&1 1>&2 2>&3
+        ) || entered="${prefill}"
+        PROXY_HTTP="${entered}"
+        PROXY_HTTPS="${entered}"
+
+        if [[ -n "${PROXY_HTTP}" ]]; then
+            local entered_no
+            entered_no=$(
+                whiptail \
+                    --title "Anthias Installer" \
+                    --inputbox "${PROXY_NO_PROMPT[*]}" 12 78 "${PROXY_NO}" \
+                    3>&1 1>&2 2>&3
+            ) || entered_no="${PROXY_NO}"
+            PROXY_NO="${entered_no}"
+        fi
+    fi
+
+    # Export for this script's own proxy-honouring tools (curl, git, uv).
+    if [[ -n "${PROXY_HTTP}${PROXY_HTTPS}" ]]; then
+        export HTTP_PROXY="${PROXY_HTTP}" HTTPS_PROXY="${PROXY_HTTPS}" \
+            NO_PROXY="${PROXY_NO}"
+        export http_proxy="${PROXY_HTTP}" https_proxy="${PROXY_HTTPS}" \
+            no_proxy="${PROXY_NO}"
+    fi
+
+    apply_proxy_apt_conf
+}
+
 function main() {
     require_supported_environment
     set_device_type
+
+    configure_proxy
 
     install_prerequisites && clear
 
@@ -719,6 +883,7 @@ function main() {
     post_clone_migrate_legacy_paths
     install_ansible
     provision_host_agent_venv
+    stop_docker_stack
     run_ansible_playbook
 
     upgrade_docker_containers

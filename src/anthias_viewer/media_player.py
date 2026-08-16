@@ -4,6 +4,7 @@ import re
 import signal
 import subprocess
 import sys
+import time
 from typing import Any, ClassVar
 from urllib.parse import quote
 
@@ -12,6 +13,7 @@ from anthias_common.device_helper import get_device_type
 from anthias_common.utils import clamp_screen_rotation
 from anthias_server.settings import settings
 
+logger = logging.getLogger(__name__)
 
 # Lazy import for the pydbus proxy: the viewer service hands
 # MPVMediaPlayer the same ``browser_bus`` object it uses for
@@ -118,7 +120,7 @@ def _detect_hdmi_audio_device() -> str:
     try:
         entries = list(os.scandir('/sys/class/drm'))
     except OSError as exc:
-        logging.debug('Could not scan /sys/class/drm: %s', exc)
+        logger.debug('Could not scan /sys/class/drm: %s', exc)
         entries = []
 
     hdmi_to_alsa = {'HDMI-A-1': 'vc4hdmi0', 'HDMI-A-2': 'vc4hdmi1'}
@@ -126,7 +128,7 @@ def _detect_hdmi_audio_device() -> str:
     # `os.DirEntry[str]` is subscriptable on 3.9+, but quoting it keeps
     # this module loadable on any interpreter without depending on
     # PEP-585 runtime support.
-    ports: 'list[tuple[str, os.DirEntry[str]]]' = []
+    ports: list[tuple[str, os.DirEntry[str]]] = []
     for entry in entries:
         for suffix in hdmi_to_alsa:
             if entry.name.endswith(suffix):
@@ -149,7 +151,7 @@ def _detect_hdmi_audio_device() -> str:
                     detected_card = card_name
                     break
         except OSError as exc:
-            logging.debug(
+            logger.debug(
                 'HDMI status read failed for %s: %s', status_path, exc
             )
 
@@ -157,13 +159,13 @@ def _detect_hdmi_audio_device() -> str:
     if detected_card is not None:
         device = f'sysdefault:CARD={detected_card}'
         if device != _last_detected_device:
-            logging.info(
+            logger.info(
                 'Detected connected HDMI: %s -> %s',
                 detected_entry_name,
                 device,
             )
         else:
-            logging.debug(
+            logger.debug(
                 'Detected connected HDMI: %s -> %s',
                 detected_entry_name,
                 device,
@@ -175,88 +177,341 @@ def _detect_hdmi_audio_device() -> str:
     if device != _last_detected_device:
         # First call, or we just lost a previously detected
         # connection — be loud so the cause is visible in logs.
-        logging.warning(
+        logger.warning(
             'No connected HDMI detected, falling back to %s', device
         )
     else:
-        logging.debug('No connected HDMI detected, falling back to %s', device)
+        logger.debug('No connected HDMI detected, falling back to %s', device)
     _last_detected_device = device
     return device
 
 
-# Once-per-process flag for _log_arm64_alsa_default_once() — we don't
-# want every play() call repeating the same INFO line.
-_arm64_alsa_logged = False
+# Last (audio_output, sink) `_resolve_pulse_sink()` resolved in this
+# process, so a stable resolution doesn't repeat the same INFO/WARNING
+# line on every play()/set_asset() call — only transitions (a different
+# setting or a different resolved sink) are logged loudly.
+_last_pulse_resolution: tuple[str, str] | None = None
 
 
-def _log_arm64_alsa_default_once() -> None:
-    """Log the kernel's ALSA card listing so silent-HDMI reports are
-    debuggable from journalctl alone. Reads /proc/asound/cards (always
-    present when sound is registered) rather than shelling to
-    `aplay -l` — the viewer image deliberately doesn't ship
-    alsa-utils, so the subprocess form would always fall through to
-    a "not found" error and surface no useful info.
+def _pi_alsa_device(device_type: str, audio_output: str) -> str | None:
+    """Resolve the fixed ALSA card name for a Raspberry Pi board.
+
+    Pi firmware exposes stable card names (``vc4hdmi*`` for HDMI,
+    ``Headphones`` for the 3.5 mm jack), so the audio_output setting
+    maps straight onto them. The Pi 5 has no analog jack, so its
+    ``local`` selection also resolves to the connected HDMI device
+    (the UI hides the 3.5 mm option there). Returns ``None`` for any
+    non-Pi board (x86, arm64 SBCs) whose card names aren't portable —
+    the caller then falls through to runtime PulseAudio sink discovery.
     """
-    global _arm64_alsa_logged
-    if _arm64_alsa_logged:
-        return
-    _arm64_alsa_logged = True
+    if audio_output == 'local':
+        if device_type == 'pi5':
+            return _detect_hdmi_audio_device()
+        if device_type in ('pi1', 'pi2', 'pi3', 'pi4'):
+            return 'plughw:CARD=Headphones'
+        return None
+
+    # 'hdmi' (the default for any other value)
+    if device_type in ('pi4', 'pi5'):
+        return _detect_hdmi_audio_device()
+    if device_type in ('pi1', 'pi2', 'pi3'):
+        return 'sysdefault:CARD=vc4hdmi'
+    return None
+
+
+# get_alsa_audio_device() runs on every play()/set_asset(), so the sink
+# listing is cached for a short window to keep a fast-rotating playlist
+# from spawning a `pactl` subprocess per asset transition. The TTL is
+# short enough that an HDMI hotplug (sink appears/disappears) is picked
+# up within a few seconds. Only successful lists are cached — a transient
+# pactl failure retries on the next call rather than latching an empty
+# list.
+_SINK_CACHE_TTL_SECONDS = 5.0
+_sink_cache: tuple[float, list[str]] | None = None
+
+
+def _invalidate_sink_cache() -> None:
+    global _sink_cache
+    _sink_cache = None
+
+
+def _list_pulse_sinks() -> list[str]:
+    """Return the sink names the running PulseAudio daemon exposes.
+
+    Uses ``pactl`` (pulseaudio-utils, which the viewer image ships —
+    unlike alsa-utils/``aplay``). The viewer process already runs with
+    ``XDG_RUNTIME_DIR`` pointed at the pulse socket that
+    start_pulseaudio() created, so the child inherits it. Result is
+    cached for ``_SINK_CACHE_TTL_SECONDS``. Returns an empty list if
+    pulse is unreachable.
+    """
+    global _sink_cache
+    now = time.monotonic()
+    if (
+        _sink_cache is not None
+        and now - _sink_cache[0] < _SINK_CACHE_TTL_SECONDS
+    ):
+        return _sink_cache[1]
+
     try:
-        with open('/proc/asound/cards') as f:
-            listing = f.read().strip() or '<no cards registered>'
-    except OSError as exc:
-        listing = f'<could not read /proc/asound/cards: {exc}>'
-    logging.info(
-        'arm64: using the default audio device for HDMI audio '
-        '(resolves to the PulseAudio default sink — see '
-        'start_pulseaudio in bin/start_viewer.sh). If audio is '
-        'silent, check `pactl list short sinks` in the viewer '
-        'container. Registered ALSA cards:\n%s',
-        listing,
+        completed = subprocess.run(
+            ['pactl', 'list', 'short', 'sinks'],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug('Could not list PulseAudio sinks: %s', exc)
+        return []
+
+    sinks = []
+    for line in completed.stdout.splitlines():
+        # `pactl list short sinks` is tab-separated:
+        # index<TAB>name<TAB>module<TAB>sample-spec<TAB>state
+        fields = line.split('\t')
+        if len(fields) >= 2 and fields[1]:
+            sinks.append(fields[1])
+    _sink_cache = (now, sinks)
+    return sinks
+
+
+# Profile/sink name tokens that identify each output. module-alsa-card
+# names both its sinks (``alsa_output.<card>.hdmi-stereo``) and its
+# profiles (``output:hdmi-stereo``) after the same standardised token,
+# so one keyword set matches both. The token — not the card name — is
+# the HDMI-vs-analog discriminator: the Dell Latitude in forum #6749
+# puts both an analog and an HDMI output on the *same* HDA card.
+_ANALOG_KEYWORDS = ('analog', 'headphone', 'speaker', 'lineout')
+_HDMI_KEYWORDS = ('hdmi', 'displayport', 'iec958')
+
+
+def _output_keywords(audio_output: str) -> tuple[str, ...]:
+    return _ANALOG_KEYWORDS if audio_output == 'local' else _HDMI_KEYWORDS
+
+
+def _select_pulse_sink(sinks: list[str], audio_output: str) -> str | None:
+    """Pick the sink matching the requested output, or ``None``.
+
+    `pactl list short sinks` order isn't guaranteed, so a stable
+    preference is applied among all matches: plain ``*-stereo`` first,
+    then any non-surround sink, then lexical. That keeps a multi-HDMI
+    box (hdmi-stereo, hdmi-surround, hdmi-stereo-extra1, …) from picking
+    a surround or secondary port unpredictably.
+    """
+    keywords = _output_keywords(audio_output)
+    matches = [
+        sink
+        for sink in sinks
+        if any(keyword in sink.lower() for keyword in keywords)
+    ]
+    if not matches:
+        return None
+    return min(
+        matches,
+        key=lambda sink: (
+            0 if 'stereo' in sink.lower() else 1,
+            1 if 'surround' in sink.lower() else 0,
+            sink,
+        ),
     )
 
 
-def get_alsa_audio_device() -> str:
-    # device_helper.get_device_type() reads /proc/device-tree/model and
-    # falls back to 'pi1' for any aarch64 host whose model line isn't a
-    # Pi regex match (Rock Pi, Orange Pi, Banana Pi, …). The Pi-firmware
-    # ALSA card names below (vc4hdmi*, "Headphones") don't exist on
-    # those boards, so route via DEVICE_TYPE env first and only fall
-    # through to the Pi-name dispatch when we're actually on a Pi.
-    if os.environ.get('DEVICE_TYPE') in ARM64_DEVICE_TYPES:
-        # No portable per-SoC HDMI card name across Rockchip /
-        # Allwinner / Amlogic, so defer to the `default` device —
-        # which VideoView::resolveAlsaDevice resolves to the
-        # PulseAudio default sink (the daemon start_viewer.sh runs;
-        # Debian's Qt 6 Multimedia only has a PulseAudio backend).
-        # Log the chosen device at INFO once per process so a
-        # silent-HDMI report carries enough breadcrumbs to debug
-        # from journalctl alone.
-        _log_arm64_alsa_default_once()
-        return 'default'
+class _PulseCard:
+    """A PulseAudio card, its active profile, and its *pure output*
+    profiles (``output:<token>-…`` with no ``+input:`` half) keyed to
+    whether that profile is available.
 
-    device_type = get_device_type()
-    if settings['audio_output'] == 'local':
-        if device_type == 'pi5':
-            return _detect_hdmi_audio_device()
+    Only pure-output profiles are tracked because a combined
+    ``output:hdmi-stereo+input:analog-stereo`` profile reports
+    ``available: yes`` whenever the analog *input* is usable, even
+    when the HDMI output itself is unavailable (forum #6749). The
+    pure-output profile's availability reflects only the output port,
+    so it is the honest signal for "can this output actually play".
+    """
 
-        return 'plughw:CARD=Headphones'
-    else:
-        if device_type in ['pi4', 'pi5']:
-            return _detect_hdmi_audio_device()
-        elif device_type in ['pi1', 'pi2', 'pi3']:
-            return 'sysdefault:CARD=vc4hdmi'
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.active_profile: str | None = None
+        self.output_profiles: dict[str, bool] = {}
+
+
+def _list_pulse_cards() -> list[_PulseCard]:
+    """Parse ``pactl list cards`` into `_PulseCard` records."""
+    try:
+        completed = subprocess.run(
+            ['pactl', 'list', 'cards'],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug('Could not list PulseAudio cards: %s', exc)
+        return []
+
+    cards: list[_PulseCard] = []
+    current: _PulseCard | None = None
+    # Pure-output profile line, e.g.:
+    #   output:hdmi-stereo: Digital Stereo (HDMI) ... available: no)
+    # Excludes ports (they don't start with "output:") and combined
+    # output+input profiles (they contain "+input:").
+    profile_re = re.compile(
+        r'^(output:[A-Za-z0-9._-]+):.*available:\s*(yes|no|unknown)\)',
+    )
+    for raw in completed.stdout.splitlines():
+        line = raw.strip()
+        if line.startswith('Name:'):
+            name = line.split(':', 1)[1].strip()
+            current = _PulseCard(name)
+            cards.append(current)
+        elif current is None:
+            continue
+        elif line.startswith('Active Profile:'):
+            current.active_profile = line.split(':', 1)[1].strip()
         else:
-            # x86 fallback: ALSA card names vary across Intel / AMD /
-            # Nvidia HDA chipsets, so there's no portable per-SoC name
-            # to hard-code (the old 'sysdefault:CARD=HID' matched no
-            # real card on standard HDA setups). Defer to the `default`
-            # device — which VideoView::resolveAlsaDevice resolves to
-            # the PulseAudio default sink (x86 is a Qt 6 board and
-            # Debian's Qt 6 Multimedia only has a PulseAudio backend;
-            # the daemon is started by start_viewer.sh). Mirrors the
-            # ARM64 path above.
-            return 'default'
+            match = profile_re.match(line)
+            if match:
+                profile, avail = match.group(1), match.group(2)
+                # Only a definite ``yes`` counts as available. ``unknown``
+                # (driver can't probe the port) is not a confirmation, so
+                # we don't switch to it — that could swap a working analog
+                # profile for a dead HDMI one.
+                current.output_profiles[profile] = avail == 'yes'
+    return cards
+
+
+def _activate_output_profile(audio_output: str) -> bool:
+    """Activate a card profile for the requested output if one is
+    available but not currently active. Returns True when a profile
+    was switched (so the caller should re-list sinks).
+
+    Needed on single-card HDA systems (laptops/desktops — the forum
+    #6749 topology) where PulseAudio instantiates only the *active*
+    profile's sink, so `pactl list short sinks` never shows the HDMI
+    sink while analog is active, and vice versa. Multi-card boards
+    (Rock Pi's separate ``hdmisound``/``Analog`` cards, a discrete
+    HDMI card next to onboard analog) already expose both sinks, so
+    nothing is switched.
+    """
+    keywords = _output_keywords(audio_output)
+    for card in _list_pulse_cards():
+        # Prefer a plain ``*-stereo`` output; fall back to any
+        # available surround variant for the requested output.
+        candidates = sorted(
+            (
+                profile
+                for profile, available in card.output_profiles.items()
+                if available and any(k in profile for k in keywords)
+            ),
+            key=lambda profile: (0 if 'stereo' in profile else 1, profile),
+        )
+        if not candidates:
+            continue
+        target = candidates[0]
+        if card.active_profile == target:
+            return False
+        try:
+            subprocess.run(
+                ['pactl', 'set-card-profile', card.name, target],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=True,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning(
+                'Could not activate profile %r on card %r: %s',
+                target,
+                card.name,
+                exc,
+            )
+            return False
+        logger.info(
+            'audio_output=%r: activated card %r profile %r to expose its sink',
+            audio_output,
+            card.name,
+            target,
+        )
+        return True
+    return False
+
+
+def _resolve_pulse_sink(audio_output: str) -> str:
+    """Map the audio_output setting onto a live PulseAudio sink.
+
+    x86 and arm64 SBCs run Qt 6 Multimedia, whose only backend on
+    Debian is PulseAudio, and have no portable per-SoC ALSA card name.
+    Rather than hard-code one (the old code returned ``default`` and so
+    always followed whatever sink pulse defaulted to — issue #3208), we
+    ask the running daemon which sinks exist and route the setting to
+    the matching one. The bare sink name is returned;
+    ``_build_video_options`` prepends ``alsa/`` and
+    ``VideoView::resolveAlsaDevice`` matches it against
+    ``QAudioDevice::id()``.
+
+    If the requested sink isn't currently instantiated, try to
+    activate the matching card profile (single-card HDA systems only
+    expose the active profile's sink) and re-list. Falls back to
+    ``default`` — the PulseAudio default sink — when pulse is
+    unreachable or no sink matches, preserving the previous behaviour
+    rather than silencing audio.
+    """
+    sinks = _list_pulse_sinks()
+    chosen = _select_pulse_sink(sinks, audio_output)
+
+    # Only attempt a profile switch when pulse gave us a sink list but
+    # none matched (the single-card HDA case always has ≥1 active sink).
+    # An empty list means pulse is unreachable, so probing `pactl list
+    # cards` would just fail again — skip it and fall back to default.
+    if chosen is None and sinks and _activate_output_profile(audio_output):
+        # Switching the card profile instantiated a new sink; drop the
+        # cached listing so the fresh sink is picked up this call.
+        _invalidate_sink_cache()
+        sinks = _list_pulse_sinks()
+        chosen = _select_pulse_sink(sinks, audio_output)
+
+    result = chosen if chosen is not None else 'default'
+
+    # Key the log suppression on (setting, result) so a setting change
+    # that resolves to the same sink (e.g. hdmi→local both falling back
+    # to default) still logs once, staying correlatable in the journal.
+    global _last_pulse_resolution
+    if (audio_output, result) != _last_pulse_resolution:
+        if chosen is not None:
+            logger.info(
+                'audio_output=%r routed to PulseAudio sink %r',
+                audio_output,
+                chosen,
+            )
+        else:
+            logger.warning(
+                'audio_output=%r: no matching PulseAudio sink among %s; '
+                'falling back to the default sink. Check '
+                '`pactl list short sinks` in the viewer container.',
+                audio_output,
+                sinks or '<none>',
+            )
+        _last_pulse_resolution = (audio_output, result)
+    return result
+
+
+def get_alsa_audio_device() -> str:
+    audio_output = settings['audio_output']
+
+    # Raspberry Pi boards have stable, portable ALSA card names, so the
+    # setting maps directly onto them. get_device_type() reads
+    # /proc/device-tree/model; the ARM64_DEVICE_TYPES env gate keeps
+    # non-Pi aarch64 boards (Rock Pi, Orange Pi, …) — which
+    # get_device_type() would misclassify as 'pi1' — out of the Pi
+    # dispatch and on the PulseAudio path below.
+    if os.environ.get('DEVICE_TYPE') not in ARM64_DEVICE_TYPES:
+        pi_device = _pi_alsa_device(get_device_type(), audio_output)
+        if pi_device is not None:
+            return pi_device
+
+    # x86 + arm64 SBCs: resolve the setting against a live pulse sink.
+    return _resolve_pulse_sink(audio_output)
 
 
 class MediaPlayer:
@@ -313,16 +568,19 @@ def _build_video_options(uri: str) -> dict[str, Any]:
     ``docker/_rpt1-ffmpeg-pin.j2`` carry ``--enable-v4l2-request``
     / ``--enable-v4l2-m2m``, so libavcodec engages the Pi-family
     hardware decoders automatically — the application no longer
-    dispatches per-codec hwdec. The options dict shrinks to:
+    dispatches per-codec hwdec. The options dict shrinks to a single
+    entry:
 
     * ``audio-device`` — ALSA device name. C++ side strips the
       ``alsa/`` prefix and extracts the ``CARD=<name>`` segment
       to look up the matching ``QAudioDevice``.
-    * ``video-rotate`` — Pi 4 only. Cage / wayland boards inherit
-      the transform from wlr-randr at the compositor level;
-      sending ``video-rotate`` on top would double-rotate. Sent
-      as a Python ``int`` (was ``str`` before — the type-aware
-      ``_marshal_dbus_options`` now serialises both correctly).
+
+    No ``video-rotate`` is sent: every Qt6 board now rotates at the
+    platform/compositor layer, so a per-video rotate option would
+    double-rotate. See the body comment for the per-board detail
+    (eglfs QT_QPA_EGLFS_ROTATION, wlroots wlr-randr, and the pi3-64
+    vc4-overlay special case). ``_marshal_dbus_options`` still
+    type-marshals any option should one be reintroduced.
 
     The ``uri`` argument is kept on the signature for symmetry
     with the libmpv era (where it fed ffprobe). It's no longer
@@ -335,13 +593,20 @@ def _build_video_options(uri: str) -> dict[str, Any]:
         'audio-device': f'alsa/{get_alsa_audio_device()}',
     }
 
-    # No per-video rotation here. Every Qt6 board now rotates at the
-    # platform layer and the QGraphicsVideoItem inherits the transform:
-    # cage/wlroots (x86) via wlr-randr (issue #2856) and eglfs (pi4-64)
-    # via QT_QPA_EGLFS_ROTATION (set in _build_webview_env). Sending
-    # ``video-rotate`` on top of either would double-rotate the frames.
-    # linuxfb boards (pi1/2/3) apply rotation through the GStreamer
-    # ``videoflip`` element in GstFbdevMediaPlayer instead.
+    # No per-video rotation here. Every Qt6 board rotates at the platform
+    # layer and the video (QML VideoOutput / raster widget) inherits the
+    # transform: cage/wlroots (x86) via wlr-randr (issue #2856) and eglfs
+    # (pi4-64) via QT_QPA_EGLFS_ROTATION (set in _build_webview_env).
+    # Sending ``video-rotate`` on top of either would double-rotate the
+    # frames. linuxfb boards (pi1/2/3) apply rotation through the
+    # GStreamer ``videoflip`` element in GstFbdevMediaPlayer instead.
+    # pi3-64 is the one board whose fast video path (a vc4 DRM overlay
+    # plane) is NOT rotated by the compositor. It's handled without
+    # ``video-rotate`` (forum 6730): the vc4 plane can HW-rotate 0°/180°,
+    # so _build_webview_env keeps the overlay for those and VideoView sets
+    # the plane's rotation=180 property; for 90°/270° (no HW plane
+    # rotation) it drops the overlay so the eglfs-composited raster
+    # fallback rotates the frames instead.
     return options
 
 
@@ -370,7 +635,7 @@ class MPVMediaPlayer(MediaPlayer):
 
         bus = get_browser_bus()
         if bus is None:
-            logging.error(
+            logger.error(
                 'MPVMediaPlayer.play: AnthiasViewer D-Bus proxy not '
                 'set — call set_browser_bus() after the webview '
                 'handshake (src/anthias_viewer/__init__.py).'
@@ -387,12 +652,12 @@ class MPVMediaPlayer(MediaPlayer):
                 lambda: bus.playVideo(self.uri, _marshal_dbus_options(options))
             )
             self._playing = True
-        except Exception as exc:
+        except Exception:
             # pydbus surfaces transport / signature errors as
             # generic exceptions. Log + clear local state so a
             # transient AnthiasViewer crash doesn't leave the
             # player thinking a video is on screen.
-            logging.error('MPVMediaPlayer.play failed: %s', exc)
+            logger.exception('MPVMediaPlayer.play failed')
             self._playing = False
 
     def stop(self) -> None:
@@ -402,8 +667,8 @@ class MPVMediaPlayer(MediaPlayer):
             return
         try:
             _call_webview(lambda: bus.stopVideo())
-        except Exception as exc:
-            logging.error('MPVMediaPlayer.stop failed: %s', exc)
+        except Exception:
+            logger.exception('MPVMediaPlayer.stop failed')
 
     def is_playing(self) -> bool:
         return self._playing
@@ -564,7 +829,7 @@ class GstFbdevMediaPlayer(MediaPlayer):
     def play(self) -> None:
         self.stop()  # never leave a previous pipeline holding the fb
         argv = self._build_command()
-        logging.info('GstFbdev play: %s', ' '.join(argv))
+        logger.info('GstFbdev play: %s', ' '.join(argv))
         # The helper loops the clip for the whole on-screen slot (the
         # asset_loop sleeps for ``duration`` then stop()s us) and exits
         # non-zero on a pipeline error so a persistent failure doesn't
@@ -583,8 +848,8 @@ class GstFbdevMediaPlayer(MediaPlayer):
                 stderr=None,
                 start_new_session=True,
             )
-        except OSError as exc:
-            logging.error('GstFbdev: failed to spawn player: %s', exc)
+        except OSError:
+            logger.exception('GstFbdev: failed to spawn player')
             self._proc = None
 
     def stop(self) -> None:
@@ -676,5 +941,5 @@ class MediaPlayerProxy:
             try:
                 cls.INSTANCE.stop()
             except Exception as exc:
-                logging.debug('reset(): stop() raised: %s', exc)
+                logger.debug('reset(): stop() raised: %s', exc)
         cls.INSTANCE = None

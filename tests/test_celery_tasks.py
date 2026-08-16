@@ -11,9 +11,11 @@ from celery.exceptions import SoftTimeLimitExceeded
 
 import anthias_server.celery_tasks as celery_tasks_module
 from anthias_server.app.models import Asset
-from anthias_server.celery_tasks import celery as celeryapp
 from anthias_server.celery_tasks import (
     ASSET_REVALIDATION_LOCK_KEY,
+    DISPLAY_POWER_STATE_KEY,
+    DISPLAY_POWER_STATE_TTL_S,
+    apply_display_power_schedule,
     asset_recheck_lock_key,
     cleanup,
     download_youtube_asset,
@@ -25,6 +27,7 @@ from anthias_server.celery_tasks import (
     send_telemetry_task,
     shutdown_anthias,
 )
+from anthias_server.celery_tasks import celery as celeryapp
 from anthias_server.settings import settings
 
 
@@ -213,10 +216,10 @@ def test_get_display_power_reports_not_available_without_cec() -> None:
     """On a board with no CEC adapter the task records 'Not available'
     and never spawns the libcec probe.
 
-    x86 (and any host that doesn't pass /dev/cec0 or /dev/vchiq into
-    the container) can only fail the probe; it used to store
-    'CEC error', which the System Info card and the v2 /info API then
-    showed as though something were broken.
+    x86 (and any host with no /dev/cec* passed into the container)
+    has nothing to probe; it used to store 'CEC error', which the
+    System Info card and the v2 /info API then showed as though
+    something were broken.
     """
     fake_redis = mock.MagicMock()
     with (
@@ -294,6 +297,121 @@ def test_shutdown_anthias_uses_balena_supervisor_on_balena() -> None:
     mock_shutdown.assert_called_once()
 
 
+def test_reboot_anthias_retries_until_supervisor_recovers() -> None:
+    """The supervisor is routinely down right when a reboot fires
+    (it restarts itself during an OTA apply) — the task must keep
+    retrying past the first refused connection and also treat a 5xx
+    from a half-started supervisor as retryable (Sentry ANTHIAS-3F)."""
+    import requests as requests_module
+
+    error_response = mock.MagicMock()
+    error_response.raise_for_status.side_effect = (
+        requests_module.exceptions.HTTPError('503')
+    )
+    ok_response = mock.MagicMock()
+    ok_response.raise_for_status.return_value = None
+    with (
+        mock.patch.object(
+            celery_tasks_module, 'is_balena_app', return_value=True
+        ),
+        mock.patch.object(
+            celery_tasks_module,
+            'reboot_via_balena_supervisor',
+            side_effect=[
+                requests_module.exceptions.ConnectionError(),
+                error_response,
+                ok_response,
+            ],
+        ) as mock_reboot,
+        # Zero the exponential backoff so the retries don't sleep.
+        mock.patch.object(celery_tasks_module, 'SUPERVISOR_CMD_WAIT_MAX_S', 0),
+    ):
+        result = reboot_anthias.apply()
+    assert result.successful()
+    assert mock_reboot.call_count == 3
+
+
+def test_reboot_anthias_non_transport_error_propagates() -> None:
+    """Only transport/HTTP failures are retryable — anything else
+    (a TypeError-class bug, celery's SoftTimeLimitExceeded) must
+    escape immediately instead of being retried for the full window
+    and masked as 'supervisor didn't accept the command'."""
+    with (
+        mock.patch.object(
+            celery_tasks_module, 'is_balena_app', return_value=True
+        ),
+        mock.patch.object(
+            celery_tasks_module,
+            'reboot_via_balena_supervisor',
+            side_effect=TypeError('a real bug'),
+        ) as mock_reboot,
+        mock.patch.object(celery_tasks_module, 'SUPERVISOR_CMD_WAIT_MAX_S', 0),
+    ):
+        result = reboot_anthias.apply()
+    assert result.failed()
+    assert isinstance(result.result, TypeError)
+    mock_reboot.assert_called_once()
+
+
+def test_reboot_anthias_terminal_supervisor_failure_warns_not_raises() -> None:
+    """When the supervisor never comes back within the retry window the
+    task must log a warning and exit cleanly — an unhandled RetryError
+    here was a Sentry event per attempt fleet-wide (ANTHIAS-3F)."""
+    import requests as requests_module
+
+    with (
+        mock.patch.object(
+            celery_tasks_module, 'is_balena_app', return_value=True
+        ),
+        mock.patch.object(
+            celery_tasks_module,
+            'reboot_via_balena_supervisor',
+            side_effect=requests_module.exceptions.ConnectionError(),
+        ),
+        # Zero the budget so stop_after_delay trips right after the
+        # first attempt — no sleeping and no tight retry loop.
+        mock.patch.object(
+            celery_tasks_module, 'SUPERVISOR_CMD_RETRY_WINDOW_S', 0
+        ),
+        mock.patch.object(celery_tasks_module, 'SUPERVISOR_CMD_WAIT_MAX_S', 0),
+        mock.patch(
+            'anthias_server.celery_tasks.logger.warning'
+        ) as mock_warning,
+        mock.patch('anthias_server.celery_tasks.logger.error') as mock_error,
+    ):
+        result = reboot_anthias.apply()
+    assert result.successful()
+    mock_warning.assert_called_once()
+    mock_error.assert_not_called()
+
+
+def test_shutdown_anthias_terminal_supervisor_failure_warns_not_raises() -> (
+    None
+):
+    import requests as requests_module
+
+    with (
+        mock.patch.object(
+            celery_tasks_module, 'is_balena_app', return_value=True
+        ),
+        mock.patch.object(
+            celery_tasks_module,
+            'shutdown_via_balena_supervisor',
+            side_effect=requests_module.exceptions.ConnectionError(),
+        ),
+        mock.patch.object(
+            celery_tasks_module, 'SUPERVISOR_CMD_RETRY_WINDOW_S', 0
+        ),
+        mock.patch.object(celery_tasks_module, 'SUPERVISOR_CMD_WAIT_MAX_S', 0),
+        mock.patch(
+            'anthias_server.celery_tasks.logger.warning'
+        ) as mock_warning,
+    ):
+        result = shutdown_anthias.apply()
+    assert result.successful()
+    mock_warning.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # revalidate_asset_urls (periodic sweep)
 # ---------------------------------------------------------------------------
@@ -306,6 +424,7 @@ def _make_revalidation_asset(
     is_enabled: bool = True,
     is_processing: bool = False,
     skip_asset_check: bool = False,
+    skip_ssl_verify: bool = False,
     is_reachable: bool = True,
 ) -> Asset:
     return Asset.objects.create(
@@ -317,6 +436,7 @@ def _make_revalidation_asset(
         is_enabled=is_enabled,
         is_processing=is_processing,
         skip_asset_check=skip_asset_check,
+        skip_ssl_verify=skip_ssl_verify,
         is_reachable=is_reachable,
     )
 
@@ -356,6 +476,41 @@ def test_sweep_marks_reachable_when_url_succeeds(eager_celery: None) -> None:
     ):
         revalidate_asset_urls.apply()
     assert Asset.objects.get(asset_id='a1').is_reachable
+
+
+@pytest.mark.django_db
+def test_sweep_skips_ssl_verification_per_asset(eager_celery: None) -> None:
+    """A per-asset skip_ssl_verify must reach url_fails as
+    verify_ssl=False so a trusted self-signed host isn't marked
+    unreachable. A default asset keeps verification on.
+
+    Pin the device-wide ``verify_ssl`` on explicitly: the effective flag
+    is ``settings['verify_ssl'] and not asset.skip_ssl_verify``, so a
+    host whose ``anthias.conf`` happens to have verification off would
+    otherwise mask the per-asset composition under test."""
+    _make_revalidation_asset('secure', uri='https://secure.example/x.png')
+    _make_revalidation_asset(
+        'selfsigned',
+        uri='https://intranet.example/x.png',
+        skip_ssl_verify=True,
+    )
+
+    with (
+        mock.patch.dict(
+            'anthias_server.celery_tasks.settings', {'verify_ssl': True}
+        ),
+        mock.patch(
+            'anthias_server.celery_tasks.url_fails', return_value=False
+        ) as m,
+    ):
+        revalidate_asset_urls.apply()
+
+    verify_by_url = {
+        call.args[0]: call.kwargs.get('verify_ssl')
+        for call in m.call_args_list
+    }
+    assert verify_by_url['https://secure.example/x.png'] is True
+    assert verify_by_url['https://intranet.example/x.png'] is False
 
 
 @pytest.mark.django_db
@@ -438,7 +593,7 @@ def test_sweep_probe_exception_does_not_kill_sweep(
     _make_revalidation_asset('boom', uri='https://example.com/boom')
     _make_revalidation_asset('ok', uri='https://example.com/ok')
 
-    def fake_url_fails(url: str) -> bool:
+    def fake_url_fails(url: str, verify_ssl: bool | None = None) -> bool:
         if 'boom' in url:
             raise RuntimeError('synthetic')
         return False
@@ -757,13 +912,13 @@ def fake_youtube_dl() -> Iterator[mock.MagicMock]:
         # setattr keeps mypy happy on a dynamically-created ModuleType
         # (a static `module.attr = ...` assignment is `attr-defined`
         # under --strict).
-        setattr(fake_module, 'YoutubeDL', fake_cls)
+        fake_module.YoutubeDL = fake_cls  # type: ignore[attr-defined]
         utils_mod = types.ModuleType('yt_dlp.utils')
 
         class FakeDownloadError(Exception):
             pass
 
-        setattr(utils_mod, 'DownloadError', FakeDownloadError)
+        utils_mod.DownloadError = FakeDownloadError  # type: ignore[attr-defined]
         sys.modules['yt_dlp'] = fake_module
         sys.modules['yt_dlp.utils'] = utils_mod
         # Exposing the inst lets the test reach `.extract_info` to set
@@ -984,7 +1139,7 @@ def test_download_youtube_asset_failure_propagates_for_on_failure(
     """yt-dlp DownloadError is permanent — the task re-raises so
     Celery's on_failure path runs (which clears is_processing)."""
     _make_youtube_asset()
-    DownloadError = fake_youtube_dl._download_error  # noqa: N806
+    DownloadError = fake_youtube_dl._download_error
     fake_youtube_dl.extract_info.side_effect = DownloadError('404')
     with pytest.raises(DownloadError):
         download_youtube_asset('yt-1', 'https://youtu.be/dead')
@@ -1139,7 +1294,7 @@ def test_download_youtube_asset_unknown_board_falls_back_to_h264(
 # ---------------------------------------------------------------------------
 
 
-from anthias_server.celery_tasks import (  # noqa: E402
+from anthias_server.celery_tasks import (
     RemoteVideoDownloadError,
     download_remote_video_asset,
 )
@@ -1272,9 +1427,9 @@ def test_download_remote_video_asset_size_cap_aborts(
             'anthias_server.processing.dispatch_normalize_video'
         ) as mock_dispatch,
         mock.patch('anthias_server.app.consumers.notify_asset_update'),
+        pytest.raises(RemoteVideoDownloadError, match='size cap'),
     ):
-        with pytest.raises(RemoteVideoDownloadError, match='size cap'):
-            download_remote_video_asset('rv-1', 'https://example.com/huge.mp4')
+        download_remote_video_asset('rv-1', 'https://example.com/huge.mp4')
     dest = path.join(remote_video_asset_dir, 'rv-1.mp4')
     assert not path.exists(dest)
     assert not path.exists(f'{dest}.part')
@@ -1298,11 +1453,9 @@ def test_download_remote_video_asset_http_404_propagates_for_on_failure(
         ),
         mock.patch('anthias_server.processing.dispatch_normalize_video'),
         mock.patch('anthias_server.app.consumers.notify_asset_update'),
+        pytest.raises(RemoteVideoDownloadError, match='HTTP 404'),
     ):
-        with pytest.raises(RemoteVideoDownloadError, match='HTTP 404'):
-            download_remote_video_asset(
-                'rv-1', 'https://example.com/missing.mp4'
-            )
+        download_remote_video_asset('rv-1', 'https://example.com/missing.mp4')
 
 
 @pytest.mark.django_db
@@ -1325,9 +1478,9 @@ def test_download_remote_video_asset_manifest_content_type_aborts(
         ),
         mock.patch('anthias_server.processing.dispatch_normalize_video'),
         mock.patch('anthias_server.app.consumers.notify_asset_update'),
+        pytest.raises(RemoteVideoDownloadError, match='manifest'),
     ):
-        with pytest.raises(RemoteVideoDownloadError, match='manifest'):
-            download_remote_video_asset('rv-1', 'https://example.com/sneaky')
+        download_remote_video_asset('rv-1', 'https://example.com/sneaky')
 
 
 @pytest.mark.django_db
@@ -1347,9 +1500,9 @@ def test_download_remote_video_asset_wrong_content_type_aborts(
         ),
         mock.patch('anthias_server.processing.dispatch_normalize_video'),
         mock.patch('anthias_server.app.consumers.notify_asset_update'),
+        pytest.raises(RemoteVideoDownloadError, match='Content-Type'),
     ):
-        with pytest.raises(RemoteVideoDownloadError, match='Content-Type'):
-            download_remote_video_asset('rv-1', 'https://example.com/error')
+        download_remote_video_asset('rv-1', 'https://example.com/error')
 
 
 @pytest.mark.django_db
@@ -1397,11 +1550,11 @@ def test_download_remote_video_asset_empty_content_type_aborts(
         ),
         mock.patch('anthias_server.processing.dispatch_normalize_video'),
         mock.patch('anthias_server.app.consumers.notify_asset_update'),
+        pytest.raises(RemoteVideoDownloadError, match='Content-Type'),
     ):
-        with pytest.raises(RemoteVideoDownloadError, match='Content-Type'):
-            download_remote_video_asset(
-                'rv-1', 'https://example.com/no-headers.mp4'
-            )
+        download_remote_video_asset(
+            'rv-1', 'https://example.com/no-headers.mp4'
+        )
     # Nothing landed on disk; the staging cleanup wiped the .part too.
     dest = path.join(remote_video_asset_dir, 'rv-1.mp4')
     assert not path.exists(dest)
@@ -1424,11 +1577,9 @@ def test_download_remote_video_asset_zero_bytes_aborts(
         ),
         mock.patch('anthias_server.processing.dispatch_normalize_video'),
         mock.patch('anthias_server.app.consumers.notify_asset_update'),
+        pytest.raises(RemoteVideoDownloadError, match='zero bytes'),
     ):
-        with pytest.raises(RemoteVideoDownloadError, match='zero bytes'):
-            download_remote_video_asset(
-                'rv-1', 'https://example.com/empty.mp4'
-            )
+        download_remote_video_asset('rv-1', 'https://example.com/empty.mp4')
     dest = path.join(remote_video_asset_dir, 'rv-1.mp4')
     assert not path.exists(dest)
     assert not path.exists(f'{dest}.part')
@@ -1489,13 +1640,9 @@ def test_download_remote_video_asset_refuses_row_with_empty_uri(
         mock.patch('anthias_server.celery_tasks._session.get') as fake_get,
         mock.patch('anthias_server.processing.dispatch_normalize_video'),
         mock.patch('anthias_server.app.consumers.notify_asset_update'),
+        pytest.raises(RemoteVideoDownloadError, match='no destination uri'),
     ):
-        with pytest.raises(
-            RemoteVideoDownloadError, match='no destination uri'
-        ):
-            download_remote_video_asset(
-                'rv-empty', 'https://example.com/x.mp4'
-            )
+        download_remote_video_asset('rv-empty', 'https://example.com/x.mp4')
     # No network call attempted — the guard fires before the GET.
     fake_get.assert_not_called()
 
@@ -1533,11 +1680,11 @@ def test_download_remote_video_asset_on_failure_writes_error_metadata(
 # ---------------------------------------------------------------------------
 
 
-from datetime import timedelta  # noqa: E402
+from datetime import timedelta
 
-from django.utils import timezone  # noqa: E402
+from django.utils import timezone
 
-from anthias_server.celery_tasks import (  # noqa: E402
+from anthias_server.celery_tasks import (
     RECONCILE_STUCK_LOCK_KEY,
     RECONCILE_STUCK_THRESHOLD_S,
     reconcile_stuck_processing,
@@ -1966,6 +2113,47 @@ class TestPeriodicPokeTimeLimits:
         assert result.successful()
 
 
+class TestReconcileTimeLimits:
+    """The stuck-row reconciler was the last periodic task carrying a
+    bare ``time_limit=300`` with no soft companion, so its unbounded
+    per-row work (SQLite + a kombu ``.delay()`` publish) could still
+    trip the hard limit and SIGKILL the pool child — keeping the
+    ANTHIAS-A / ANTHIAS-9 / ANTHIAS-B group alive after #3017/#3063
+    closed the sibling tasks."""
+
+    def test_reconcile_task_has_soft_limit_headroom(self) -> None:
+        soft = reconcile_stuck_processing.soft_time_limit
+        hard = reconcile_stuck_processing.time_limit
+        assert soft == celery_tasks_module.RECONCILE_STUCK_SOFT_TIME_LIMIT_S
+        assert hard == celery_tasks_module.RECONCILE_STUCK_TIME_LIMIT_S
+        assert soft is not None
+        assert hard is not None
+        assert soft < hard
+
+    @pytest.mark.django_db
+    def test_reconcile_soft_limit_aborts_and_releases_lock(
+        self, eager_celery_reconcile: None
+    ) -> None:
+        old = (
+            timezone.now()
+            - timedelta(seconds=RECONCILE_STUCK_THRESHOLD_S + 60)
+        ).isoformat()
+        _make_stuck_asset(processing_started_at=old, mimetype='video')
+
+        # A per-row re-dispatch wedges past the soft budget.
+        with mock.patch(
+            'anthias_server.processing.dispatch_normalize_video',
+            side_effect=SoftTimeLimitExceeded,
+        ):
+            result = reconcile_stuck_processing.apply()
+        # Caught inside the sweep — no exception propagates, so the tick
+        # ends as a clean success instead of a hard-kill task failure.
+        assert result.successful()
+        # The finally block must have released the singleton lock so the
+        # next beat tick can run.
+        assert celery_tasks_module.r.get(RECONCILE_STUCK_LOCK_KEY) is None
+
+
 class TestWaitForMigrations:
     """Startup gate for Sentry ANTHIAS-1 — the worker must not consume
     tasks while the server's migrate/dbrestore pass is still rewriting
@@ -2043,3 +2231,157 @@ class TestWaitForMigrations:
         ):
             celery_tasks_module.wait_for_migrations()
         assert sleep.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Scheduled display power
+# ---------------------------------------------------------------------------
+
+
+def _schedule_settings(
+    enabled: bool = True, **overrides: Any
+) -> dict[str, Any]:
+    values = {
+        'display_power_schedule_enabled': enabled,
+        'display_power_on_time': '08:00',
+        'display_power_off_time': '18:00',
+        'display_power_days': '0,1,2,3,4,5,6',
+    }
+    values.update(overrides)
+    return values
+
+
+def _run_schedule(
+    stored: Any, desired: Any, **setting_overrides: Any
+) -> tuple[Any, Any]:
+    """Drive one tick, returning (fake_redis, apply_power mock)."""
+    fake_redis = mock.MagicMock()
+    fake_redis.get.return_value = stored
+    values = _schedule_settings(**setting_overrides)
+    with (
+        mock.patch.object(celery_tasks_module, 'r', fake_redis),
+        mock.patch.dict(settings, values, clear=False),
+        mock.patch.object(settings, 'load'),
+        mock.patch(
+            'anthias_server.lib.display_power.should_be_on',
+            return_value=desired,
+        ),
+        mock.patch(
+            'anthias_server.lib.display_power.apply_power',
+            return_value='CEC (1/1 display(s) acknowledged)',
+        ) as apply_power,
+    ):
+        apply_display_power_schedule.apply()
+    return fake_redis, apply_power
+
+
+def test_schedule_does_nothing_when_disabled() -> None:
+    """A device that has always stayed on must not start switching
+    itself off just because it was upgraded."""
+    fake_redis, apply_power = _run_schedule(
+        stored=None, desired=True, enabled=False
+    )
+    apply_power.assert_not_called()
+    fake_redis.set.assert_not_called()
+
+
+def test_disabling_the_schedule_restores_a_switched_off_display() -> None:
+    """Otherwise the screen stays black forever: the manual controls are
+    CEC-only and are hidden entirely on a device with no CEC adapter, so
+    a plain monitor would have no way back on from the UI."""
+    fake_redis, apply_power = _run_schedule(
+        stored=b'off', desired=True, enabled=False
+    )
+    apply_power.assert_called_once_with(True)
+    fake_redis.delete.assert_called_once_with(DISPLAY_POWER_STATE_KEY)
+
+
+def test_disabling_the_schedule_leaves_an_on_display_alone() -> None:
+    fake_redis, apply_power = _run_schedule(
+        stored=b'on', desired=True, enabled=False
+    )
+    apply_power.assert_not_called()
+    fake_redis.delete.assert_called_once_with(DISPLAY_POWER_STATE_KEY)
+
+
+def test_schedule_applies_the_desired_state_on_first_tick() -> None:
+    """Nothing stored yet (fresh worker) — assert the state the schedule
+    says it should be in rather than waiting for the next boundary."""
+    fake_redis, apply_power = _run_schedule(stored=None, desired=False)
+    apply_power.assert_called_once_with(False)
+    fake_redis.set.assert_called_once_with(
+        DISPLAY_POWER_STATE_KEY, 'off', ex=DISPLAY_POWER_STATE_TTL_S
+    )
+
+
+def test_schedule_is_edge_triggered() -> None:
+    """Re-asserting every minute would spam the CEC bus and fight an
+    operator who deliberately switched the screen on out of hours."""
+    fake_redis, apply_power = _run_schedule(stored=b'on', desired=True)
+    apply_power.assert_not_called()
+    fake_redis.set.assert_not_called()
+
+
+def test_schedule_acts_on_a_transition() -> None:
+    fake_redis, apply_power = _run_schedule(stored=b'on', desired=False)
+    apply_power.assert_called_once_with(False)
+    fake_redis.set.assert_called_once_with(
+        DISPLAY_POWER_STATE_KEY, 'off', ex=DISPLAY_POWER_STATE_TTL_S
+    )
+
+
+def test_schedule_handles_a_decoded_redis_client() -> None:
+    """decode_responses is not guaranteed on the shared connection, so
+    the stored value can arrive as str or bytes."""
+    _, apply_power = _run_schedule(stored='on', desired=True)
+    apply_power.assert_not_called()
+
+
+def test_schedule_skips_an_unusable_schedule() -> None:
+    """should_be_on returns None for identical/missing times. Leave the
+    display alone rather than guessing."""
+    fake_redis, apply_power = _run_schedule(stored=None, desired=None)
+    apply_power.assert_not_called()
+    fake_redis.set.assert_not_called()
+
+
+def test_schedule_does_not_latch_state_when_applying_fails() -> None:
+    """If the command never went out, the next tick must retry rather
+    than believing it already succeeded.
+
+    The failure is swallowed (logged at warning) rather than raised: the
+    task runs every 60s and would otherwise file a Sentry event every
+    minute for as long as the fault lasted. Not latching the state is
+    what makes that safe — the retry is immediate.
+    """
+    fake_redis = mock.MagicMock()
+    fake_redis.get.return_value = None
+    with (
+        mock.patch.object(celery_tasks_module, 'r', fake_redis),
+        mock.patch.dict(settings, _schedule_settings(), clear=False),
+        mock.patch.object(settings, 'load'),
+        mock.patch(
+            'anthias_server.lib.display_power.should_be_on',
+            return_value=False,
+        ),
+        mock.patch(
+            'anthias_server.lib.display_power.apply_power',
+            side_effect=RuntimeError('redis down'),
+        ),
+    ):
+        apply_display_power_schedule.apply(throw=True)
+    fake_redis.set.assert_not_called()
+
+
+def test_schedule_survives_a_soft_time_limit() -> None:
+    fake_redis = mock.MagicMock()
+    fake_redis.get.return_value = None
+    with (
+        mock.patch.object(celery_tasks_module, 'r', fake_redis),
+        mock.patch.dict(settings, _schedule_settings(), clear=False),
+        mock.patch.object(
+            settings, 'load', side_effect=SoftTimeLimitExceeded()
+        ),
+    ):
+        apply_display_power_schedule.apply()
+    fake_redis.set.assert_not_called()

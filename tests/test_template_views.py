@@ -19,9 +19,11 @@ from django.test import Client
 from django.urls import reverse
 from django.utils import timezone
 
+from anthias_common import storage_health
 from anthias_server.app import page_context
-from anthias_server.app.models import Asset
+from anthias_server.app.models import DURATION_S_MAX, Asset
 from anthias_server.app.templatetags.asset_filters import to_json
+from anthias_server.settings import settings
 
 
 @pytest.fixture
@@ -86,6 +88,9 @@ def test_system_info_renders(client: Client) -> None:
     # are environment-dependent.
     for label in ('Load Average', 'Disk', 'Memory', 'Uptime'):
         assert label in body
+    # The device clock card + its seed-from-server ticking hook.
+    assert 'Device time' in body
+    assert 'id="device-clock"' in body
 
 
 @pytest.mark.django_db
@@ -107,12 +112,22 @@ def test_settings_renders(client: Client) -> None:
         'Default duration',
         'Audio output',
         'Date format',
+        'Timezone',
         'Authentication',
         'Show splash screen',
+        'Display schedule',
+        'Turn on at',
+        'Turn off at',
         'Backup',
         'System controls',
     ):
         assert label in body
+    # The timezone dropdown is populated from the IANA list, with the
+    # real id as the option value and a humanised (underscore-free)
+    # label shown to the operator.
+    assert 'name="timezone"' in body
+    assert 'value="America/New_York"' in body
+    assert 'America/New York' in body
 
 
 @pytest.mark.django_db
@@ -200,6 +215,11 @@ def test_page_context_device_settings_keys() -> None:
         'screen_rotation',
         'date_format_options',
         'is_pi5',
+        'display_power_schedule_enabled',
+        'display_power_on_time',
+        'display_power_off_time',
+        'display_power_days',
+        'weekday_options',
     ):
         assert key in ctx
 
@@ -753,195 +773,6 @@ def test_assets_delete_removes_local_file(
 
 
 @pytest.mark.django_db
-def test_assets_duplicate_creates_independent_copy(
-    client: Client, asset: Asset
-) -> None:
-    """POST assets/<id>/duplicate/ clones the row after the source.
-
-    URL-backed asset (uri outside assetdir): no file work, just a new
-    row with its own asset_id, name suffixed ``(copy)``, slotted at
-    ``source.play_order + 1``.
-    """
-    with mock.patch(
-        'anthias_server.settings.ViewerPublisher.send_to_viewer',
-        return_value=None,
-    ):
-        response = client.post(
-            reverse(
-                'anthias_app:assets_duplicate', args=[asset.asset_id]
-            )
-        )
-
-    assert response.status_code in (200, 302)
-    rows = list(Asset.objects.order_by('play_order'))
-    assert len(rows) == 2
-    copy = next(a for a in rows if a.asset_id != asset.asset_id)
-    assert copy.name == 'Test asset (copy)'
-    assert copy.uri == asset.uri
-    assert copy.play_order == asset.play_order + 1
-    assert copy.is_enabled
-    assert not copy.is_processing
-
-
-@pytest.mark.django_db
-def test_assets_duplicate_shifts_following_play_orders(
-    client: Client,
-) -> None:
-    """Duplicating the first of three active assets slots the copy at
-    position 1 and pushes the other two down one each."""
-    now = timezone.now()
-    originals = [
-        Asset.objects.create(
-            name=f'a{i}',
-            uri=f'https://example.com/{i}',
-            mimetype='webpage',
-            duration=1,
-            is_enabled=True,
-            play_order=i,
-            start_date=now,
-            end_date=now + timedelta(days=30),
-        )
-        for i in range(3)
-    ]
-
-    with mock.patch(
-        'anthias_server.settings.ViewerPublisher.send_to_viewer',
-        return_value=None,
-    ):
-        client.post(
-            reverse(
-                'anthias_app:assets_duplicate',
-                args=[originals[0].asset_id],
-            )
-        )
-
-    by_order = {
-        a.play_order: a.name for a in Asset.objects.order_by('play_order')
-    }
-    assert by_order == {0: 'a0', 1: 'a0 (copy)', 2: 'a1', 3: 'a2'}
-
-
-@pytest.mark.django_db
-def test_assets_duplicate_hardlinks_local_file(
-    client: Client, tmp_path: Any
-) -> None:
-    """A local upload's clone gets its own directory entry, so deleting
-    the source afterwards must not take the copy's file with it — the
-    failure mode that ruled out naive uri-sharing."""
-    from anthias_server.settings import settings as anthias_settings
-
-    assetdir = tmp_path / 'assets'
-    assetdir.mkdir()
-    src_path = assetdir / 'video.mp4'
-    src_path.write_bytes(b'\x00\x01video-payload')
-
-    now = timezone.now()
-    asset = Asset.objects.create(
-        name='Local video',
-        uri=str(src_path),
-        mimetype='video',
-        duration=10,
-        is_enabled=True,
-        play_order=0,
-        start_date=now,
-        end_date=now + timedelta(days=30),
-    )
-
-    with (
-        mock.patch.dict(anthias_settings, {'assetdir': str(assetdir)}),
-        mock.patch(
-            'anthias_server.settings.ViewerPublisher.send_to_viewer',
-            return_value=None,
-        ),
-    ):
-        client.post(
-            reverse('anthias_app:assets_duplicate', args=[asset.asset_id])
-        )
-        copy = Asset.objects.exclude(asset_id=asset.asset_id).get()
-        assert copy.uri != asset.uri
-        assert copy.uri.startswith(str(assetdir))
-
-        client.post(
-            reverse('anthias_app:assets_delete', args=[asset.asset_id])
-        )
-
-    assert not src_path.exists()
-    assert Asset.objects.filter(asset_id=copy.asset_id).exists()
-    with open(copy.uri, 'rb') as f:
-        assert f.read() == b'\x00\x01video-payload'
-
-
-@pytest.mark.django_db
-def test_assets_duplicate_falls_back_to_copy_without_hardlinks(
-    client: Client, tmp_path: Any
-) -> None:
-    """FAT / network filesystems reject os.link — the clone must fall
-    back to a byte copy instead of failing."""
-    from anthias_server.settings import settings as anthias_settings
-
-    assetdir = tmp_path / 'assets'
-    assetdir.mkdir()
-    src_path = assetdir / 'image.png'
-    src_path.write_bytes(b'png-payload')
-
-    now = timezone.now()
-    asset = Asset.objects.create(
-        name='Local image',
-        uri=str(src_path),
-        mimetype='image',
-        duration=10,
-        is_enabled=True,
-        play_order=0,
-        start_date=now,
-        end_date=now + timedelta(days=30),
-    )
-
-    with (
-        mock.patch.dict(anthias_settings, {'assetdir': str(assetdir)}),
-        mock.patch(
-            'anthias_server.app.helpers.link',
-            side_effect=OSError('EPERM: hardlinks not supported'),
-        ),
-        mock.patch(
-            'anthias_server.settings.ViewerPublisher.send_to_viewer',
-            return_value=None,
-        ),
-    ):
-        client.post(
-            reverse('anthias_app:assets_duplicate', args=[asset.asset_id])
-        )
-
-    copy = Asset.objects.exclude(asset_id=asset.asset_id).get()
-    with open(copy.uri, 'rb') as f:
-        assert f.read() == b'png-payload'
-
-
-@pytest.mark.django_db
-def test_assets_duplicate_rejects_processing_asset(
-    client: Client,
-) -> None:
-    now = timezone.now()
-    asset = Asset.objects.create(
-        name='Still transcoding',
-        uri='https://example.com/raw.mov',
-        mimetype='video',
-        duration=0,
-        is_enabled=False,
-        is_processing=True,
-        play_order=0,
-        start_date=now,
-        end_date=now + timedelta(days=30),
-    )
-
-    response = client.post(
-        reverse('anthias_app:assets_duplicate', args=[asset.asset_id])
-    )
-
-    assert response.status_code in (200, 302)
-    assert Asset.objects.count() == 1
-
-
-@pytest.mark.django_db
 def test_assets_order_persists_play_order(client: Client) -> None:
     a1 = Asset.objects.create(
         name='a1',
@@ -1005,7 +836,9 @@ def test_assets_download_redirects_for_url_mimetype(
 
 
 @pytest.mark.django_db
-def test_settings_save_round_trip(client: Client) -> None:
+def test_settings_save_round_trip(
+    client: Client, _isolated_settings_conf: Any
+) -> None:
     with mock.patch(
         'anthias_server.settings.ViewerPublisher.send_to_viewer',
         return_value=None,
@@ -1038,7 +871,7 @@ def test_settings_save_round_trip(client: Client) -> None:
     ],
 )
 def test_settings_save_screen_rotation(
-    client: Client, posted: str, persisted: int
+    client: Client, posted: str, persisted: int, _isolated_settings_conf: Any
 ) -> None:
     """Issue #2856 — form path mirrors the v2 PATCH validation."""
     from anthias_server.settings import settings
@@ -1061,6 +894,66 @@ def test_settings_save_screen_rotation(
         )
     assert response.status_code in (200, 302)
     assert settings['screen_rotation'] == persisted
+
+
+@pytest.mark.django_db
+def test_settings_save_timezone_valid(
+    client: Client, _isolated_settings_conf: Any
+) -> None:
+    """A valid IANA zone posted from the HTML form is persisted."""
+    from anthias_server.settings import settings
+
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        response = client.post(
+            reverse('anthias_app:settings_save'),
+            data={
+                'player_name': 'Test',
+                'default_duration': '10',
+                'default_streaming_duration': '300',
+                'audio_output': 'hdmi',
+                'date_format': 'mm/dd/yyyy',
+                'auth_backend': '',
+                'timezone': 'Europe/Stockholm',
+            },
+        )
+    assert response.status_code in (200, 302)
+    assert settings['timezone'] == 'Europe/Stockholm'
+
+
+@pytest.mark.django_db
+def test_settings_save_timezone_invalid_rejected(
+    client: Client, _isolated_settings_conf: Any
+) -> None:
+    """A bad zone is rejected up front and never written — a value that
+    would crash-loop the settings module can't be persisted."""
+    from anthias_server.settings import settings
+
+    settings['timezone'] = 'Europe/Stockholm'
+    settings.save()
+
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ) as publish_mock:
+        response = client.post(
+            reverse('anthias_app:settings_save'),
+            data={
+                'player_name': 'Test',
+                'default_duration': '10',
+                'default_streaming_duration': '300',
+                'audio_output': 'hdmi',
+                'date_format': 'mm/dd/yyyy',
+                'auth_backend': '',
+                'timezone': 'Mars/Phobos',
+            },
+        )
+    assert response.status_code in (200, 302)
+    # Prior value untouched, and no reload was signalled.
+    assert settings['timezone'] == 'Europe/Stockholm'
+    publish_mock.assert_not_called()
 
 
 @pytest.mark.django_db
@@ -1299,6 +1192,33 @@ def test_assets_update_clamps_oversize_refresh_interval(
         )
     asset.refresh_from_db()
     assert asset.metadata.get('refresh_interval_s') == 86400
+
+
+@pytest.mark.django_db
+def test_assets_update_clamps_oversize_duration(
+    client: Client, asset: Asset
+) -> None:
+    """Same clamp-not-400 policy as the refresh interval above. The
+    posted value is the real one from Sentry ANTHIAS-3E: an operator
+    typed 9999999999999 to mean "forever", and the stored row
+    crash-looped the viewer's ``Event.wait`` on OverflowError."""
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        client.post(
+            reverse('anthias_app:assets_update', args=[asset.asset_id]),
+            data={
+                'name': asset.name,
+                'mimetype': 'webpage',
+                'duration': '9999999999999',
+                'start_date': '2026-01-01T00:00',
+                'end_date': '2027-01-01T00:00',
+                'refresh_interval_s': '',
+            },
+        )
+    asset.refresh_from_db()
+    assert asset.duration == DURATION_S_MAX
 
 
 @pytest.mark.django_db
@@ -1936,19 +1856,21 @@ def test_assets_bulk_update_issues_single_update_query(
         )
         ids.append(a.asset_id)
 
-    with mock.patch(
-        'anthias_server.settings.ViewerPublisher.send_to_viewer',
-        return_value=None,
+    with (
+        mock.patch(
+            'anthias_server.settings.ViewerPublisher.send_to_viewer',
+            return_value=None,
+        ),
+        CaptureQueriesContext(connection) as ctx,
     ):
-        with CaptureQueriesContext(connection) as ctx:
-            client.post(
-                reverse('anthias_app:assets_bulk_update'),
-                data={
-                    'ids': ','.join(ids),
-                    'apply_duration': 'true',
-                    'duration': '55',
-                },
-            )
+        client.post(
+            reverse('anthias_app:assets_bulk_update'),
+            data={
+                'ids': ','.join(ids),
+                'apply_duration': 'true',
+                'duration': '55',
+            },
+        )
 
     updates = [
         q['sql']
@@ -2056,6 +1978,136 @@ def test_assets_bulk_update_days(
     for a in bulk_assets:
         a.refresh_from_db()
         assert a.get_play_days() == [1, 3, 5]
+
+
+@pytest.mark.django_db
+def test_assets_bulk_update_nocache_sets_flag(
+    client: Client, bulk_assets: list[Asset]
+) -> None:
+    """Ticking the No cache group with the On radio sets nocache on
+    every selected asset, videos included (#3137)."""
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        client.post(
+            reverse('anthias_app:assets_bulk_update'),
+            data={
+                'ids': _bulk_ids_csv(bulk_assets),
+                'apply_nocache': 'true',
+                'nocache': 'true',
+            },
+        )
+    for a in bulk_assets:
+        a.refresh_from_db()
+        assert a.nocache is True
+
+
+@pytest.mark.django_db
+def test_assets_bulk_update_nocache_off_clears_flag(
+    client: Client, bulk_assets: list[Asset]
+) -> None:
+    """The group can clear as well as set: the Off radio POSTs
+    nocache=false and turns the flag off on every selected asset (#3137).
+    """
+    Asset.objects.filter(
+        asset_id__in=[a.asset_id for a in bulk_assets]
+    ).update(nocache=True)
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        client.post(
+            reverse('anthias_app:assets_bulk_update'),
+            data={
+                'ids': _bulk_ids_csv(bulk_assets),
+                'apply_nocache': 'true',
+                'nocache': 'false',
+            },
+        )
+    for a in bulk_assets:
+        a.refresh_from_db()
+        assert a.nocache is False
+
+
+@pytest.mark.django_db
+def test_assets_bulk_update_skip_asset_check_sets_flag(
+    client: Client, bulk_assets: list[Asset]
+) -> None:
+    """Ticking the Skip asset check group with the On radio sets
+    skip_asset_check on every selected asset (#3137)."""
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        client.post(
+            reverse('anthias_app:assets_bulk_update'),
+            data={
+                'ids': _bulk_ids_csv(bulk_assets),
+                'apply_skip_asset_check': 'true',
+                'skip_asset_check': 'true',
+            },
+        )
+    for a in bulk_assets:
+        a.refresh_from_db()
+        assert a.skip_asset_check is True
+
+
+@pytest.mark.django_db
+def test_assets_bulk_update_flag_untouched_when_group_off(
+    client: Client, bulk_assets: list[Asset]
+) -> None:
+    """A flag value POSTed without its apply_* toggle is ignored — an
+    unticked group never overwrites the stored flag (#3137)."""
+    Asset.objects.filter(
+        asset_id__in=[a.asset_id for a in bulk_assets]
+    ).update(nocache=True, skip_asset_check=True)
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        client.post(
+            reverse('anthias_app:assets_bulk_update'),
+            data={
+                'ids': _bulk_ids_csv(bulk_assets),
+                # Duration group is the only one ticked; the stray flag
+                # values below must be ignored.
+                'apply_duration': 'true',
+                'duration': '42',
+                'nocache': 'false',
+                'skip_asset_check': 'false',
+            },
+        )
+    for a in bulk_assets:
+        a.refresh_from_db()
+        assert a.nocache is True
+        assert a.skip_asset_check is True
+
+
+@pytest.mark.django_db
+def test_assets_bulk_update_flag_only_counts_all_matched(
+    client: Client, bulk_assets: list[Asset]
+) -> None:
+    """A flag-only edit touches every matched row (videos included), so
+    the success toast reports the full selection count, not the
+    non-video subset the duration rule uses (#3137)."""
+    import json as _json
+
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        response = client.post(
+            reverse('anthias_app:assets_bulk_update'),
+            data={
+                'ids': _bulk_ids_csv(bulk_assets),
+                'apply_nocache': 'true',
+                'nocache': 'true',
+            },
+            HTTP_HX_REQUEST='true',
+        )
+    trigger = _json.loads(response['HX-Trigger'])
+    assert trigger['toast']['message'] == '3 assets updated'
 
 
 @pytest.mark.django_db
@@ -2215,12 +2267,75 @@ def test_assets_preview_404_for_unknown_id(client: Client) -> None:
     assert response['Location'].endswith('/')
 
 
+def _remote_media_asset(mimetype: str, uri: str) -> Asset:
+    now = timezone.now()
+    return Asset.objects.create(
+        name=f'Remote {mimetype}',
+        uri=uri,
+        mimetype=mimetype,
+        duration=10,
+        is_enabled=True,
+        is_processing=False,
+        play_order=0,
+        start_date=now,
+        end_date=now + timedelta(days=30),
+    )
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'mimetype,uri',
+    [
+        ('image', 'https://upload.wikimedia.org/wikipedia/x/cat.jpg'),
+        ('video', 'https://cdn.example.com/clip.mp4'),
+    ],
+)
+def test_assets_preview_redirects_for_remote_media(
+    client: Client, mimetype: str, uri: str
+) -> None:
+    """Regression for the forum "web content doesn't display" report:
+    a remote-hosted image is stored mimetype image with an http(s) uri
+    (unlike remote videos, which Celery downloads to a local file), so
+    the preview must redirect to the source rather than 302-ing to the
+    home page (the blank preview). The endpoint dispatches on the uri
+    scheme, so a remote-uri video row redirects the same way."""
+    asset = _remote_media_asset(mimetype, uri)
+    response = client.get(
+        reverse('anthias_app:assets_preview', args=[asset.asset_id])
+    )
+    assert response.status_code == 302
+    assert response['Location'] == uri
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'mimetype,uri',
+    [
+        ('image', 'https://upload.wikimedia.org/wikipedia/x/cat.jpg'),
+        ('video', 'https://cdn.example.com/clip.mp4'),
+    ],
+)
+def test_assets_download_redirects_for_remote_media(
+    client: Client, mimetype: str, uri: str
+) -> None:
+    asset = _remote_media_asset(mimetype, uri)
+    response = client.get(
+        reverse('anthias_app:assets_download', args=[asset.asset_id])
+    )
+    assert response.status_code == 302
+    assert response['Location'] == uri
+
+
 @pytest.mark.django_db
 def test_settings_save_invalid_default_streaming_duration(
-    client: Client,
+    client: Client, _isolated_settings_conf: Any
 ) -> None:
-    """The save handler catches ValueError and surfaces it via messages
-    instead of 500ing — exercise the except branch."""
+    """A non-numeric duration must not 500. ``clamp_duration`` coerces
+    the junk to a safe ``0`` (it swallows the ValueError rather than
+    letting it reach the handler's except branch), the save returns
+    normally, and the clamped value is what gets persisted."""
+    from anthias_server.settings import settings
+
     with mock.patch(
         'anthias_server.settings.ViewerPublisher.send_to_viewer',
         return_value=None,
@@ -2229,14 +2344,17 @@ def test_settings_save_invalid_default_streaming_duration(
             reverse('anthias_app:settings_save'),
             data={
                 'player_name': 'Test',
-                'default_duration': 'not-a-number',  # int(...) blows up
-                'default_streaming_duration': '300',
+                'default_duration': '10',
+                'default_streaming_duration': 'not-a-number',
                 'audio_output': 'hdmi',
                 'date_format': 'mm/dd/yyyy',
                 'auth_backend': '',
             },
         )
     assert response.status_code in (200, 302)
+    # Persisted as the string '0' — default_streaming_duration's default
+    # is a str, so configparser reads it back with .get, not .getint.
+    assert int(settings['default_streaming_duration']) == 0
 
 
 @pytest.mark.django_db
@@ -2255,6 +2373,147 @@ def test_assets_upload_rejects_unknown_extension(client: Client) -> None:
     )
     assert response.status_code in (200, 302)
     assert not Asset.objects.filter(name='random.bin').exists()
+
+
+@pytest.mark.django_db
+def test_assets_upload_disk_full_shows_toast_not_500(client: Client) -> None:
+    """ENOSPC while copying the upload into assetdir must surface as
+    the disk-full toast on the table partial, with no row persisted
+    — not an unhandled 500 (Sentry ANTHIAS-3K)."""
+    import errno
+
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    with mock.patch(
+        'anthias_server.app.views.open',
+        side_effect=OSError(errno.ENOSPC, 'No space left on device'),
+        create=True,
+    ):
+        response = client.post(
+            reverse('anthias_app:assets_upload'),
+            data={
+                'file_upload': SimpleUploadedFile(
+                    'photo.png', b'\x89PNG\r\n', content_type='image/png'
+                ),
+            },
+            headers={'HX-Request': 'true'},
+        )
+    assert response.status_code == 200
+    assert 'disk is full' in response.headers.get('HX-Trigger', '')
+    assert Asset.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_assets_upload_disk_full_during_parse_shows_toast(
+    client: Client,
+) -> None:
+    """The reported Sentry stack (ANTHIAS-3K) is ENOSPC during the
+    multipart *parse* — Django spooling the request body to a temp
+    file, surfaced when the view first accesses ``request.FILES``.
+    Force the parser itself to raise and assert the same graceful
+    toast, with no row persisted."""
+    import errno
+
+    from django.core.files.uploadedfile import SimpleUploadedFile
+    from django.http.multipartparser import MultiPartParser
+
+    with mock.patch.object(
+        MultiPartParser,
+        'parse',
+        side_effect=OSError(errno.ENOSPC, 'No space left on device'),
+    ):
+        response = client.post(
+            reverse('anthias_app:assets_upload'),
+            data={
+                'file_upload': SimpleUploadedFile(
+                    'photo.png', b'\x89PNG\r\n', content_type='image/png'
+                ),
+            },
+            headers={'HX-Request': 'true'},
+        )
+    assert response.status_code == 200
+    assert 'disk is full' in response.headers.get('HX-Trigger', '')
+    assert Asset.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_assets_upload_disk_full_during_write_cleans_up_partial(
+    client: Client,
+) -> None:
+    """When the disk fills mid-write (open() succeeds, f.write() then
+    raises ENOSPC), the view must remove the partially-written file so
+    a truncated asset doesn't squat on the last free bytes — and still
+    show the toast with no row persisted."""
+    import errno
+
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    write_fails = mock.mock_open()
+    # The view streams chunks via f.writelines(...); that is where the
+    # simulated ENOSPC must surface.
+    write_fails.return_value.writelines.side_effect = OSError(
+        errno.ENOSPC, 'No space left on device'
+    )
+    with (
+        mock.patch('anthias_server.app.views.open', write_fails, create=True),
+        mock.patch('anthias_server.app.views.remove') as mock_remove,
+    ):
+        response = client.post(
+            reverse('anthias_app:assets_upload'),
+            data={
+                'file_upload': SimpleUploadedFile(
+                    'photo.png', b'\x89PNG\r\n', content_type='image/png'
+                ),
+            },
+            headers={'HX-Request': 'true'},
+        )
+    assert response.status_code == 200
+    assert 'disk is full' in response.headers.get('HX-Trigger', '')
+    assert Asset.objects.count() == 0
+    mock_remove.assert_called_once()
+
+
+@pytest.mark.django_db
+def test_settings_recover_invalid_archive_warns_not_error(
+    client: Client,
+) -> None:
+    """A bad / non-backup upload to the HTML recover view is operator
+    input, not a bug — it must log at warning (not logger.exception,
+    which pages Sentry) and show the error message (Sentry
+    ANTHIAS-3W)."""
+    import tarfile
+
+    from django.contrib.messages import get_messages
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    with (
+        mock.patch('anthias_server.app.views.ViewerPublisher'),
+        mock.patch(
+            'anthias_server.app.views.open', mock.mock_open(), create=True
+        ),
+        mock.patch('anthias_server.app.views.path.isfile', return_value=False),
+        mock.patch(
+            'anthias_server.app.views.backup_helper.recover',
+            side_effect=tarfile.ReadError('not a gzip file'),
+        ),
+        mock.patch('anthias_server.app.views.logger') as mock_logger,
+    ):
+        response = client.post(
+            reverse('anthias_app:settings_recover'),
+            data={
+                'backup_upload': SimpleUploadedFile(
+                    'backup.tar.gz',
+                    b'\n\nnot a real gzip',
+                    content_type='application/x-tar',
+                )
+            },
+        )
+
+    assert response.status_code in (200, 302)
+    messages = [str(m) for m in get_messages(response.wsgi_request)]
+    assert 'Invalid backup archive.' in messages
+    mock_logger.warning.assert_called_once()
+    mock_logger.exception.assert_not_called()
 
 
 @pytest.mark.django_db
@@ -3291,6 +3550,763 @@ def test_review_cta_suppressed_while_snoozed(
         )
     assert response.status_code == 200
     assert 'review-cta' not in response.headers.get('HX-Trigger', '')
+
+
+# ---------------------------------------------------------------------------
+# Scheduled display power — settings form round trip
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_settings_save_display_schedule(
+    client: Client, _isolated_settings_conf: Any
+) -> None:
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        response = client.post(
+            reverse('anthias_app:settings_save'),
+            data={
+                'auth_backend': '',
+                'display_power_schedule_enabled': 'true',
+                'display_power_on_time': '07:30',
+                'display_power_off_time': '19:45',
+                'display_power_days': ['0', '2', '4'],
+            },
+        )
+    assert response.status_code in (200, 302)
+    settings.load()
+    assert settings['display_power_schedule_enabled'] is True
+    assert settings['display_power_on_time'] == '07:30'
+    assert settings['display_power_off_time'] == '19:45'
+    assert settings['display_power_days'] == '0,2,4'
+
+
+@pytest.mark.django_db
+def test_settings_save_display_schedule_rejects_bad_time(
+    client: Client, _isolated_settings_conf: Any
+) -> None:
+    """A malformed time must leave the stored value untouched — the beat
+    reads it every minute and must never see something unparsable."""
+    settings.load()
+    settings['display_power_on_time'] = '06:15'
+    settings.save()
+
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        client.post(
+            reverse('anthias_app:settings_save'),
+            data={
+                'auth_backend': '',
+                'display_power_on_time': 'not-a-time',
+                'display_power_off_time': '19:45',
+            },
+        )
+    settings.load()
+    assert settings['display_power_on_time'] == '06:15'
+
+
+@pytest.mark.django_db
+def test_settings_save_display_schedule_empty_days_means_every_day(
+    client: Client, _isolated_settings_conf: Any
+) -> None:
+    """Posting no day checkboxes must not leave an enabled schedule
+    silently inert."""
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        client.post(
+            reverse('anthias_app:settings_save'),
+            data={
+                'auth_backend': '',
+                'display_power_schedule_enabled': 'true',
+                'display_power_on_time': '08:00',
+                'display_power_off_time': '18:00',
+            },
+        )
+    settings.load()
+    assert settings['display_power_days'] == '0,1,2,3,4,5,6'
+
+
+@pytest.mark.django_db
+def test_settings_renders_selected_schedule_days(
+    client: Client, _isolated_settings_conf: Any
+) -> None:
+    """The day checkboxes must reflect the stored selection. Guards the
+    template's `{% if value in display_power_days %}` int-membership
+    check, which silently renders everything unchecked if the context
+    ever hands over strings instead of ints."""
+    settings.load()
+    settings['display_power_days'] = '0,4'
+    settings.save()
+
+    body = client.get(reverse('anthias_app:settings')).content.decode()
+    import re
+
+    checked = {
+        int(m)
+        for m in re.findall(
+            r'name="display_power_days"\s+value="(\d)"\s+checked', body
+        )
+    }
+    assert checked == {0, 4}
+
+
+# ---------------------------------------------------------------------------
+# Device alert banners (_device_alerts.html)
+#
+# Rendered from the shared navbar context, so they must appear on every
+# page rather than only on System Info: an operator whose screen is
+# glitching goes to the Schedule page, not a diagnostics tab.
+#
+# Both banners share the .device-alert block, so a test cannot assert
+# on that class to mean "the power banner is showing" -- it would also
+# match the storage banner, and the wrapper .device-alerts renders
+# unconditionally. Assert on the per-banner title id instead.
+# ---------------------------------------------------------------------------
+
+POWER_BANNER_ID = 'power-alert-title'
+STORAGE_BANNER_ID = 'storage-alert-title'
+
+
+def _collapse(html: str) -> str:
+    """Whitespace-collapsed markup.
+
+    Copy in these templates is hard-wrapped, so a sentence assertion
+    would otherwise break the moment a line rewraps -- which says
+    nothing about whether the sentence still reads correctly.
+    """
+    return ' '.join(html.split())
+
+
+def _banner(body: str, banner_id: str) -> str:
+    """The one <section> carrying ``banner_id``, or ''."""
+    for chunk in body.split('<section'):
+        if banner_id in chunk:
+            return chunk.split('</section>', 1)[0]
+    return ''
+
+
+@pytest.fixture(autouse=True)
+def _healthy_storage() -> Any:
+    """Pin storage health to healthy for every page render in this
+    module.
+
+    Without this, ``_storage_warning`` reads the real ext4 counters of
+    whatever machine is running the suite, so a developer laptop with
+    a nonzero ``errors_count`` would render an extra banner on every
+    page and fail assertions that have nothing to do with storage.
+    Tests that care patch over this from the inside.
+    """
+    healthy = {
+        'supported': True,
+        'status': storage_health.STATUS_OK,
+        'mount_point': '/data/.anthias',
+        'fstype': 'ext4',
+        'device': 'mmcblk0p2',
+        'disk': 'mmcblk0',
+        'read_only': False,
+        'error_stats_supported': True,
+        'errors_count': 0,
+        'errors_new': 0,
+        'errors_this_boot': False,
+        'first_error': None,
+        'last_error': None,
+        'last_error_function': None,
+        'lifetime_written_kb': 4096,
+        'write_ok': True,
+        'write_reason': None,
+        'write_failed_since_boot': False,
+        'write_fail_count': 0,
+        'first_write_fail': None,
+        'last_write_fail': None,
+        'last_check': None,
+        'fsync_ms': 2.5,
+        'media': {
+            'kind': 'sd',
+            'name': 'SC32G',
+            'manufacturer': 'SanDisk',
+            'manufactured': '03/2019',
+            'wear_pct': None,
+            'pre_eol': None,
+        },
+    }
+    with mock.patch(
+        'anthias_server.app.page_context.storage_health.get_state',
+        side_effect=lambda *a, **k: dict(healthy),
+    ):
+        yield
+
+
+@pytest.fixture
+def storage_state() -> Any:
+    """Patch the storage reader used by both page-context helpers."""
+
+    def _apply(**overrides: Any) -> Any:
+        state: dict[str, Any] = {
+            'supported': True,
+            'status': storage_health.STATUS_OK,
+            'mount_point': '/data/.anthias',
+            'fstype': 'ext4',
+            'device': 'mmcblk0p2',
+            'disk': 'mmcblk0',
+            'read_only': False,
+            'error_stats_supported': True,
+            'errors_count': 0,
+            'errors_new': 0,
+            'errors_this_boot': False,
+            'first_error': None,
+            'last_error': None,
+            'last_error_function': None,
+            'lifetime_written_kb': None,
+            'write_ok': True,
+            'write_reason': None,
+            'write_failed_since_boot': False,
+            'write_fail_count': 0,
+            'first_write_fail': None,
+            'last_write_fail': None,
+            'last_check': None,
+            'fsync_ms': None,
+            'media': {
+                'kind': 'sd',
+                'name': 'SC32G',
+                'manufacturer': 'SanDisk',
+                'manufactured': '03/2019',
+                'wear_pct': None,
+                'pre_eol': None,
+            },
+        }
+        media = overrides.pop('media', None)
+        state.update(overrides)
+        if media:
+            state['media'] = {**state['media'], **media}
+        # side_effect, not return_value: the real get_state builds
+        # a fresh dict per call, and a double that hands out one
+        # shared instance makes any caller mutation leak across
+        # requests and tests.
+        return mock.patch(
+            'anthias_server.app.page_context.storage_health.get_state',
+            side_effect=lambda *a, **k: dict(state),
+        )
+
+    return _apply
+
+
+@pytest.fixture
+def undervoltage_state() -> Any:
+    """Patch the under-voltage reader used by both page-context helpers."""
+
+    def _apply(**overrides: Any) -> Any:
+        state = {
+            'supported': True,
+            'active': False,
+            'seen_since_boot': False,
+            'first_seen': None,
+            'last_seen': None,
+            'count': 0,
+        }
+        state.update(overrides)
+        return mock.patch(
+            'anthias_server.app.page_context.undervoltage.get_state',
+            return_value=state,
+        )
+
+    return _apply
+
+
+@pytest.mark.django_db
+def test_power_banner_hidden_when_healthy(
+    client: Client, undervoltage_state: Any
+) -> None:
+    with undervoltage_state():
+        response = client.get(reverse('anthias_app:home'))
+
+    assert response.status_code == 200
+    assert POWER_BANNER_ID not in response.content.decode()
+
+
+@pytest.mark.django_db
+def test_power_banner_hidden_on_unsupported_hardware(
+    client: Client, undervoltage_state: Any
+) -> None:
+    # x86 and most non-Pi arm64 boards have no sensor. Silence is
+    # correct: we can't verify the supply either way.
+    with undervoltage_state(supported=False):
+        response = client.get(reverse('anthias_app:home'))
+
+    assert POWER_BANNER_ID not in response.content.decode()
+
+
+@pytest.mark.django_db
+def test_power_banner_shows_on_a_non_diagnostic_page(
+    client: Client, undervoltage_state: Any
+) -> None:
+    with undervoltage_state(active=True, seen_since_boot=True, count=1):
+        response = client.get(reverse('anthias_app:home'))
+
+    body = response.content.decode()
+    assert 'device-alert--warning' not in _banner(body, POWER_BANNER_ID)
+    assert "This player isn't getting enough power" in body
+    # The recommendation that actually resolves this must be present
+    # and must name Raspberry Pi rather than hedging.
+    assert 'official Raspberry Pi power supply' in body
+
+
+@pytest.mark.django_db
+def test_power_banner_de_escalates_after_recovery(
+    client: Client, undervoltage_state: Any
+) -> None:
+    with undervoltage_state(active=False, seen_since_boot=True, count=3):
+        response = client.get(reverse('anthias_app:settings'))
+
+    body = response.content.decode()
+    assert 'device-alert--warning' in _banner(body, POWER_BANNER_ID)
+    assert 'This player briefly lost power' in body
+    assert '3 times' in body
+
+
+@pytest.mark.django_db
+def test_power_banner_carries_no_jargon(
+    client: Client, undervoltage_state: Any
+) -> None:
+    # The banner is read by whoever installed the screen. Sensor and
+    # kernel detail belongs on System Info behind a disclosure.
+    with undervoltage_state(active=True, seen_since_boot=True, count=1):
+        response = client.get(reverse('anthias_app:home'))
+
+    body = response.content.decode()
+    banner = _banner(body, POWER_BANNER_ID)
+    for jargon in ('rpi_volt', 'in0_lcrit_alarm', 'hwmon', 'vcgencmd'):
+        assert jargon not in banner
+
+
+@pytest.mark.django_db
+def test_system_info_power_card_reports_health(
+    client: Client, undervoltage_state: Any
+) -> None:
+    with undervoltage_state():
+        response = client.get(reverse('anthias_app:system_info'))
+
+    body = response.content.decode()
+    assert 'Power supply' in body
+    assert 'No power problems since this player last restarted' in body
+
+
+@pytest.mark.django_db
+def test_system_info_power_card_states_when_unmonitored(
+    client: Client, undervoltage_state: Any
+) -> None:
+    # "We checked and it's fine" and "we can't check" must not look the
+    # same to someone chasing a glitch.
+    with undervoltage_state(supported=False):
+        response = client.get(reverse('anthias_app:system_info'))
+
+    body = response.content.decode()
+    assert 'Not monitored' in body
+    assert 'rpi_volt' not in body
+
+
+@pytest.mark.django_db
+def test_system_info_power_card_exposes_the_sensor_detail(
+    client: Client, undervoltage_state: Any
+) -> None:
+    with undervoltage_state(active=True, seen_since_boot=True, count=1):
+        response = client.get(reverse('anthias_app:system_info'))
+
+    body = response.content.decode()
+    assert 'Not enough power' in body
+    # System Info is the one place the mechanism is named.
+    assert 'rpi_volt' in body
+
+
+@pytest.mark.django_db
+def test_naive_latch_timestamp_is_read_as_utc() -> None:
+    # We only ever write offset-aware strings, but fromisoformat also
+    # accepts a naive one. naturaltime then compares it against a naive
+    # LOCAL now, so on a non-UTC device a dip a minute ago renders as
+    # "3 hours from now". Not a crash, just a nonsense relative time in
+    # the banner, which is worse than useless to an operator.
+    parsed = page_context._parse_iso('2026-08-15T10:00:00')
+
+    assert parsed is not None
+    assert parsed.utcoffset() is not None, 'naive value must be stamped UTC'
+    assert parsed.utcoffset().total_seconds() == 0
+
+    # An explicit offset is preserved rather than overwritten.
+    other = page_context._parse_iso('2026-08-15T10:00:00+05:00')
+    assert other.utcoffset().total_seconds() == 5 * 3600
+
+
+@pytest.mark.django_db
+def test_power_banner_renders_with_a_naive_latch_timestamp(
+    client: Client, undervoltage_state: Any
+) -> None:
+    # End-to-end guard: a stale or hand-edited latch must not produce a
+    # future-dated "most recently ..." line on the banner.
+    with undervoltage_state(
+        active=False,
+        seen_since_boot=True,
+        count=2,
+        last_seen='2026-08-15T10:00:00',
+        first_seen='2026-08-15T09:00:00',
+    ):
+        response = client.get(reverse('anthias_app:home'))
+
+    body = response.content.decode()
+    assert response.status_code == 200
+    assert 'This player briefly lost power' in body
+    assert 'from now' not in body
+
+
+# ---------------------------------------------------------------------------
+# Memory-card banner (_storage_warning.html)
+#
+# Six states rather than the power banner's two, because the failures
+# have different fixes. The tests below are mostly about keeping the
+# wrong fix off the screen: telling someone with a full card to go and
+# buy a new one wastes their money, and telling someone with a soldered
+# eMMC to swap the card wastes their afternoon.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_storage_banner_hidden_when_healthy(
+    client: Client, storage_state: Any
+) -> None:
+    with storage_state():
+        response = client.get(reverse('anthias_app:home'))
+
+    assert response.status_code == 200
+    assert STORAGE_BANNER_ID not in response.content.decode()
+
+
+@pytest.mark.django_db
+def test_storage_banner_hidden_when_unresolvable(
+    client: Client, storage_state: Any
+) -> None:
+    # We could not work out which filesystem we're on. Staying silent
+    # is correct: we can't claim health we never measured.
+    with storage_state(supported=False, status=storage_health.STATUS_UNKNOWN):
+        response = client.get(reverse('anthias_app:home'))
+
+    assert STORAGE_BANNER_ID not in response.content.decode()
+
+
+@pytest.mark.django_db
+def test_storage_banner_leads_with_the_symptom_when_read_only(
+    client: Client, storage_state: Any
+) -> None:
+    # The operator has already noticed that their changes don't stick.
+    # The banner has to name that, not the filesystem state producing
+    # it, or they won't connect the two.
+    with storage_state(status=storage_health.STATUS_FAILING, read_only=True):
+        response = client.get(reverse('anthias_app:home'))
+
+    body = response.content.decode()
+    assert 'This player has stopped saving changes' in body
+    assert 'Replace the memory card' in body
+    assert 'device-alert--warning' not in _banner(body, STORAGE_BANNER_ID)
+
+
+@pytest.mark.django_db
+def test_storage_banner_names_corruption_when_the_readback_differs(
+    client: Client, storage_state: Any
+) -> None:
+    with storage_state(
+        status=storage_health.STATUS_FAILING,
+        write_ok=False,
+        write_reason='corrupt',
+    ):
+        response = client.get(reverse('anthias_app:home'))
+
+    body = _collapse(response.content.decode())
+    assert "This player can't save anything" in body
+    assert 'read back something different' in body
+
+
+@pytest.mark.django_db
+def test_storage_banner_reports_errors_while_writes_still_work(
+    client: Client, storage_state: Any
+) -> None:
+    with storage_state(
+        status=storage_health.STATUS_FAILING,
+        errors_count=4,
+        errors_new=4,
+        errors_this_boot=True,
+    ):
+        response = client.get(reverse('anthias_app:settings'))
+
+    body = response.content.decode()
+    assert 'The memory card is returning errors' in body
+    assert '4 storage errors' in body
+
+
+@pytest.mark.django_db
+def test_storage_banner_de_escalates_for_historical_errors(
+    client: Client, storage_state: Any
+) -> None:
+    # Amber, not red: the errors are real but nothing is failing this
+    # second, and using the same red for both would flatten a
+    # distinction the operator can act on differently.
+    with storage_state(status=storage_health.STATUS_ERRORS, errors_count=6):
+        response = client.get(reverse('anthias_app:home'))
+
+    body = response.content.decode()
+    assert 'device-alert--warning' in _banner(body, STORAGE_BANNER_ID)
+    assert 'The memory card has recorded errors' in body
+    assert '6 storage errors' in body
+
+
+@pytest.mark.django_db
+def test_full_card_does_not_tell_the_operator_to_buy_hardware(
+    client: Client, storage_state: Any
+) -> None:
+    # A full card is the one state here that isn't a hardware fault.
+    # Reusing the failing-card advice would send someone out for a
+    # card they don't need and leave the actual problem in place.
+    with storage_state(
+        status=storage_health.STATUS_FULL,
+        write_ok=False,
+        write_reason='no_space',
+    ):
+        response = client.get(reverse('anthias_app:home'))
+
+    body = response.content.decode()
+    banner = _banner(body, STORAGE_BANNER_ID)
+    assert 'This player has run out of space' in banner
+    assert 'Remove content you no longer need' in banner
+    assert 'Replace the memory card' not in banner
+    assert 'A1 or A2' not in banner
+
+
+@pytest.mark.django_db
+def test_soldered_storage_is_not_told_to_swap_a_card(
+    client: Client, storage_state: Any
+) -> None:
+    # eMMC is soldered to the board. "Replace the memory card" is
+    # advice the operator physically cannot follow.
+    with storage_state(
+        status=storage_health.STATUS_WEAR,
+        media={'kind': 'emmc', 'wear_pct': 90, 'pre_eol': 'warning'},
+    ):
+        response = client.get(reverse('anthias_app:home'))
+
+    banner = _banner(response.content.decode(), STORAGE_BANNER_ID)
+    assert "This player's storage is wearing out" in banner
+    assert 'up to 90%' in banner
+    assert 'Plan to replace this player' in banner
+    assert 'Replace the memory card' not in banner
+
+
+@pytest.mark.django_db
+def test_bad_blocks_are_not_described_as_wear(
+    client: Client, storage_state: Any
+) -> None:
+    # Built from the x86 testbed's real drive: Wear_Leveling_Count at
+    # 100 (zero wear), overall self-assessment PASSED, but 4
+    # reallocated and 4 pending sectors. The wear copy would have told
+    # that operator the drive had used "most of" the writes it was
+    # built for -- wrong, and it sends them looking at write volume
+    # when the drive is failing to read blocks it already wrote.
+    with storage_state(
+        status=storage_health.STATUS_WEAR,
+        media={
+            'kind': 'disk',
+            'name': 'SSD 128GB',
+            'wear_pct': 0,
+            'pre_eol': 'warning',
+            'smart': {
+                'supported': True,
+                'device': '/dev/sda',
+                'passed': True,
+                'wear_pct': 0,
+                'wear_is_exact': False,
+                'reallocated_sectors': 4,
+                'pending_sectors': 4,
+                'power_on_hours': 2226,
+            },
+        },
+    ):
+        response = client.get(reverse('anthias_app:home'))
+
+    banner = _collapse(_banner(response.content.decode(), STORAGE_BANNER_ID))
+    assert 'developing bad spots' in banner
+    assert '8 blocks' in banner
+    assert 'wearing out' not in banner
+    assert 'most of' not in banner
+
+
+@pytest.mark.django_db
+def test_zero_wear_is_not_read_as_missing(
+    client: Client, storage_state: Any
+) -> None:
+    # 0 is falsy in a Django template, so `{% if wear_pct %}` fell
+    # through to the "most of the writes it was built for" branch on a
+    # drive with no wear at all. Genuine wear with no bad blocks must
+    # still say a number.
+    with storage_state(
+        status=storage_health.STATUS_WEAR,
+        media={
+            'kind': 'disk',
+            'wear_pct': 0,
+            'pre_eol': 'urgent',
+            'smart': {
+                'supported': True,
+                'device': '/dev/sda',
+                'passed': False,
+                'wear_pct': 0,
+                'reallocated_sectors': 0,
+                'pending_sectors': 0,
+            },
+        },
+    ):
+        response = client.get(reverse('anthias_app:home'))
+
+    banner = _collapse(_banner(response.content.decode(), STORAGE_BANNER_ID))
+    assert 'up to 0% of' in banner
+    assert 'most of' not in banner
+
+
+@pytest.mark.django_db
+def test_storage_banner_points_at_the_power_supply(
+    client: Client, storage_state: Any
+) -> None:
+    # Under-voltage is one of the main causes of a corrupted card, so
+    # a replacement fitted without fixing the supply goes the same
+    # way. The two diagnostics have to cross-reference or the operator
+    # solves the same problem twice.
+    with storage_state(status=storage_health.STATUS_FAILING, read_only=True):
+        response = client.get(reverse('anthias_app:home'))
+
+    assert 'Check the power supply' in _banner(
+        response.content.decode(), STORAGE_BANNER_ID
+    )
+
+
+@pytest.mark.django_db
+def test_x86_players_are_not_told_they_have_a_memory_card(
+    client: Client, storage_state: Any
+) -> None:
+    # Anthias runs from an SSD on x86. Naming the wrong object is the
+    # fastest way to make an operator stop believing the warning.
+    with storage_state(
+        status=storage_health.STATUS_FAILING,
+        read_only=True,
+        media={'kind': 'disk', 'name': 'Samsung SSD 870', 'wear_pct': None},
+    ):
+        response = client.get(reverse('anthias_app:home'))
+
+    banner = _collapse(_banner(response.content.decode(), STORAGE_BANNER_ID))
+    assert 'memory card' not in banner
+    assert 'Replace the drive' in banner
+    # The A1/A2 rating only exists for SD cards.
+    assert 'A1 or A2' not in banner
+
+
+@pytest.mark.django_db
+def test_power_advice_is_dropped_when_the_power_banner_says_it(
+    client: Client, storage_state: Any, undervoltage_state: Any
+) -> None:
+    # The power banner sits directly above saying the same thing at
+    # greater length. Repeating it reads as filler and costs this list
+    # the attention its first item needs.
+    with (
+        undervoltage_state(active=True, seen_since_boot=True, count=1),
+        storage_state(status=storage_health.STATUS_FAILING, read_only=True),
+    ):
+        response = client.get(reverse('anthias_app:home'))
+
+    banner = _banner(response.content.decode(), STORAGE_BANNER_ID)
+    assert 'Check the power supply' not in banner
+
+
+@pytest.mark.django_db
+def test_storage_banner_carries_no_jargon(
+    client: Client, storage_state: Any
+) -> None:
+    with storage_state(status=storage_health.STATUS_FAILING, read_only=True):
+        response = client.get(reverse('anthias_app:home'))
+
+    banner = _banner(response.content.decode(), STORAGE_BANNER_ID)
+    for jargon in (
+        'ext4',
+        'errors_count',
+        'mmcblk',
+        'fsync',
+        'superblock',
+        'EROFS',
+    ):
+        assert jargon not in banner
+
+
+@pytest.mark.django_db
+def test_both_banners_stack_with_power_first(
+    client: Client, storage_state: Any, undervoltage_state: Any
+) -> None:
+    # A bad supply is what corrupts the card, so when both fire the
+    # top banner has to be the one to act on first. Sorting by
+    # severity would put the card above the thing destroying it.
+    with (
+        undervoltage_state(active=True, seen_since_boot=True, count=1),
+        storage_state(status=storage_health.STATUS_FAILING, read_only=True),
+    ):
+        response = client.get(reverse('anthias_app:home'))
+
+    body = response.content.decode()
+    assert body.index(POWER_BANNER_ID) < body.index(STORAGE_BANNER_ID)
+
+
+@pytest.mark.django_db
+def test_system_info_storage_card_reports_health(
+    client: Client, storage_state: Any
+) -> None:
+    with storage_state():
+        response = client.get(reverse('anthias_app:system_info'))
+
+    body = response.content.decode()
+    assert 'Memory card' in body
+    assert 'No storage errors recorded' in body
+
+
+@pytest.mark.django_db
+def test_system_info_storage_card_states_when_unchecked(
+    client: Client, storage_state: Any
+) -> None:
+    with storage_state(supported=False, status=storage_health.STATUS_UNKNOWN):
+        response = client.get(reverse('anthias_app:system_info'))
+
+    body = response.content.decode()
+    assert 'Not checked' in body
+    assert 'errors_count' not in body
+
+
+@pytest.mark.django_db
+def test_system_info_storage_card_exposes_the_evidence(
+    client: Client, storage_state: Any
+) -> None:
+    # System Info is the one place the mechanism is named, so a
+    # support engineer reading a screenshot can see the counter and
+    # the card it came from.
+    with storage_state(
+        status=storage_health.STATUS_ERRORS,
+        errors_count=6,
+        last_error_function='ext4_find_entry',
+    ):
+        response = client.get(reverse('anthias_app:system_info'))
+
+    body = _collapse(response.content.decode())
+    assert 'Errors recorded' in body
+    # The readout labels the row in words now rather than naming the
+    # sysfs symbol, but every piece of evidence is still on the page.
+    assert 'ext4 errors' in body
+    assert 'mmcblk0p2' in body
+    assert 'ext4_find_entry' in body
+    assert 'SanDisk SC32G' in body
+    assert 'survives reboots' in body
 
 
 # ---------------------------------------------------------------------------

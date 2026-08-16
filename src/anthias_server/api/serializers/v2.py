@@ -1,5 +1,5 @@
-from datetime import timezone
-from typing import Any
+from datetime import UTC
+from typing import Any, ClassVar
 
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema_field
@@ -9,6 +9,7 @@ from rest_framework.serializers import (
     CharField,
     ChoiceField,
     DateTimeField,
+    DictField,
     IntegerField,
     ListField,
     ModelSerializer,
@@ -18,13 +19,34 @@ from rest_framework.serializers import (
 )
 
 from anthias_common.utils import SCREEN_ROTATION_CHOICES
-from anthias_server.app.models import (
-    Asset,
-    REFRESH_INTERVAL_S_MAX,
-    clamp_refresh_interval,
-)
 from anthias_server.api.serializers import UpdateAssetSerializer
 from anthias_server.api.serializers.mixins import CreateAssetSerializerMixin
+from anthias_server.app.models import (
+    DURATION_S_MAX,
+    MAX_ASSET_HEADERS,
+    REFRESH_INTERVAL_S_MAX,
+    Asset,
+    clamp_refresh_interval,
+    normalize_asset_headers,
+    validate_asset_headers,
+)
+from anthias_server.django_project.settings import is_valid_time_zone
+from anthias_server.lib import display_power
+
+
+def _validate_hhmm(value: str) -> str:
+    """Normalise an ``HH:MM`` (or ``HH:MM:SS``) time to ``HH:MM``.
+
+    Rejects rather than ignores a malformed value. The HTML form keeps
+    the previous setting and shows a toast, but an API client gets a 400:
+    silently discarding a field it explicitly sent would be worse.
+    """
+    parsed = display_power.parse_hhmm(value)
+    if parsed is None:
+        raise serializers.ValidationError(
+            f'Invalid time {value!r}: expected HH:MM.'
+        )
+    return parsed.strftime('%H:%M')
 
 
 def _normalise_play_days(value: list[int]) -> list[int]:
@@ -63,6 +85,31 @@ def _normalise_play_days(value: list[int]) -> list[int]:
 # value without drift.
 
 
+def _validate_custom_headers(value: Any) -> dict[str, str]:
+    """Strictly validate the write-side ``custom_headers`` payload,
+    translating the model's ``ValueError`` into a DRF 400.
+
+    Delegates to ``validate_asset_headers`` (the single source of truth
+    for the header-name / value rules and the count cap) so the API and
+    the viewer read path can't drift apart.
+
+    On failure we raise a fixed, self-authored message rather than
+    surfacing the caught exception's text: the rules are few and the
+    operator supplied the offending value themselves, so a static
+    description is just as actionable and keeps any exception detail off
+    the HTTP response (CodeQL "information exposure through an
+    exception").
+    """
+    try:
+        return validate_asset_headers(value)
+    except ValueError:
+        raise serializers.ValidationError(
+            'Invalid custom headers. Each entry needs a valid header-name '
+            "token (letters, digits, and !#$%&'*+-.^_`|~) and a value with "
+            f'no CR/LF, and at most {MAX_ASSET_HEADERS} headers are allowed.'
+        ) from None
+
+
 def _validate_time_window(
     attrs: dict[str, Any],
     instance: Asset | None = None,
@@ -99,6 +146,7 @@ class AssetSerializerV2(ModelSerializer[Asset], CreateAssetSerializerMixin):
     is_active = SerializerMethodField()
     play_days = SerializerMethodField()
     refresh_interval_s = SerializerMethodField()
+    custom_headers = SerializerMethodField()
     metadata = SerializerMethodField()
 
     @extend_schema_field(OpenApiTypes.BOOL)
@@ -128,6 +176,17 @@ class AssetSerializerV2(ModelSerializer[Asset], CreateAssetSerializerMixin):
             (obj.metadata or {}).get('refresh_interval_s', 0)
         )
 
+    @extend_schema_field(
+        {'type': 'object', 'additionalProperties': {'type': 'string'}}
+    )
+    def get_custom_headers(self, obj: Asset) -> dict[str, str]:
+        # Per-asset custom request headers for webpage assets (#2215),
+        # surfaced as a first-class field like ``refresh_interval_s`` but
+        # written back into ``metadata['headers']``. Sanitised on read so
+        # a legacy / hand-edited row can never echo an unsafe (CR/LF)
+        # value or a non-string blob. Empty {} = no custom headers.
+        return normalize_asset_headers((obj.metadata or {}).get('headers'))
+
     @extend_schema_field({'type': 'object', 'additionalProperties': True})
     def get_metadata(self, obj: Asset) -> dict[str, Any]:
         # Sanitise ``refresh_interval_s`` in the embedded metadata too,
@@ -141,11 +200,16 @@ class AssetSerializerV2(ModelSerializer[Asset], CreateAssetSerializerMixin):
             raw['refresh_interval_s'] = clamp_refresh_interval(
                 raw['refresh_interval_s']
             )
+        # Same posture for the custom headers bag: keep the embedded
+        # ``metadata.headers`` consistent with the top-level
+        # ``custom_headers`` field a client also reads off this response.
+        if 'headers' in raw:
+            raw['headers'] = normalize_asset_headers(raw['headers'])
         return raw
 
     class Meta:
         model = Asset
-        fields = [
+        fields: ClassVar = [
             'asset_id',
             'name',
             'uri',
@@ -157,6 +221,7 @@ class AssetSerializerV2(ModelSerializer[Asset], CreateAssetSerializerMixin):
             'nocache',
             'play_order',
             'skip_asset_check',
+            'skip_ssl_verify',
             'is_active',
             'is_processing',
             'play_days',
@@ -166,8 +231,9 @@ class AssetSerializerV2(ModelSerializer[Asset], CreateAssetSerializerMixin):
             'last_reachability_check',
             'metadata',
             'refresh_interval_s',
+            'custom_headers',
         ]
-        read_only_fields = [
+        read_only_fields: ClassVar = [
             'is_reachable',
             'last_reachability_check',
             # ``metadata`` is owned by the upload-pipeline tasks
@@ -200,15 +266,16 @@ class CreateAssetSerializerV2(
     ext = CharField(write_only=True, required=False)
     name = CharField()
     uri = CharField()
-    start_date = DateTimeField(default_timezone=timezone.utc)
-    end_date = DateTimeField(default_timezone=timezone.utc)
-    duration = IntegerField()
+    start_date = DateTimeField(default_timezone=UTC)
+    end_date = DateTimeField(default_timezone=UTC)
+    duration = IntegerField(min_value=0, max_value=DURATION_S_MAX)
     mimetype = CharField()
     is_enabled = BooleanField()
     is_processing = BooleanField(required=False)
     nocache = BooleanField(required=False)
     play_order = IntegerField(required=False)
     skip_asset_check = BooleanField(required=False)
+    skip_ssl_verify = BooleanField(required=False)
     play_days = ListField(
         child=IntegerField(min_value=1, max_value=7),
         required=False,
@@ -228,9 +295,24 @@ class CreateAssetSerializerV2(
         min_value=0,
         max_value=REFRESH_INTERVAL_S_MAX,
     )
+    # write_only for the same reason as ``refresh_interval_s`` above:
+    # ``Asset`` has no ``custom_headers`` column — the value lives inside
+    # ``metadata['headers']`` and is surfaced back via
+    # ``AssetSerializerV2.get_custom_headers``. ``DictField`` gives a
+    # clean 400 on a non-object; ``validate_custom_headers`` enforces the
+    # header-name/value rules. No ``child=CharField``: that would *coerce*
+    # a numeric/boolean JSON value (``{"X": 123}`` -> ``"123"``) instead
+    # of rejecting it. The unvalidated child passes values through
+    # verbatim so ``validate_asset_headers``' ``isinstance(str)`` gate
+    # can 400 non-string values (and no CharField trimming mangles a
+    # value we send on the wire byte-for-byte).
+    custom_headers = DictField(required=False, write_only=True)
 
     def validate_play_days(self, value: Any) -> list[int]:
         return _normalise_play_days(value)
+
+    def validate_custom_headers(self, value: Any) -> dict[str, str]:
+        return _validate_custom_headers(value)
 
     def validate(self, data: dict[str, Any]) -> dict[str, Any]:
         _validate_time_window(data)
@@ -249,6 +331,20 @@ class CreateAssetSerializerV2(
             metadata = dict(prepared.get('metadata') or {})
             metadata['refresh_interval_s'] = int(data['refresh_interval_s'])
             prepared['metadata'] = metadata
+        # POST round-trip for the per-asset custom headers, mirroring the
+        # refresh-interval handling above: fold into ``metadata`` so a
+        # freshly-created webpage asset carries its headers without a
+        # follow-up PATCH. An explicit empty object clears the key rather
+        # than storing ``{}`` so ``metadata`` stays clean for assets that
+        # didn't ask for headers.
+        if 'custom_headers' in data:
+            metadata = dict(prepared.get('metadata') or {})
+            headers = data['custom_headers']
+            if headers:
+                metadata['headers'] = headers
+            else:
+                metadata.pop('headers', None)
+            prepared['metadata'] = metadata
         return prepared
 
 
@@ -257,7 +353,8 @@ class UpdateAssetSerializerV2(UpdateAssetSerializer):
     is_processing = BooleanField(required=False)
     nocache = BooleanField(required=False)
     skip_asset_check = BooleanField(required=False)
-    duration = IntegerField()
+    skip_ssl_verify = BooleanField(required=False)
+    duration = IntegerField(min_value=0, max_value=DURATION_S_MAX)
     play_days = ListField(
         child=IntegerField(min_value=1, max_value=7),
         required=False,
@@ -269,9 +366,16 @@ class UpdateAssetSerializerV2(UpdateAssetSerializer):
         min_value=0,
         max_value=REFRESH_INTERVAL_S_MAX,
     )
+    # No ``child=CharField`` — see CreateAssetSerializerV2.custom_headers:
+    # the unvalidated child preserves value types so a non-string value is
+    # rejected (not coerced) and header values aren't trimmed.
+    custom_headers = DictField(required=False)
 
     def validate_play_days(self, value: Any) -> list[int]:
         return _normalise_play_days(value)
+
+    def validate_custom_headers(self, value: Any) -> dict[str, str]:
+        return _validate_custom_headers(value)
 
     def validate(self, data: dict[str, Any]) -> dict[str, Any]:
         return _validate_time_window(data, instance=self.instance)
@@ -296,6 +400,20 @@ class UpdateAssetSerializerV2(UpdateAssetSerializer):
                 validated_data['refresh_interval_s']
             )
             instance.metadata = metadata
+        if 'custom_headers' in validated_data:
+            # Merge into metadata for the same reason as
+            # refresh_interval_s: pipeline-owned keys (original_ext,
+            # transcoded, error_message) must survive. An empty object
+            # clears the headers rather than storing ``{}``. Like
+            # refresh_interval_s, we accept and persist this on any
+            # asset, but the viewer only injects it for webpage assets.
+            metadata = dict(instance.metadata or {})
+            headers = validated_data['custom_headers']
+            if headers:
+                metadata['headers'] = headers
+            else:
+                metadata.pop('headers', None)
+            instance.metadata = metadata
         return super().update(instance, validated_data)
 
 
@@ -305,6 +423,7 @@ class DeviceSettingsSerializerV2(Serializer[Any]):
     default_duration = IntegerField()
     default_streaming_duration = IntegerField()
     date_format = CharField()
+    timezone = CharField(allow_blank=True)
     auth_backend = CharField()
     show_splash = BooleanField()
     default_assets = BooleanField()
@@ -312,25 +431,48 @@ class DeviceSettingsSerializerV2(Serializer[Any]):
     use_24_hour_clock = BooleanField()
     debug_logging = BooleanField()
     prefer_dark_mode = BooleanField()
+    verify_ssl = BooleanField()
     # Mirror the PATCH-side ChoiceField so the OpenAPI schema
     # advertises the same enum on both directions — clients can rely
     # on the value being one of {0, 90, 180, 270} when reading too.
     screen_rotation = ChoiceField(choices=SCREEN_ROTATION_CHOICES)
     username = CharField()
+    # Scheduled display power. Times are 'HH:MM' in the device's
+    # configured timezone; days is a comma-separated list of Python
+    # weekday numbers (Monday=0) naming the days an on-period *begins*
+    # — which is what governs a schedule that wraps past midnight.
+    display_power_schedule_enabled = BooleanField()
+    display_power_on_time = CharField()
+    display_power_off_time = CharField()
+    display_power_days = CharField(allow_blank=True)
 
 
 class UpdateDeviceSettingsSerializerV2(Serializer[Any]):
     player_name = CharField(required=False, allow_blank=True)
     audio_output = CharField(required=False)
-    default_duration = IntegerField(required=False)
-    default_streaming_duration = IntegerField(required=False)
+    # Bounded like Asset.duration — these defaults get copied onto new
+    # asset rows (CreateAssetSerializerMixin, HTML add-asset path), so
+    # a poisoned default would reach the viewer's Event.wait the same
+    # way a bad per-asset duration does (Sentry ANTHIAS-3E).
+    default_duration = IntegerField(
+        required=False, min_value=0, max_value=DURATION_S_MAX
+    )
+    default_streaming_duration = IntegerField(
+        required=False, min_value=0, max_value=DURATION_S_MAX
+    )
     date_format = CharField(required=False)
+    # Blank defers to resolve_time_zone() (TZ env -> /etc/timezone ->
+    # UTC). A non-blank value must be a zone Django will accept,
+    # validated the same way as the host zone so a save can never land a
+    # value that crash-loops the settings module on the next read.
+    timezone = CharField(required=False, allow_blank=True)
     show_splash = BooleanField(required=False)
     default_assets = BooleanField(required=False)
     shuffle_playlist = BooleanField(required=False)
     use_24_hour_clock = BooleanField(required=False)
     debug_logging = BooleanField(required=False)
     prefer_dark_mode = BooleanField(required=False)
+    verify_ssl = BooleanField(required=False)
     screen_rotation = ChoiceField(
         required=False, choices=SCREEN_ROTATION_CHOICES
     )
@@ -346,6 +488,48 @@ class UpdateDeviceSettingsSerializerV2(Serializer[Any]):
         ],
     )
     current_password = CharField(required=False, allow_blank=True)
+    # Scheduled display power — mirrors the HTML form path in
+    # anthias_app.views._apply_display_power_schedule_settings.
+    display_power_schedule_enabled = BooleanField(required=False)
+    display_power_on_time = CharField(required=False)
+    display_power_off_time = CharField(required=False)
+    display_power_days = CharField(required=False, allow_blank=True)
+
+    def validate_display_power_on_time(self, value: str) -> str:
+        return _validate_hhmm(value)
+
+    def validate_display_power_off_time(self, value: str) -> str:
+        return _validate_hhmm(value)
+
+    def validate_display_power_days(self, value: str) -> str:
+        """Normalise the weekday list.
+
+        Rejected rather than silently coerced: unlike the HTML form —
+        where an empty checkbox set legitimately means "every day" — an
+        API client that sends garbage has made a mistake and should be
+        told, not have it reinterpreted.
+        """
+        raw = (value or '').strip()
+        if not raw:
+            return display_power.ALL_DAYS
+        days = []
+        for token in raw.split(','):
+            token = token.strip()
+            if not token.isdigit() or not 0 <= int(token) <= 6:
+                raise serializers.ValidationError(
+                    f'Invalid weekday {token!r}: expected 0-6 '
+                    '(Monday=0), comma-separated.'
+                )
+            days.append(int(token))
+        return ','.join(str(d) for d in sorted(set(days)))
+
+    def validate_timezone(self, value: str) -> str:
+        value = (value or '').strip()
+        if value and not is_valid_time_zone(value):
+            raise serializers.ValidationError(
+                f'Unknown or unavailable timezone: {value}.'
+            )
+        return value
 
 
 class ViewerPlaylistSerializerV2(Serializer[Any]):
@@ -403,3 +587,22 @@ class ScreenlyMigrateAssetSerializerV2(Serializer[Any]):
     token = CharField(write_only=True)
     asset_id = CharField()
     asset_group_id = CharField(required=False, allow_blank=True)
+
+
+class ImportValidateSerializerV2(Serializer[Any]):
+    """Request body for validating an import provider's token."""
+
+    token = CharField(write_only=True)
+
+
+class ImportItemSerializerV2(Serializer[Any]):
+    """Request body for importing a single remote media item.
+
+    ``enable`` defaults to True so the wizard's per-item calls don't have
+    to send it on every request; the operator toggles it once and it
+    rides on each item POST.
+    """
+
+    token = CharField(write_only=True)
+    remote_id = CharField()
+    enable = BooleanField(required=False, default=True)

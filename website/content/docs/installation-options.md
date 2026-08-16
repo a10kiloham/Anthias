@@ -6,7 +6,13 @@ aliases:
   - "/docs/installation-options/"
 ---
 
-The quickest way to get started on a Raspberry Pi is to use [Raspberry Pi Imager](https://www.raspberrypi.com/software/), where you can find Anthias under **Other specific-purpose OS &rarr; Digital signage and kiosks &rarr; Anthias**. Pick the entry that matches your Pi (Pi 2, Pi 3, Pi 4, or Pi 5), select your SD card, and flash &mdash; the device boots straight into Anthias.
+## Recommended: Raspberry Pi Imager
+
+> **Recommended for most users**
+>
+> No command line, no scripts, just flash an SD card and boot. If you're not sure which method to use, use this one. The [scripted install](#advanced-scripted-install-on-raspberry-pi-os-lite-or-debian) further down is for advanced users who want to install onto an existing Raspberry Pi OS Lite / Debian system or a PC.
+
+The quickest way to get started on a Raspberry Pi is to use [Raspberry Pi Imager](https://www.raspberrypi.com/software/), where you can find Anthias under **Other specific-purpose OS &rarr; Digital signage and kiosks &rarr; Anthias**. Pick the entry that matches your Pi (Pi 2, Pi 3, Pi 4, or Pi 5), select your SD card, and flash. The device boots straight into Anthias.
 
 ![Raspberry Pi Imager showing Other specific-purpose OS category](/docs/images/imager-01.png)
 
@@ -14,7 +20,7 @@ The quickest way to get started on a Raspberry Pi is to use [Raspberry Pi Imager
 
 ![Raspberry Pi Imager confirming the SD card target before writing Anthias](/docs/images/imager-03.png)
 
-# Using the images from balenaHub
+## Using the images from balenaHub
 
 > **Important**
 >
@@ -28,10 +34,10 @@ here are the links to the images:
 
 * [Raspberry Pi 5](https://hub.balena.io/fleets-for-good/2209774/anthias-pi5)
 * [Raspberry Pi 4](https://hub.balena.io/fleets-for-good/1971389/anthias-pi4)
-* [Raspberry Pi 3 (64-bit)](#using-the-images-from-the-releases) — recommended for Pi 3 hardware (Qt 6 viewer); ships as `anthias-pi3-64` in the pre-built release images
-* [Raspberry Pi 3 (32-bit)](https://hub.balena.io/fleets-for-good/1971388/anthias-pi3) — legacy; consider the 64-bit image above
+* [Raspberry Pi 3 (64-bit)](#using-the-images-from-the-releases): recommended for Pi 3 hardware (Qt 6 viewer); ships as `anthias-pi3-64` in the pre-built release images
+* [Raspberry Pi 3 (32-bit)](https://hub.balena.io/fleets-for-good/1971388/anthias-pi3): legacy; consider the 64-bit image above
 * [Raspberry Pi 2](https://hub.balena.io/fleets-for-good/1971385/anthias-pi2)
-* [Rock Pi 4 (Model B)](#using-the-images-from-the-releases) — ships as `anthias-rockpi4` in the pre-built release images
+* [Rock Pi 4 (Model B)](#using-the-images-from-the-releases): ships as `anthias-rockpi4` in the pre-built release images
 
 Go to one of the links above and click the *Join* button, then select either *Ethernet only* or *Wifi + Ethernet* for Network options.
 You can either click the *Flash* button to open balenaEtcher (make sure that it's installed) or download the image file and flash it using your preferred imager.
@@ -39,14 +45,14 @@ Flash the SD card and boot up your Raspberry Pi. It will take a few minutes to b
 
 Alternatively, you can [download our pre-built Balena disk images from the releases](#using-the-images-from-the-releases).
 
-# Using the images from the releases
+## Using the images from the releases
 
-You can find the latest release [here](https://github.com/a10kiloham/Anthias/releases/latest). From there, you can download the disk image that you need and flash it to your SD card.
+You can find the [latest release on GitHub](https://github.com/a10kiloham/Anthias/releases/latest). From there, you can download the disk image that you need and flash it to your SD card.
 The image file looks something like `<yyyy>-<mm>-<dd>-anthias-<board>.img.xz`. Take note that the `.img` file is compressed in this `.img.xz` file.
 
 > **Note**
 >
-> We release the images in `.img.xz` format so that they are smaller in size. Both [Raspberry Pi Imager](https://www.raspberrypi.com/software/) and [balenaEtcher](https://etcher.balena.io/) flash `.img.xz` files directly &mdash; there's no need to decompress them first. If you ever want the raw `.img`, you can extract it yourself:
+> We release the images in `.img.xz` format so that they are smaller in size. Both [Raspberry Pi Imager](https://www.raspberrypi.com/software/) and [balenaEtcher](https://etcher.balena.io/) flash `.img.xz` files directly. There's no need to decompress them first. If you ever want the raw `.img`, you can extract it yourself:
 >
 > ```
 > xz -d <yyyy>-<mm>-<dd>-anthias-<board>.img.xz
@@ -54,7 +60,7 @@ The image file looks something like `<yyyy>-<mm>-<dd>-anthias-<board>.img.xz`. T
 
 > **macOS: "Error writing to storage device"**
 >
-> Raspberry Pi Imager **2.0.2 through at least 2.0.7** has a macOS bug that aborts mid-write with *"Error writing to storage device. Some writes failed to complete."* It is triggered by writing any image that is decompressed on the fly &mdash; our `.img.xz` images as well as uncompressed `.img` files (see rpi-imager [#1605](https://github.com/raspberrypi/rpi-imager/issues/1605) and [#1489](https://github.com/raspberrypi/rpi-imager/issues/1489)). The card itself is fine.
+> Raspberry Pi Imager **2.0.2 through at least 2.0.7** has a macOS bug that aborts mid-write with *"Error writing to storage device. Some writes failed to complete."* It is triggered by writing any image that is decompressed on the fly, our `.img.xz` images as well as uncompressed `.img` files (see rpi-imager [#1605](https://github.com/raspberrypi/rpi-imager/issues/1605) and [#1489](https://github.com/raspberrypi/rpi-imager/issues/1489)). The card itself is fine.
 >
 > The fix was merged upstream in [rpi-imager#1621](https://github.com/raspberrypi/rpi-imager/pull/1621) (May 2026), so the simplest solution is to **update Raspberry Pi Imager to a release newer than 2.0.7**. If you can't update, work around it by decompressing the image yourself and flashing the resulting `.img`:
 >
@@ -66,15 +72,19 @@ The image file looks something like `<yyyy>-<mm>-<dd>-anthias-<board>.img.xz`. T
 
 Devices installed from a disk image join the balena fleet and track the latest stable release. The image ships preloaded with the release it was built from, so the device boots and runs fully offline out of the box, then receives later releases automatically over the air once it has connectivity.
 
-# Installing on Raspberry Pi OS Lite or Debian
+## Advanced: scripted install on Raspberry Pi OS Lite or Debian
+
+> **Advanced method**
+>
+> This method uses the command line and is aimed at users who want more control, a specific OS, an existing Raspberry Pi OS Lite / Debian install, or a PC (x86). **If you just want to get going on a Raspberry Pi, use the [Raspberry Pi Imager method](#recommended-raspberry-pi-imager) above instead.**
 
 #### Overview
 
-If you'd like more control over your digital signage instance, try installing it on Raspberry Pi OS Lite or Debian.
+If you'd like more control over your digital signage instance, you can install it on Raspberry Pi OS Lite or Debian with a single command.
 
 > **Important**
 >
-> Installing on a **PC (x86)**? Follow the [PC installation guide](/docs/pc/) first to prepare Debian — the script below assumes that setup.
+> Installing on a **PC (x86)**? Follow the [PC installation guide](/docs/pc/) first to prepare Debian, the script below assumes that setup.
 
 > **Note**
 >
@@ -91,6 +101,18 @@ The TL;DR for on [Raspberry Pi OS](https://www.raspberrypi.com/software/) or Deb
 ```
 $ bash <(curl -sL https://install-anthias.srly.io)
 ```
+
+> **Prefer to read the script before running it?**
+>
+> Piping a remote script straight into your shell is convenient, but it's perfectly reasonable to want to see what it does first. Download it, review it, then run it:
+>
+> ```
+> curl -fsSL https://install-anthias.srly.io -o install-anthias.sh
+> less install-anthias.sh   # read through it
+> bash install-anthias.sh
+> ```
+>
+> The installer is open source. You can also read it in the [Anthias repository](https://github.com/a10kiloham/Anthias/blob/master/bin/install.sh).
 
 You'll be prompted with the following questions:
 
@@ -121,7 +143,7 @@ Opting for network management will enable and configure the [NetworkManager](htt
 
 #### Prompt: Version Selection
 
-You can choose between the following choices &mdash; `latest` and `tag`.
+You can choose between the following choices: `latest` and `tag`.
 
 * Selecting `latest` will install the version from the `master` branch.
 * Selecting `tag` will prompt you to enter a specific tag to install.
@@ -152,12 +174,12 @@ You have the option to reboot now or later. On the next boot, make sure to run
 
 Otherwise, if you've selected **No** for the system upgrade, then you don't need to do a reboot for the containers to be started. However, it's still recommended to do a reboot.
 
-# Installing with Balena
+## Installing with Balena
 
 Go through the steps in [this documentation](/docs/balena/)
 to deploy Anthias on your own Balena fleet.
 
-# Installing on a Raspberry Pi 5 with an SSD
+## Installing on a Raspberry Pi 5 with an SSD
 
 Go through the steps in [this documentation](/docs/pi5-ssd/)
 to deploy Anthias on a Pi5 with an SSD

@@ -1,5 +1,5 @@
 import uuid
-from datetime import timezone
+from datetime import UTC
 from os import path, rename
 from typing import Any
 
@@ -17,9 +17,11 @@ from anthias_common.utils import (
     url_fails,
 )
 from anthias_common.youtube import is_youtube_url, youtube_destination_path
+from anthias_server.app.models import DURATION_S_MAX, clamp_duration
 from anthias_server.settings import settings
 
 from . import (
+    DURATION_RANGE_ERROR,
     get_unique_name,
     validate_uri,
 )
@@ -58,8 +60,8 @@ class CreateAssetSerializerV1_1(Serializer[dict[str, Any]]):
 
     name = CharField()
     uri = CharField()
-    start_date = DateTimeField(default_timezone=timezone.utc, required=False)
-    end_date = DateTimeField(default_timezone=timezone.utc, required=False)
+    start_date = DateTimeField(default_timezone=UTC, required=False)
+    end_date = DateTimeField(default_timezone=UTC, required=False)
     duration = CharField(required=False)
     mimetype = CharField()
     is_enabled = IntegerField(min_value=0, max_value=1, required=False)
@@ -155,7 +157,15 @@ class CreateAssetSerializerV1_1(Serializer[dict[str, Any]]):
                             )
                         }
                     )
-                asset['duration'] = int(video_duration.total_seconds())
+                # Clamp (not reject): the file itself is playable,
+                # only a corrupted container header can advertise an
+                # out-of-range length — and that must not put an
+                # over-cap value in the DB (Sentry ANTHIAS-3E).
+                asset['duration'] = clamp_duration(
+                    video_duration.total_seconds()
+                )
+            elif duration_int < 0 or duration_int > DURATION_S_MAX:
+                raise ValidationError({'duration': DURATION_RANGE_ERROR})
             else:
                 asset['duration'] = duration_int
         elif not is_youtube:
@@ -172,6 +182,8 @@ class CreateAssetSerializerV1_1(Serializer[dict[str, Any]]):
                 raise ValidationError(
                     {'duration': 'A valid integer is required.'}
                 )
+            if not 0 <= asset['duration'] <= DURATION_S_MAX:
+                raise ValidationError({'duration': DURATION_RANGE_ERROR})
 
         asset['skip_asset_check'] = int(data.get('skip_asset_check', 0))
 
@@ -194,7 +206,7 @@ class CreateAssetSerializerV1_1(Serializer[dict[str, Any]]):
             and not asset['skip_asset_check']
             and url_fails(asset['uri'])
         ):
-            raise Exception('Could not retrieve file. Check the asset URL.')
+            raise RuntimeError('Could not retrieve file. Check the asset URL.')
 
         # Flag the freshly-uploaded local video for the
         # normalisation pipeline. Fixes GH #2870: pre-fix, v1 / v1.1
