@@ -452,3 +452,117 @@ def test_nesting_a_schedule_row_moves_it_off_the_schedule(
     assert not PlaylistItem.objects.filter(
         playlist=get_default_playlist(), child_playlist=inner
     ).exists()
+
+
+@pytest.mark.django_db
+def test_playlist_schedule_lifecycle(client: Client) -> None:
+    """The full operator journey from the Schedule tab: create a
+    playlist, fill it with existing assets, schedule it for right now
+    (it becomes an Active row and its occurrences play), push its
+    window into the past and disable it (it stops and moves to
+    Inactive), then delete it — the underlying assets must survive and
+    keep playing through the Default playlist."""
+    from anthias_server.app.page_context import assets as assets_context
+    from anthias_server.app.playlist_eval import evaluate_playlist
+
+    def playing_via(playlist_id: str) -> list[str]:
+        active, _ = evaluate_playlist()
+        return [
+            occurrence.asset.asset_id
+            for occurrence in active
+            if any(p.playlist_id == playlist_id for p in occurrence.path)
+        ]
+
+    def schedule_rows(section: str) -> list[str]:
+        return [
+            row['playlist'].name
+            for row in assets_context()[section]
+            if row['kind'] == 'playlist'
+        ]
+
+    first, second = _make_asset('first'), _make_asset('second')
+
+    # Create — the new playlist is a Schedule row (child of Default).
+    _hx(
+        client,
+        reverse('anthias_app:playlists_create'),
+        {'name': 'Lunch loop'},
+    )
+    playlist = Playlist.objects.get(name='Lunch loop')
+    assert playlist.parent_item is not None
+    assert playlist.parent_item.playlist.is_default
+
+    for asset in (first, second):
+        _hx(
+            client,
+            reverse(
+                'anthias_app:playlist_add_asset',
+                args=[playlist.playlist_id],
+            ),
+            {'asset_id': asset.asset_id},
+        )
+
+    # Schedule for now: a date window around the current moment.
+    local_now = timezone.localtime()
+    fmt = '%Y-%m-%dT%H:%M'
+    all_days = [str(day) for day in range(1, 8)]
+    response = _hx(
+        client,
+        reverse('anthias_app:playlists_schedule', args=[playlist.playlist_id]),
+        {
+            'start_date': (local_now - timedelta(hours=1)).strftime(fmt),
+            'end_date': (local_now + timedelta(hours=1)).strftime(fmt),
+            'play_time_from': '',
+            'play_time_to': '',
+            'play_days': all_days,
+            'return': 'schedule',
+        },
+    )
+    assert response.status_code == 200
+    playlist.refresh_from_db()
+    assert playlist.admits()
+    assert 'Lunch loop' in schedule_rows('active_rows')
+    assert playing_via(playlist.playlist_id) == ['first', 'second']
+
+    # Unschedule — a window wholly in the past stops playback...
+    _hx(
+        client,
+        reverse('anthias_app:playlists_schedule', args=[playlist.playlist_id]),
+        {
+            'start_date': (local_now - timedelta(days=2)).strftime(fmt),
+            'end_date': (local_now - timedelta(days=1)).strftime(fmt),
+            'play_days': all_days,
+            'return': 'schedule',
+        },
+    )
+    playlist.refresh_from_db()
+    assert not playlist.admits()
+    assert playing_via(playlist.playlist_id) == []
+
+    # ...and disabling moves the row to the Inactive section.
+    _hx(
+        client,
+        reverse('anthias_app:playlists_toggle', args=[playlist.playlist_id]),
+        {'return': 'schedule'},
+    )
+    playlist.refresh_from_db()
+    assert playlist.is_enabled is False
+    assert 'Lunch loop' not in schedule_rows('active_rows')
+    assert 'Lunch loop' in schedule_rows('inactive_rows')
+
+    # Delete — the playlist and its items go; the assets stay and keep
+    # playing through the Default playlist.
+    _hx(
+        client,
+        reverse('anthias_app:playlists_delete', args=[playlist.playlist_id]),
+        {'return': 'schedule'},
+    )
+    assert not Playlist.objects.filter(
+        playlist_id=playlist.playlist_id
+    ).exists()
+    assert not PlaylistItem.objects.filter(
+        playlist_id=playlist.playlist_id
+    ).exists()
+    assert Asset.objects.filter(asset_id__in=['first', 'second']).count() == 2
+    active, _ = evaluate_playlist()
+    assert {'first', 'second'} <= {o.asset.asset_id for o in active}
