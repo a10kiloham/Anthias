@@ -20,14 +20,8 @@
       </span>
       <span class="asset-cell-name__title">
         <span class="asset-cell-name__primary" title="{{ asset.name }}">{{ asset.name }}</span>
-        {% if pills or asset.playlist %}
+        {% if pills %}
         <span class="schedule-chips">
-          {% if asset.playlist %}
-          <span class="schedule-chip schedule-chip--playlist" title="In playlist {{ asset.playlist.name }}">
-            <i class="ti ti-playlist"></i>
-            <span>{{ asset.playlist.name }}</span>
-          </span>
-          {% endif %}
           {% for pill in pills %}
           <span class="schedule-chip schedule-chip--{{ pill.kind }}">
             {% if pill.kind == 'all' %}<i class="ti ti-calendar-check"></i>
@@ -111,7 +105,7 @@
         <button
           type="submit"
           class="app-btn app-btn-icon"
-          title="Duplicate"
+          title="Schedule again (adds another playlist slot for this asset — manage slots on the Playlists page)"
           {% if asset.is_processing %}disabled{% endif %}
         ><i class="ti ti-copy"></i></button>
       </form>

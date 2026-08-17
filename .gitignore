@@ -39,7 +39,6 @@ venv
 node_modules
 *.retry
 .env
-.balena/balena.yml
 
 # Ignore all non-template based files
 docker/Dockerfile.base
@@ -52,7 +51,6 @@ docker/Dockerfile.test
 docker-compose.yml
 docker-compose.override.yml
 
-balena-deploy/
 db.sqlite3
 
 # Local pytest SQLite database (created by
@@ -93,9 +91,6 @@ website/.hugo_build.lock
 # Linting
 .coffeelint.json
 .shoulder/
-
-# balena fleet maintenance roller state (bin/balena_fleet_maintenance.py)
-.balena-maint-state.tsv
 
 # mypy
 .mypy_cache/

@@ -82,7 +82,7 @@ cache_from_args=()
 if [[ -z "${QT5_NO_REGISTRY_CACHE:-}" ]]; then
     for cache_board in pi3 pi2; do
         cache_from_args+=(--cache-from \
-            "type=registry,ref=ghcr.io/screenly/anthias-viewer:buildcache-${cache_board}")
+            "type=registry,ref=ghcr.io/a10kiloham/anthias-viewer:buildcache-${cache_board}")
     done
 fi
 docker buildx build \

@@ -49,6 +49,62 @@ urlpatterns = [
         views.assets_table_partial,
         name='assets_table',
     ),
+    path('playlists/', views.playlists, name='playlists'),
+    path(
+        '_partials/playlist-tree/',
+        views.playlists_table_partial,
+        name='playlists_tree',
+    ),
+    path(
+        'playlists/create/',
+        views.playlists_create,
+        name='playlists_create',
+    ),
+    path(
+        'playlists/<str:playlist_id>/delete/',
+        views.playlists_delete,
+        name='playlists_delete',
+    ),
+    path(
+        'playlists/<str:playlist_id>/toggle/',
+        views.playlists_toggle,
+        name='playlists_toggle',
+    ),
+    path(
+        'playlists/<str:playlist_id>/toggle-repeat/',
+        views.playlists_toggle_repeat,
+        name='playlists_toggle_repeat',
+    ),
+    path(
+        'playlists/<str:playlist_id>/schedule/',
+        views.playlists_schedule,
+        name='playlists_schedule',
+    ),
+    path(
+        'playlists/<str:playlist_id>/add-asset/',
+        views.playlist_add_asset,
+        name='playlist_add_asset',
+    ),
+    path(
+        'playlists/<str:playlist_id>/nest/',
+        views.playlist_nest,
+        name='playlist_nest',
+    ),
+    path(
+        'playlists/<str:playlist_id>/items/<int:item_id>/remove/',
+        views.playlist_remove_item,
+        name='playlist_remove_item',
+    ),
+    path(
+        'playlists/<str:playlist_id>/items/<int:item_id>/move/',
+        views.playlist_move_item,
+        name='playlist_move_item',
+    ),
+    path(
+        'playlists/<str:playlist_id>/order/',
+        views.playlist_order,
+        name='playlist_order',
+    ),
     path(
         'review-cta/dismiss/',
         views.review_cta_dismiss,
@@ -75,32 +131,6 @@ urlpatterns = [
         'assets/bulk/update/',
         views.assets_bulk_update,
         name='assets_bulk_update',
-    ),
-    path(
-        'assets/bulk/playlist/',
-        views.assets_bulk_playlist,
-        name='assets_bulk_playlist',
-    ),
-    path('playlists/new/', views.playlists_create, name='playlists_create'),
-    path(
-        'playlists/<str:playlist_id>/rename/',
-        views.playlists_rename,
-        name='playlists_rename',
-    ),
-    path(
-        'playlists/<str:playlist_id>/toggle/',
-        views.playlists_toggle,
-        name='playlists_toggle',
-    ),
-    path(
-        'playlists/<str:playlist_id>/group/',
-        views.playlists_group,
-        name='playlists_group',
-    ),
-    path(
-        'playlists/<str:playlist_id>/delete/',
-        views.playlists_delete,
-        name='playlists_delete',
     ),
     path(
         'assets/control/<str:command>/',
