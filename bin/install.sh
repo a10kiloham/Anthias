@@ -340,7 +340,14 @@ function clone_repo() {
     if [ ! -d "${ANTHIAS_REPO_DIR}/.git" ]; then
         git clone "${REPOSITORY}" "${ANTHIAS_REPO_DIR}"
     fi
-    git -C "${ANTHIAS_REPO_DIR}" fetch --tags origin
+    # Force the remote onto THIS fork before fetching. A device that
+    # was originally installed from upstream (or another fork) keeps
+    # its old origin URL forever otherwise — the fetch/reset below
+    # would then happily "update" to the wrong repository's master,
+    # and the device ends up rendering upstream's compose template and
+    # pulling upstream's images while claiming a successful install.
+    git -C "${ANTHIAS_REPO_DIR}" remote set-url origin "${REPOSITORY}"
+    git -C "${ANTHIAS_REPO_DIR}" fetch --tags --force origin
     git -C "${ANTHIAS_REPO_DIR}" checkout "${BRANCH}"
 
     # Releases are pinned via tags (e.g. v0.20.5), which fetch into

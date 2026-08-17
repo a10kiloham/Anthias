@@ -127,13 +127,26 @@ def _create_assets(assets: list[dict[str, Any]]) -> None:
         Asset.objects.create(**asset)
 
 
+def _bare(asset: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Strip the occurrence bookkeeping keys so playlist entries can be
+    compared against the raw asset payloads the tests are written in
+    terms of."""
+    if asset is None:
+        return None
+    return {
+        k: v
+        for k, v in asset.items()
+        if k not in ('occurrence_id', 'no_repeat_playlist_ids')
+    }
+
+
 @pytest.mark.django_db
 def test_generate_asset_list_assets_should_return_list_sorted_by_play_order(
     restore_shuffle_setting: None,
 ) -> None:
     _create_assets([ASSET_X, ASSET_Y])
     assets, _ = generate_asset_list()
-    assert assets == [ASSET_Y, ASSET_X]
+    assert [_bare(a) for a in assets] == [ASSET_Y, ASSET_X]
 
 
 @pytest.mark.django_db
@@ -168,7 +181,7 @@ def test_get_next_asset_should_be_y_and_x(
     expected_y = scheduler.get_next_asset()
     expected_x = scheduler.get_next_asset()
 
-    assert [expected_y, expected_x] == [ASSET_Y, ASSET_X]
+    assert [_bare(expected_y), _bare(expected_x)] == [ASSET_Y, ASSET_X]
 
 
 @pytest.mark.django_db
@@ -193,7 +206,7 @@ def test_get_next_asset_missing_extra_asset_warns_and_falls_back(
     m_warn.assert_called_once()
     m_error.assert_not_called()
     assert scheduler.extra_asset is None
-    assert result in (ASSET_X, ASSET_Y)
+    assert _bare(result) in (ASSET_X, ASSET_Y)
 
 
 @pytest.mark.django_db
@@ -280,7 +293,7 @@ def test_playlist_should_be_updated_after_deadline_reached(
     scheduler = Scheduler()
     scheduler.refresh_playlist()
 
-    assert scheduler.assets == [ASSET_X]
+    assert [_bare(a) for a in scheduler.assets] == [ASSET_X]
     traveller.stop()
 
 

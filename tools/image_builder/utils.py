@@ -161,6 +161,13 @@ def get_test_context() -> dict[str, Any]:
 
 
 def get_viewer_context(board: str, target_platform: str) -> dict[str, Any]:
+    # The prebuilt Qt 5 toolchain tarballs are hosted on the FORK's own
+    # WebView-v* release — a checksum-verified mirror of upstream's
+    # artifacts — so the image pipeline has no build-time dependency on
+    # upstream infrastructure (same posture as the ghcr.io/a10kiloham
+    # bun mirror). To CVE-patch or bump the toolchain run
+    # bin/rebuild_qt5_toolchain.sh and upload the tarballs to a new
+    # WebView-v* release on the fork.
     releases_url = f'{GITHUB_REPO_URL}/releases/download'
 
     is_qt6 = board in ['pi5', 'pi4-64', 'pi3-64', 'x86', 'arm64']

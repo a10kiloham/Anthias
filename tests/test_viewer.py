@@ -1592,6 +1592,12 @@ def test_handle_reload_runs_load_settings() -> None:
     load.assert_called_once()
 
 
+def _occurrence_of(asset_id: str) -> mock.Mock:
+    occurrence = mock.Mock()
+    occurrence.asset.asset_id = asset_id
+    return occurrence
+
+
 def test_skip_when_current_asset_deleted() -> None:
     """Deleting the currently-displayed asset must set the skip event."""
     scheduler = mock.Mock()
@@ -1600,27 +1606,29 @@ def test_skip_when_current_asset_deleted() -> None:
     with (
         mock.patch.object(viewer, 'scheduler', scheduler),
         mock.patch('anthias_viewer.get_skip_event', return_value=skip_event),
-        mock.patch('anthias_viewer.Asset.objects.filter') as objects_filter,
+        mock.patch(
+            'anthias_viewer.evaluate_playlist',
+            return_value=([_occurrence_of('other')], None),
+        ),
     ):
-        # ``filter().first()`` returns None for a deleted row.
-        objects_filter.return_value.first.return_value = None
         viewer._skip_if_current_asset_inactive()
     skip_event.set.assert_called_once()
 
 
 def test_skip_when_current_asset_deactivated() -> None:
-    """Toggling is_enabled off on the displayed asset must skip."""
+    """Toggling is_enabled off on the displayed asset — or on every
+    playlist containing it — must skip."""
     scheduler = mock.Mock()
     scheduler.current_asset_id = 'asset-1'
     skip_event = mock.Mock()
-    inactive_asset = mock.Mock()
-    inactive_asset.is_active.return_value = False
     with (
         mock.patch.object(viewer, 'scheduler', scheduler),
         mock.patch('anthias_viewer.get_skip_event', return_value=skip_event),
-        mock.patch('anthias_viewer.Asset.objects.filter') as objects_filter,
+        mock.patch(
+            'anthias_viewer.evaluate_playlist',
+            return_value=([], None),
+        ),
     ):
-        objects_filter.return_value.first.return_value = inactive_asset
         viewer._skip_if_current_asset_inactive()
     skip_event.set.assert_called_once()
 
@@ -1631,14 +1639,14 @@ def test_no_skip_when_current_asset_still_active() -> None:
     scheduler = mock.Mock()
     scheduler.current_asset_id = 'asset-1'
     skip_event = mock.Mock()
-    active_asset = mock.Mock()
-    active_asset.is_active.return_value = True
     with (
         mock.patch.object(viewer, 'scheduler', scheduler),
         mock.patch('anthias_viewer.get_skip_event', return_value=skip_event),
-        mock.patch('anthias_viewer.Asset.objects.filter') as objects_filter,
+        mock.patch(
+            'anthias_viewer.evaluate_playlist',
+            return_value=([_occurrence_of('asset-1')], None),
+        ),
     ):
-        objects_filter.return_value.first.return_value = active_asset
         viewer._skip_if_current_asset_inactive()
     skip_event.set.assert_not_called()
 
@@ -1651,10 +1659,10 @@ def test_skip_noop_when_no_current_asset() -> None:
     with (
         mock.patch.object(viewer, 'scheduler', scheduler),
         mock.patch('anthias_viewer.get_skip_event', return_value=skip_event),
-        mock.patch('anthias_viewer.Asset.objects.filter') as objects_filter,
+        mock.patch('anthias_viewer.evaluate_playlist') as evaluate,
     ):
         viewer._skip_if_current_asset_inactive()
-    objects_filter.assert_not_called()
+    evaluate.assert_not_called()
     skip_event.set.assert_not_called()
 
 
@@ -1681,7 +1689,7 @@ def test_skip_swallows_db_errors() -> None:
         mock.patch.object(viewer, 'scheduler', scheduler),
         mock.patch('anthias_viewer.get_skip_event', return_value=skip_event),
         mock.patch(
-            'anthias_viewer.Asset.objects.filter',
+            'anthias_viewer.evaluate_playlist',
             side_effect=RuntimeError('boom'),
         ),
     ):

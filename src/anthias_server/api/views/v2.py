@@ -10,11 +10,13 @@ from typing import Any
 import psutil
 import redis
 import requests
+from django.db.models import F
 from django.shortcuts import get_object_or_404
 from django.template.defaultfilters import filesizeformat
 from django.utils import timezone
 from drf_spectacular.utils import extend_schema
 from rest_framework import status
+from rest_framework.exceptions import ValidationError
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -37,14 +39,18 @@ from anthias_server.api.helpers import (
 from anthias_server.api.serializers.v2 import (
     AssetSerializerV2,
     CreateAssetSerializerV2,
+    CreatePlaylistItemSerializerV2,
+    CreatePlaylistSerializerV2,
     DeviceSettingsSerializerV2,
     ImportItemSerializerV2,
     ImportValidateSerializerV2,
     IntegrationsSerializerV2,
+    PlaylistSerializerV2,
     ScreenlyMigrateAssetSerializerV2,
     ScreenlyTokenSerializerV2,
     UpdateAssetSerializerV2,
     UpdateDeviceSettingsSerializerV2,
+    UpdatePlaylistSerializerV2,
     ViewerPlaylistSerializerV2,
     ViewerSettingsSerializerV2,
 )
@@ -64,10 +70,18 @@ from anthias_server.api.views.mixins import (
 from anthias_server.app.helpers import (
     AssetDuplicationError,
     add_default_assets,
-    duplicate_asset,
     remove_default_assets,
+    reorder_playlist_items,
+    schedule_asset_occurrence,
 )
-from anthias_server.app.models import Asset
+from anthias_server.app.models import (
+    Asset,
+    Playlist,
+    PlaylistItem,
+    append_playlist_to_default,
+    playlist_is_self_or_ancestor,
+)
+from anthias_server.app.playlist_eval import evaluate_playlist
 from anthias_server.lib import diagnostics
 from anthias_server.lib.auth import (
     AuthSettingsError,
@@ -457,24 +471,27 @@ class AssetViewV2(APIView, DeleteAssetViewMixin):
 
 
 class AssetDuplicateViewV2(APIView):
-    """Clone an asset into an independent playlist entry.
+    """Schedule an asset a second time.
 
-    The playlist has no item entity — the Asset row *is* the playlist
-    slot — so scheduling the same media twice means cloning the row.
-    See ``app.helpers.duplicate_asset`` for the file-ownership
-    (hardlink) and play-order semantics.
+    Playlists are first-class now, so "duplicate" no longer clones the
+    row and hardlinks its file — it adds another occurrence
+    (``PlaylistItem``) of the same asset to the Default playlist,
+    directly after its existing occurrence. See
+    ``app.helpers.schedule_asset_occurrence``.
     """
 
     serializer_class = AssetSerializerV2
 
     @extend_schema(
-        summary='Duplicate asset',
+        summary='Schedule asset again (duplicate)',
         description=(
-            'Creates an independent copy of the asset, inserted into '
-            'the playlist directly after the source. The copy has its '
-            'own asset_id and can be scheduled, reordered, edited, and '
-            'deleted separately. Returns 409 while the source asset is '
-            'still processing.'
+            'Adds another playlist occurrence of the asset to the '
+            'Default playlist, directly after its existing '
+            'occurrence, and returns the asset. No copy is made: the '
+            'same asset simply holds two playlist slots, and edits to '
+            'it apply to both. Reorder or remove the occurrence via '
+            'the /v2/playlists endpoints. Returns 409 while the asset '
+            'is still processing.'
         ),
         request=None,
         responses={201: AssetSerializerV2, 404: None, 409: None},
@@ -483,13 +500,13 @@ class AssetDuplicateViewV2(APIView):
     def post(self, request: Request, asset_id: str) -> Response:
         asset = get_object_or_404(Asset, asset_id=asset_id)
         try:
-            duplicate = duplicate_asset(asset)
+            schedule_asset_occurrence(asset)
         except AssetDuplicationError as error:
             return Response(
                 {'error': str(error)}, status=status.HTTP_409_CONFLICT
             )
         return Response(
-            AssetSerializerV2(duplicate).data,
+            AssetSerializerV2(asset).data,
             status=status.HTTP_201_CREATED,
         )
 
@@ -755,14 +772,6 @@ class DeviceSettingsViewV2(APIView):
             )
 
 
-# Re-evaluate windowed playlists at most this often. Day-of-week and
-# time-of-day boundaries don't show up in start_date/end_date, so we
-# need a polling cap to ensure transitions are picked up. Mirrors
-# ``anthias_viewer.scheduling.WINDOWED_DEADLINE_CAP_SECONDS``; once
-# the C++ viewer consumes /api/v2/viewer/playlist (Phase 3 of GH
-# #2906) the Python copy can be deleted.
-_VIEWER_WINDOWED_DEADLINE_CAP_S = 60
-
 _viewer_sysrandom = secrets.SystemRandom()
 
 
@@ -773,63 +782,20 @@ def _evaluate_viewer_playlist(
     Asset rows (so ``AssetSerializerV2`` can serialise them) instead
     of plain dicts.
 
-    Active filter and deadline computation share a single ``now`` so
-    a row can't be filtered as active here while its end_date is
-    skipped as past in the deadline pass — the two would otherwise
-    disagree across a midnight tick.
+    Expansion, filtering and deadline computation are the shared
+    ``playlist_eval.evaluate_playlist`` (one copy for this shim and
+    the live Python-viewer path); only the shuffle is applied here.
+    The response stays a flat list of asset rows — an asset occurring
+    in several playlist slots simply appears once per active slot, in
+    play order, preserving the wire shape.
     """
-    candidates = list(
-        Asset.objects.filter(
-            is_enabled=True,
-            start_date__isnull=False,
-            end_date__isnull=False,
-        ).order_by('play_order')
-    )
-
-    active_flags = [a.is_active(now=now) for a in candidates]
-    active_assets = [a for a, ok in zip(candidates, active_flags) if ok]
+    occurrences, deadline = evaluate_playlist(now)
+    active_assets = [occurrence.asset for occurrence in occurrences]
 
     if settings['shuffle_playlist']:
         _viewer_sysrandom.shuffle(active_assets)
 
-    deadline = _compute_viewer_deadline(candidates, active_flags, now)
     return active_assets, deadline
-
-
-def _compute_viewer_deadline(
-    assets: list[Asset],
-    active_flags: list[bool],
-    now: datetime,
-) -> datetime | None:
-    """Soonest future moment when the playlist might need refetching.
-
-    Mirrors ``anthias_viewer.scheduling._compute_deadline``: past
-    boundaries are dropped so a long-ago start_date on a window-
-    blocked asset doesn't pin the deadline to "always overdue", and
-    the windowed cap only applies while the asset is in its date
-    range (the window can't toggle activeness outside of it).
-    """
-    candidates: list[datetime] = []
-    has_windowed = False
-
-    for asset, is_active in zip(assets, active_flags):
-        boundary = asset.end_date if is_active else asset.start_date
-        if boundary and boundary > now:
-            candidates.append(boundary)
-        if (
-            asset.has_window_filter()
-            and asset.start_date is not None
-            and asset.end_date is not None
-            and asset.start_date < now < asset.end_date
-        ):
-            has_windowed = True
-
-    if has_windowed:
-        candidates.append(
-            now + timedelta(seconds=_VIEWER_WINDOWED_DEADLINE_CAP_S)
-        )
-
-    return min(candidates) if candidates else None
 
 
 class ViewerPlaylistViewV2(APIView):
@@ -1699,3 +1665,298 @@ class ImportItemViewV2(APIView):
             )
 
         return Response({**outcome.as_dict(), 'error': None})
+
+
+def _nudge_viewer() -> None:
+    """Wake the viewer after a playlist mutation so it re-expands the
+    tree now rather than on the next DB-mtime poll tick."""
+    ViewerPublisher.get_instance().send_to_viewer('reload')
+
+
+def _playlist_queryset() -> Any:
+    # parent_item tells clients where each playlist is nested;
+    # items__asset keeps the embedded item list from N+1ing.
+    return Playlist.objects.select_related('parent_item').prefetch_related(
+        'items'
+    )
+
+
+class PlaylistListViewV2(APIView):
+    serializer_class = PlaylistSerializerV2
+
+    @extend_schema(
+        summary='List playlists',
+        description=(
+            'All playlists, roots first (by position), each with its '
+            'ordered items and its parent playlist id (null for '
+            'roots). The playlist flagged is_default receives assets '
+            'created through the non-playlist-aware surfaces (v1.x '
+            'API, home-page add form, app installs).'
+        ),
+        responses={200: PlaylistSerializerV2(many=True)},
+    )
+    @authorized
+    def get(self, request: Request) -> Response:
+        playlists = sorted(
+            _playlist_queryset(),
+            key=lambda p: (
+                getattr(p, 'parent_item', None) is not None,
+                p.position,
+                p.playlist_id,
+            ),
+        )
+        return Response(PlaylistSerializerV2(playlists, many=True).data)
+
+    @extend_schema(
+        summary='Create playlist',
+        description=(
+            'Creates a playlist as an item at the end of the Default '
+            'playlist — i.e. a new row in the Schedule list, '
+            'reorderable alongside assets. Nest it inside another '
+            'playlist by adding a child_playlist item to the intended '
+            'parent (which moves it out of the schedule list). '
+            'Playlists repeat by default; pass repeat=false for a '
+            'play-once-per-activation playlist.'
+        ),
+        request=CreatePlaylistSerializerV2,
+        responses={201: PlaylistSerializerV2},
+    )
+    @authorized
+    def post(self, request: Request) -> Response:
+        serializer = CreatePlaylistSerializerV2(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        playlist = Playlist.objects.create(**serializer.validated_data)
+        append_playlist_to_default(playlist)
+        _nudge_viewer()
+        refreshed = _playlist_queryset().get(playlist_id=playlist.playlist_id)
+        return Response(
+            PlaylistSerializerV2(refreshed).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class PlaylistViewV2(APIView):
+    serializer_class = PlaylistSerializerV2
+
+    @extend_schema(
+        summary='Get playlist',
+        responses={200: PlaylistSerializerV2, 404: None},
+    )
+    @authorized
+    def get(self, request: Request, playlist_id: str) -> Response:
+        playlist = get_object_or_404(
+            _playlist_queryset(), playlist_id=playlist_id
+        )
+        return Response(PlaylistSerializerV2(playlist).data)
+
+    @extend_schema(
+        summary='Update playlist',
+        request=UpdatePlaylistSerializerV2,
+        responses={200: PlaylistSerializerV2, 404: None},
+    )
+    @authorized
+    def patch(self, request: Request, playlist_id: str) -> Response:
+        playlist = get_object_or_404(Playlist, playlist_id=playlist_id)
+        serializer = UpdatePlaylistSerializerV2(
+            instance=playlist, data=request.data, partial=True
+        )
+        serializer.is_valid(raise_exception=True)
+        for field, value in serializer.validated_data.items():
+            setattr(playlist, field, value)
+        playlist.save()
+        _nudge_viewer()
+        return Response(PlaylistSerializerV2(playlist).data)
+
+    @extend_schema(
+        summary='Delete playlist',
+        description=(
+            'Deletes the playlist and its items. Nested child '
+            'playlists move back into the Default playlist (their '
+            'content survives and stays visible in the Schedule '
+            'list); assets are never deleted. The Default playlist '
+            'cannot be deleted.'
+        ),
+        responses={204: None, 404: None, 409: None},
+    )
+    @authorized
+    def delete(self, request: Request, playlist_id: str) -> Response:
+        playlist = get_object_or_404(Playlist, playlist_id=playlist_id)
+        if playlist.is_default:
+            return Response(
+                {'error': 'The Default playlist cannot be deleted.'},
+                status=status.HTTP_409_CONFLICT,
+            )
+        orphaned_children = [
+            item.child_playlist
+            for item in playlist.items.select_related('child_playlist')
+            if item.child_playlist is not None
+        ]
+        playlist.delete()
+        # The cascade deleted the children's parent items, leaving them
+        # parentless — playing (any root plays) but invisible in the
+        # Schedule list. Re-home them so nothing silently disappears.
+        for child in orphaned_children:
+            child.refresh_from_db()
+            append_playlist_to_default(child)
+        _nudge_viewer()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class PlaylistItemsViewV2(APIView):
+    serializer_class = PlaylistSerializerV2
+
+    @extend_schema(
+        summary='Add an item to a playlist',
+        description=(
+            'Appends an asset occurrence or nests a child playlist. '
+            'The same asset may be added any number of times (each '
+            'item is an independent occurrence). A playlist has one '
+            'parent (tree shape): nesting a playlist that currently '
+            'sits in the Default playlist MOVES it here (out of the '
+            'top-level Schedule list); one nested under any other '
+            'playlist must be removed there first. Never nestable '
+            'under itself or a descendant, and the Default playlist '
+            'cannot be nested. Optional position inserts at that '
+            'slot.'
+        ),
+        request=CreatePlaylistItemSerializerV2,
+        responses={201: PlaylistSerializerV2, 400: None, 404: None},
+    )
+    @authorized
+    def post(self, request: Request, playlist_id: str) -> Response:
+        playlist = get_object_or_404(Playlist, playlist_id=playlist_id)
+        serializer = CreatePlaylistItemSerializerV2(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        asset = None
+        child = None
+        if data.get('asset_id') is not None:
+            asset = get_object_or_404(Asset, asset_id=data['asset_id'])
+        else:
+            child = get_object_or_404(
+                Playlist, playlist_id=data['child_playlist_id']
+            )
+            if child.is_default:
+                return Response(
+                    {'error': 'The Default playlist cannot be nested.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            existing_parent_item = getattr(child, 'parent_item', None)
+            if (
+                existing_parent_item is not None
+                and not existing_parent_item.playlist.is_default
+            ):
+                return Response(
+                    {
+                        'error': (
+                            'Playlist is already nested elsewhere; a '
+                            'playlist has at most one parent. Remove '
+                            'its existing item first.'
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if playlist_is_self_or_ancestor(child, playlist):
+                return Response(
+                    {
+                        'error': (
+                            'Nesting this playlist here would create a cycle.'
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            # Sitting in the Default playlist just means "top-level
+            # row in the Schedule list" — nesting it under a real
+            # parent is a MOVE, not a second parent.
+            if existing_parent_item is not None:
+                existing_parent_item.delete()
+
+        items = list(playlist.items.all())
+        requested = data.get('position')
+        if requested is None or requested >= len(items):
+            position = items[-1].position + 1 if items else 0
+        else:
+            # Insert at the requested slot: shift everything at or
+            # after it down one.
+            position = items[max(requested, 0)].position
+            playlist.items.filter(position__gte=position).update(
+                position=F('position') + 1
+            )
+
+        PlaylistItem.objects.create(
+            playlist=playlist,
+            asset=asset,
+            child_playlist=child,
+            position=position,
+        )
+        _nudge_viewer()
+        refreshed = _playlist_queryset().get(playlist_id=playlist_id)
+        return Response(
+            PlaylistSerializerV2(refreshed).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class PlaylistItemViewV2(APIView):
+    @extend_schema(
+        summary='Remove an item from a playlist',
+        description=(
+            'Removes the occurrence (or un-nests the child playlist, '
+            'which moves back to the end of the Default playlist — '
+            'i.e. becomes a top-level Schedule row again). Assets are '
+            'never deleted by this call.'
+        ),
+        responses={204: None, 404: None},
+    )
+    @authorized
+    def delete(
+        self, request: Request, playlist_id: str, item_id: int
+    ) -> Response:
+        item = get_object_or_404(
+            PlaylistItem, id=item_id, playlist_id=playlist_id
+        )
+        child = item.child_playlist
+        item.delete()
+        if child is not None:
+            child.refresh_from_db()
+            append_playlist_to_default(child)
+        _nudge_viewer()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class PlaylistItemsOrderViewV2(APIView):
+    @extend_schema(
+        summary='Reorder a playlist',
+        description=(
+            'Body: {"ids": "<item_id>,<item_id>,..."} — the '
+            "playlist's item ids in the desired order (same wire "
+            'shape as POST /v2/assets/order). Ids must belong to this '
+            'playlist; items not listed keep their relative order '
+            'after the listed ones.'
+        ),
+        responses={204: None, 400: None, 404: None},
+    )
+    @authorized
+    def post(self, request: Request, playlist_id: str) -> Response:
+        playlist = get_object_or_404(Playlist, playlist_id=playlist_id)
+        data = request.data
+        if not isinstance(data, dict) or not isinstance(data.get('ids'), str):
+            raise ValidationError(
+                {'ids': 'Expected an object body with an "ids" field.'}
+            )
+        try:
+            ordered_ids = [
+                int(chunk) for chunk in data['ids'].split(',') if chunk.strip()
+            ]
+        except ValueError:
+            raise ValidationError(
+                {'ids': 'ids must be a comma-separated list of item ids.'}
+            ) from None
+
+        try:
+            reorder_playlist_items(playlist, ordered_ids)
+        except ValueError as error:
+            raise ValidationError({'ids': str(error)}) from None
+        _nudge_viewer()
+        return Response(status=status.HTTP_204_NO_CONTENT)
