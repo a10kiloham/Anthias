@@ -14,7 +14,6 @@ from django.contrib import messages
 from django.contrib.auth import authenticate
 from django.contrib.auth import login as django_login
 from django.http import (
-    FileResponse,
     Http404,
     HttpRequest,
     HttpResponse,
@@ -51,6 +50,7 @@ from anthias_server.lib.auth import (
     apply_auth_settings,
     authorized,
 )
+from anthias_server.lib.file_stream import stream_file_response
 from anthias_server.settings import ViewerPublisher, settings
 
 from .helpers import (
@@ -1408,7 +1408,8 @@ def _safe_local_asset_path(uri: str) -> str | None:
 @require_http_methods(['GET'])
 def assets_download(request: HttpRequest, asset_id: str) -> HttpResponseBase:
     """Stream the asset's content back the way React's download button
-    did: redirect to the URL for url-mimetypes, FileResponse for files."""
+    did: redirect to the URL for url-mimetypes, an async streamed file
+    response for local files."""
     from anthias_server.app.models import Asset
 
     asset = Asset.objects.filter(asset_id=asset_id).first()
@@ -1437,8 +1438,11 @@ def assets_download(request: HttpRequest, asset_id: str) -> HttpResponseBase:
     # _safe_local_asset_path realpaths the URI and verifies it lives
     # under settings['assetdir'] before returning, so the open() call
     # cannot escape the assets directory.
-    return FileResponse(
-        open(safe_path, 'rb'), as_attachment=True
+    # stream_file_response, not FileResponse: a sync file iterator
+    # under ASGI buffers the ENTIRE file into RAM before the first
+    # byte (issue #3073's mechanism) — a large video wedges the device.
+    return stream_file_response(
+        request, safe_path, as_attachment=True
     )  # lgtm [py/path-injection]
 
 
@@ -1468,8 +1472,11 @@ def assets_preview(request: HttpRequest, asset_id: str) -> HttpResponseBase:
     safe_path = _safe_local_asset_path(asset.uri)
     if safe_path is None:
         return redirect(reverse('anthias_app:home'))
-    return FileResponse(
-        open(safe_path, 'rb'), as_attachment=False
+    # stream_file_response streams async (no whole-file RAM buffer —
+    # see assets_download) and honours the Range requests the preview
+    # modal's <video> issues.
+    return stream_file_response(
+        request, safe_path, as_attachment=False
     )  # lgtm [py/path-injection]
 
 

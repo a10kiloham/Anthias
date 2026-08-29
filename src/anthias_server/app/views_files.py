@@ -7,13 +7,14 @@ from pathlib import Path
 from typing import Any
 
 from django.http import (
-    FileResponse,
     Http404,
     HttpRequest,
     HttpResponseForbidden,
 )
 from django.http.response import HttpResponseBase
 from django.views.decorators.http import require_GET
+
+from anthias_server.lib.file_stream import stream_file_response
 
 # Defense-in-depth, not the real perimeter:
 #   * In the default no-SSL install, anthias-server is published as
@@ -97,7 +98,11 @@ def anthias_assets(request: HttpRequest, filename: str) -> HttpResponseBase:
     if not target.startswith(base):
         raise Http404
     try:
-        return FileResponse(open(target, 'rb'))
+        # stream_file_response, not FileResponse: a sync file iterator
+        # under ASGI buffers the whole file into RAM before the first
+        # byte (issue #3073's mechanism) — and this endpoint serves the
+        # webview's media fetches, so a large asset must stream flat.
+        return stream_file_response(request, target)
     except (FileNotFoundError, IsADirectoryError):
         raise Http404
 
@@ -117,6 +122,6 @@ def static_with_mime(request: HttpRequest, filename: str) -> HttpResponseBase:
             mimetypes.guess_type(target)[0] or 'application/octet-stream'
         )
     try:
-        return FileResponse(open(target, 'rb'), content_type=content_type)
+        return stream_file_response(request, target, content_type=content_type)
     except (FileNotFoundError, IsADirectoryError):
         raise Http404
