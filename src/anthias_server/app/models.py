@@ -1,7 +1,7 @@
 import json
 import re
 import uuid
-from datetime import datetime, time
+from datetime import UTC, datetime, time, timedelta
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from django.db import models
@@ -17,6 +17,26 @@ ALL_DAYS = [1, 2, 3, 4, 5, 6, 7]
 # validation), the form handler (clamping), and mirrored by
 # kMaxReloadIntervalS in src/anthias_webview/src/view.cpp.
 REFRESH_INTERVAL_S_MAX = 86400
+
+
+# Sentinel ``end_date`` for assets that should never expire — the
+# default for videos. A concrete far-future date rather than NULL
+# because ``is_active()`` requires both bounds set: an asset with an
+# unset ``end_date`` never plays, on every API version's semantics.
+# The schedule-window filter renders any end at/after this as
+# "no end" instead of the literal date.
+NO_EXPIRY_END_DATE = datetime(2100, 1, 1, tzinfo=UTC)
+
+
+def default_end_date(mimetype: str | None, now: datetime) -> datetime:
+    """Schedule end for a newly created asset.
+
+    Videos never expire (operators upload a clip once and expect it
+    to keep playing); everything else keeps the legacy 30-day window.
+    """
+    if mimetype == 'video':
+        return NO_EXPIRY_END_DATE
+    return now + timedelta(days=30)
 
 
 # Upper bound for ``Asset.duration`` (seconds). The hard constraint is

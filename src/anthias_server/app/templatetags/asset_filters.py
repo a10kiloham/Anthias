@@ -19,6 +19,7 @@ from django.template import Library
 from django.utils import timezone
 from django.utils.safestring import SafeString, mark_safe
 
+from anthias_server.app.models import NO_EXPIRY_END_DATE
 from anthias_server.settings import settings
 
 register = Library()
@@ -249,14 +250,22 @@ def schedule_window(asset: Any) -> dict[str, str]:
     # Django format spec: `F` = full month name, `j` = day with no
     # leading zero, `S` = English ordinal suffix ("st"/"nd"/"rd"/"th"),
     # `Y` = 4-digit year. Yields 'June 2nd' or 'June 2nd, 2027'.
-    same_year = start_local.year == end_local.year == now.year
+    # An end at/after the no-expiry sentinel means "never expires" —
+    # say "no end" rather than printing the year-2100 sentinel date.
+    never_expires = end >= NO_EXPIRY_END_DATE
+    same_year = (
+        start_local.year == now.year
+        if never_expires
+        else start_local.year == end_local.year == now.year
+    )
     abs_fmt = 'F jS' if same_year else 'F jS, Y'
 
     def _label(value: datetime) -> str:
         rendered = str(naturalday(value, abs_fmt))
         return rendered[:1].upper() + rendered[1:] if rendered else rendered
 
-    secondary = f'{_label(start_local)} → {_label(end_local)}'
+    end_label = 'no end' if never_expires else _label(end_local)
+    secondary = f'{_label(start_local)} → {end_label}'
 
     # Disabled rows aren't playing, regardless of where 'now' falls
     # in the window — surface that explicitly so the operator doesn't

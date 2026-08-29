@@ -384,6 +384,59 @@ def test_assets_create_via_post(client: Client) -> None:
 
 
 @pytest.mark.django_db
+def test_assets_create_video_url_never_expires(client: Client) -> None:
+    """Video assets default to the no-expiry sentinel end_date rather
+    than the 30-day window everything else gets."""
+    from anthias_server.app.models import NO_EXPIRY_END_DATE
+
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        client.post(
+            reverse('anthias_app:assets_create'),
+            data={'uri': 'https://anthias.example.com/clip.mp4'},
+        )
+    created = Asset.objects.get(uri='https://anthias.example.com/clip.mp4')
+    assert created.mimetype == 'video'
+    assert created.end_date == NO_EXPIRY_END_DATE
+
+
+@pytest.mark.django_db
+def test_assets_create_non_video_keeps_30_day_window(client: Client) -> None:
+    from anthias_server.app.models import NO_EXPIRY_END_DATE
+
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        client.post(
+            reverse('anthias_app:assets_create'),
+            data={'uri': 'https://anthias.example.com/pic.png'},
+        )
+    created = Asset.objects.get(uri='https://anthias.example.com/pic.png')
+    assert created.end_date is not None
+    assert created.end_date < NO_EXPIRY_END_DATE
+    assert created.end_date - timezone.now() < timedelta(days=31)
+
+
+@pytest.mark.django_db
+def test_schedule_window_renders_no_end_for_no_expiry(asset: Asset) -> None:
+    """The schedule-window column says "no end" instead of printing
+    the year-2100 sentinel date."""
+    from anthias_server.app.models import NO_EXPIRY_END_DATE
+    from anthias_server.app.templatetags.asset_filters import (
+        schedule_window,
+    )
+
+    asset.end_date = NO_EXPIRY_END_DATE
+    window = schedule_window(asset)
+    assert window['secondary'].endswith('→ no end')
+    assert '2100' not in window['secondary']
+    assert window['primary'] == 'Live · open-ended'
+
+
+@pytest.mark.django_db
 def test_assets_create_rejects_invalid_url(client: Client) -> None:
     response = client.post(
         reverse('anthias_app:assets_create'),
