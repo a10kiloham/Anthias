@@ -561,6 +561,84 @@ label { text-align: left; }
   background: var(--color-accent-wash);
 }
 
+// Currently-on-screen row (Schedule table). A quiet gray wash — the
+// surface scrim reads as gray on both the light Inactive card and the
+// dark Enabled gradient — plus an accent inset bar. A bulk selection
+// (.is-selected) wins over the playing wash.
+.asset-table tbody tr.is-playing:not(.is-selected) td {
+  background: var(--surface-scrim-8);
+}
+.asset-table tbody tr.is-playing:not(.is-selected) td:first-child {
+  box-shadow: inset 3px 0 0 var(--color-accent);
+}
+
+// -----------------------------------------------------------------------------
+// Now-playing banner (top of the Schedule page)
+// -----------------------------------------------------------------------------
+.now-playing-card {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-6);
+}
+.now-playing-card__thumb {
+  flex: none;
+  width: 4.5rem;
+  height: 2.75rem;
+  border-radius: var(--radius-md);
+  background: var(--surface-scrim-8);
+  color: var(--surface-text-muted);
+  font-size: 1.25rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+
+  img,
+  video {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+}
+.now-playing-card__meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.now-playing-card__label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: 0.6875rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--surface-text-muted);
+}
+.now-playing-card__dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: var(--color-success-bright);
+  animation: now-playing-pulse 2s ease-in-out infinite;
+
+  @media (prefers-reduced-motion: reduce) {
+    animation: none;
+  }
+}
+@keyframes now-playing-pulse {
+  50% { opacity: 0.35; }
+}
+.now-playing-card__name {
+  font-weight: 600;
+  font-size: 1.0625rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .asset-cell-name {
   display: flex;
   align-items: center;
