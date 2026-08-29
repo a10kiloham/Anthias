@@ -9,6 +9,8 @@ surfaces stay in lockstep without going through the HTTP API.
 import functools
 import logging
 import os
+import time
+import uuid
 import zoneinfo
 from datetime import timedelta
 from os import getenv, statvfs
@@ -631,6 +633,74 @@ def device_settings() -> dict[str, Any]:
     }
 
 
+# After a viewer timeout, skip the now-playing query for this long so
+# a dead/absent viewer costs one 1 s stall per window, not one per 5 s
+# table poll.
+_NOW_PLAYING_RETRY_S = 15
+_now_playing_muted_until = 0.0
+
+
+def _now_playing() -> tuple[Any, set[str]]:
+    """Best-effort "what's on screen right now" for the Schedule page.
+
+    Asks the viewer over the existing ``current_asset_id`` Redis
+    request-reply wire (the one the v1 endpoint uses). Any failure —
+    viewer down, Redis down, malformed reply — degrades to "no
+    banner" rather than an error.
+
+    Returns ``(asset, playlist_ids)`` where ``playlist_ids`` holds
+    every playlist whose subtree contains the asset, so the Schedule
+    table can highlight the playlist row the asset is playing
+    through, not just the asset's own row.
+    """
+    global _now_playing_muted_until
+
+    from anthias_server.app.models import Asset, PlaylistItem
+    from anthias_server.settings import ReplyCollector, ViewerPublisher
+
+    if time.monotonic() < _now_playing_muted_until:
+        return None, set()
+
+    try:
+        correlation_id = uuid.uuid4().hex
+        collector = ReplyCollector.get_instance()
+        ViewerPublisher.get_instance().send_to_viewer(
+            f'current_asset_id&{correlation_id}'
+        )
+        reply = collector.recv_json(correlation_id, 1000)
+    except Exception:
+        _now_playing_muted_until = time.monotonic() + _NOW_PLAYING_RETRY_S
+        return None, set()
+
+    asset_id = (
+        reply.get('current_asset_id') if isinstance(reply, dict) else None
+    )
+    if not isinstance(asset_id, str) or not asset_id:
+        return None, set()
+
+    asset = Asset.objects.filter(asset_id=asset_id).first()
+    if asset is None:
+        return None, set()
+
+    playlist_ids: set[str] = set()
+    frontier = set(
+        PlaylistItem.objects.filter(asset_id=asset_id).values_list(
+            'playlist_id', flat=True
+        )
+    )
+    while frontier:
+        playlist_ids |= frontier
+        frontier = (
+            set(
+                PlaylistItem.objects.filter(
+                    child_playlist_id__in=frontier
+                ).values_list('playlist_id', flat=True)
+            )
+            - playlist_ids
+        )
+    return asset, playlist_ids
+
+
 def assets() -> dict[str, Any]:
     """Active + inactive Schedule rows (assets AND playlists) for /.
 
@@ -721,9 +791,16 @@ def assets() -> dict[str, Any]:
 
     from anthias_server.app.models import REFRESH_INTERVAL_S_MAX
 
+    now_playing, now_playing_playlist_ids = _now_playing()
+
     return {
         'active_rows': active_rows,
         'inactive_rows': inactive_rows,
+        # The on-screen asset (viewer request-reply; None when the
+        # viewer is idle/unreachable) drives the Now-playing banner and
+        # the gray row highlight in the Schedule table.
+        'now_playing': now_playing,
+        'now_playing_playlist_ids': now_playing_playlist_ids,
         # Asset-only lists still back the bulk-selection bookkeeping
         # (syncVisibleIds) — playlist rows don't join bulk actions.
         'active_assets': active,

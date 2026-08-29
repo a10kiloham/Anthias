@@ -5,7 +5,7 @@
    asset bulk-selection machinery while the drag handler picks either
    attribute up for the mixed ordering POST.
 {% endcomment %}
-<tr data-item-ref="playlist:{{ row.playlist.playlist_id }}">
+<tr data-item-ref="playlist:{{ row.playlist.playlist_id }}" class="{% if row.playlist.playlist_id in now_playing_playlist_ids %}is-playing{% endif %}">
   <td class="asset-select-col" data-label="Select" data-no-label></td>
   <td data-label="Name">
     <div class="asset-cell-name">
