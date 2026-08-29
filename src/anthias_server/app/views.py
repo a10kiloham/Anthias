@@ -40,6 +40,7 @@ from anthias_server.app import page_context
 from anthias_server.app.models import (
     clamp_duration,
     clamp_refresh_interval,
+    default_end_date,
     parse_header_lines,
 )
 from anthias_server.celery_tasks import reboot_anthias, shutdown_anthias
@@ -236,7 +237,6 @@ def assets_create(request: HttpRequest) -> HttpResponse:
     queued to fetch the file. The "Processing" pill on the table row
     clears once the worker completes.
     """
-    from datetime import timedelta
 
     from anthias_common.remote_video import is_streaming_uri
     from anthias_common.utils import validate_url
@@ -322,7 +322,7 @@ def assets_create(request: HttpRequest) -> HttpResponse:
             is_processing=True,
             play_order=play_order,
             start_date=now,
-            end_date=now + timedelta(days=30),
+            end_date=default_end_date('video', now),
         )
         dispatch_download(asset.asset_id, uri)
         return _asset_table_response(
@@ -351,7 +351,7 @@ def assets_create(request: HttpRequest) -> HttpResponse:
         is_processing=False,
         play_order=play_order,
         start_date=now,
-        end_date=now + timedelta(days=30),
+        end_date=default_end_date(mimetype, now),
     )
     return _asset_table_response(
         request, toast=('success', 'Asset added'), offer_review_cta=True
@@ -401,7 +401,6 @@ def assets_create_app(request: HttpRequest) -> HttpResponse:
     plays.
     """
     import json
-    from datetime import timedelta
 
     from anthias_common.utils import validate_url
     from anthias_server.app.models import Asset
@@ -480,7 +479,7 @@ def assets_create_app(request: HttpRequest) -> HttpResponse:
         is_processing=False,
         play_order=play_order,
         start_date=now,
-        end_date=now + timedelta(days=30),
+        end_date=default_end_date('webpage', now),
         metadata=metadata,
     )
     return _asset_table_response(
@@ -494,7 +493,6 @@ def assets_upload(request: HttpRequest) -> HttpResponse:
     """File upload tab. Mirrors api.views.mixins.FileAssetViewMixin.post:
     move the upload into assetdir, create an Asset row, return the
     table partial so HTMX can swap straight in."""
-    from datetime import timedelta
 
     from anthias_server.app.models import Asset
 
@@ -716,7 +714,7 @@ def assets_upload(request: HttpRequest) -> HttpResponse:
         is_processing=is_processing,
         play_order=play_order,
         start_date=now,
-        end_date=now + timedelta(days=30),
+        end_date=default_end_date(mimetype, now),
         # Stash the operator's original filename. The on-disk file
         # is renamed to <uuid>.<ext> at upload time (see
         # ``final_name = uuid.uuid4().hex`` above) so the operator's
