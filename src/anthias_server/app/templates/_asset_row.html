@@ -35,8 +35,8 @@
       </span>
     </div>
   </td>
-  {% with window=asset|schedule_window %}
-  <td data-label="Schedule window">
+  {% with window=asset|playback_status %}
+  <td data-label="Status">
     <div class="schedule-window schedule-window--{{ window.kind }}">
       <div class="schedule-window__dot" aria-hidden="true"></div>
       <div>

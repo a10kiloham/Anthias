@@ -126,18 +126,12 @@ def test_playlist_empty_when_no_assets() -> None:
 def test_playlist_returns_only_active_assets(
     _restore_shuffle_setting: None,
 ) -> None:
-    """Active assets are surfaced, an asset whose start_date is in
-    the future is filtered out (Asset.is_active() will return False
-    for it)."""
+    """Active assets are surfaced; a disabled asset is filtered out
+    (Asset.is_active() returns False for it). Dates are inert and do
+    not filter."""
     anthias_settings['shuffle_playlist'] = False
-    now = timezone.now()
     _make(asset_id='active', play_order=0)
-    _make(
-        asset_id='future',
-        play_order=1,
-        start_date=now + timedelta(days=1),
-        end_date=now + timedelta(days=2),
-    )
+    _make(asset_id='off', play_order=1, is_enabled=False)
     response = Client().get('/api/v2/viewer/playlist', headers=_auth_headers())
     assert response.status_code == 200
     body = response.json()
@@ -158,55 +152,38 @@ def test_playlist_orders_by_play_order_when_not_shuffled(
 
 
 @pytest.mark.django_db
-def test_playlist_deadline_is_soonest_active_end_date(
+def test_playlist_deadline_none_without_windows(
     _restore_shuffle_setting: None,
 ) -> None:
-    """Two active assets: deadline is the earlier end_date because
-    that's when the first one drops out of the active set."""
+    """Dates are inert and contribute no deadline: with no day/time
+    windows anywhere, nothing can flip on its own."""
     anthias_settings['shuffle_playlist'] = False
     now = timezone.now()
-    soonest_end = now + timedelta(hours=1)
-    _make(asset_id='soonest', play_order=0, end_date=soonest_end)
-    _make(
-        asset_id='later',
-        play_order=1,
-        end_date=now + timedelta(days=2),
-    )
+    _make(asset_id='soonest', play_order=0, end_date=now + timedelta(hours=1))
+    _make(asset_id='later', play_order=1, end_date=now + timedelta(days=2))
     response = Client().get('/api/v2/viewer/playlist', headers=_auth_headers())
     body = response.json()
-    # ISO8601 round-trip: DRF emits microseconds + tz suffix
-    assert body['deadline'].startswith(soonest_end.strftime('%Y-%m-%dT%H:%M'))
+    assert body['deadline'] is None
 
 
 @pytest.mark.django_db
-def test_playlist_deadline_picks_inactive_start_date_when_scheduled(
+def test_playlist_deadline_is_windowed_cap(
     _restore_shuffle_setting: None,
 ) -> None:
-    """If the soonest future boundary is an *inactive* asset's
-    start_date (not the active one's end_date), deadline must point
-    at it so the viewer re-evaluates when the scheduled asset
-    becomes active."""
+    """A day/time-windowed asset forces the 60s re-evaluation cap so
+    the viewer picks up the window boundary."""
     anthias_settings['shuffle_playlist'] = False
-    now = timezone.now()
-    scheduled_start = now + timedelta(hours=1)
+    from datetime import time as time_of_day
+
     _make(
-        asset_id='active',
+        asset_id='windowed',
         play_order=0,
-        end_date=now + timedelta(days=2),
-    )
-    _make(
-        asset_id='scheduled',
-        play_order=1,
-        start_date=scheduled_start,
-        end_date=now + timedelta(days=3),
+        play_time_from=time_of_day(0, 0),
+        play_time_to=time_of_day(23, 59),
     )
     response = Client().get('/api/v2/viewer/playlist', headers=_auth_headers())
     body = response.json()
-    assert body['deadline'].startswith(
-        scheduled_start.strftime('%Y-%m-%dT%H:%M')
-    )
-    # Only the active one is returned in the assets list.
-    assert [a['asset_id'] for a in body['assets']] == ['active']
+    assert body['deadline'] is not None
 
 
 @pytest.mark.django_db

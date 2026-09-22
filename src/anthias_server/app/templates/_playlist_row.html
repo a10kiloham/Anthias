@@ -1,3 +1,4 @@
+{% load asset_filters %}
 {% comment %} One playlist row in the home Schedule table. Expects
    `row` = {'kind': 'playlist', 'playlist': ..., 'item_count': N} from
    page_context.assets() and `is_active` like _asset_row.html.
@@ -22,15 +23,12 @@
       </span>
     </div>
   </td>
-  <td data-label="Schedule window">
-    <div class="schedule-window schedule-window--{% if row.playlist.start_date or row.playlist.end_date or row.playlist.has_window_filter %}scheduled{% else %}all{% endif %}">
+  {% with window=row.playlist|playback_status %}
+  <td data-label="Status">
+    <div class="schedule-window schedule-window--{{ window.kind }}">
       <div class="schedule-window__dot" aria-hidden="true"></div>
       <div>
-        {% if row.playlist.start_date or row.playlist.end_date %}
-        <p class="schedule-window__primary">{% if row.playlist.start_date %}{{ row.playlist.start_date }}{% else %}Always{% endif %} – {% if row.playlist.end_date %}{{ row.playlist.end_date }}{% else %}no end{% endif %}</p>
-        {% else %}
-        <p class="schedule-window__primary">Always</p>
-        {% endif %}
+        <p class="schedule-window__primary">{{ window.primary }}</p>
         {% if row.playlist.has_window_filter %}
         <p class="schedule-window__secondary">
           {% if row.playlist.play_time_from and row.playlist.play_time_to %}{{ row.playlist.play_time_from|time:'H:i' }}–{{ row.playlist.play_time_to|time:'H:i' }} · {% endif %}days {% for day in row.playlist.get_play_days %}{{ day }}{% if not forloop.last %},{% endif %}{% endfor %}
@@ -39,6 +37,7 @@
       </div>
     </div>
   </td>
+  {% endwith %}
   <td data-label="Duration">—</td>
   <td data-label="Enabled">
     <form method="post" action="{% url 'anthias_app:playlists_toggle' row.playlist.playlist_id %}" class="m-0">

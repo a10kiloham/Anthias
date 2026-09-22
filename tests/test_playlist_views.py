@@ -142,6 +142,40 @@ def test_add_asset_and_move_and_remove(client: Client) -> None:
 
 
 @pytest.mark.django_db
+def test_add_assets_multi_select(client: Client) -> None:
+    """The add-content pane posts a checkbox multi-selection as
+    ``asset_ids`` — all of them land, appended in selection order,
+    with stale ids skipped."""
+    a, b, c = _make_asset('a'), _make_asset('b'), _make_asset('c')
+    playlist = Playlist.objects.create(name='p')
+    _hx(
+        client,
+        reverse('anthias_app:playlist_add_asset', args=[playlist.playlist_id]),
+        {
+            'asset_ids': [
+                c.asset_id,
+                a.asset_id,
+                'stale-id-of-deleted-asset',
+                b.asset_id,
+            ]
+        },
+    )
+    items = list(playlist.items.order_by('position', 'id'))
+    assert [item.asset_id for item in items] == ['c', 'a', 'b']
+
+
+@pytest.mark.django_db
+def test_add_assets_empty_selection_is_rejected(client: Client) -> None:
+    playlist = Playlist.objects.create(name='p')
+    _hx(
+        client,
+        reverse('anthias_app:playlist_add_asset', args=[playlist.playlist_id]),
+        {},
+    )
+    assert playlist.items.count() == 0
+
+
+@pytest.mark.django_db
 def test_nest_rejects_cycle_and_double_parent(client: Client) -> None:
     outer = Playlist.objects.create(name='outer')
     inner = Playlist.objects.create(name='inner')
@@ -182,8 +216,6 @@ def test_schedule_save_roundtrip(client: Client) -> None:
         client,
         reverse('anthias_app:playlists_schedule', args=[playlist.playlist_id]),
         {
-            'start_date': '2026-09-01T09:00',
-            'end_date': '2026-12-01T17:00',
             'play_time_from': '09:00',
             'play_time_to': '17:00',
             'play_days': ['6', '7'],
@@ -191,27 +223,22 @@ def test_schedule_save_roundtrip(client: Client) -> None:
     )
     assert response.status_code == 200
     playlist.refresh_from_db()
-    assert playlist.start_date is not None
-    assert playlist.end_date is not None
     assert playlist.get_play_days() == [6, 7]
     assert playlist.play_time_from is not None
 
-    # Blank dates clear the bounds (unbounded again).
+    # Blank times clear the window (all-day again).
     _hx(
         client,
         reverse('anthias_app:playlists_schedule', args=[playlist.playlist_id]),
         {
-            'start_date': '',
-            'end_date': '',
             'play_time_from': '',
             'play_time_to': '',
             'play_days': ['1', '2', '3', '4', '5', '6', '7'],
         },
     )
     playlist.refresh_from_db()
-    assert playlist.start_date is None
-    assert playlist.end_date is None
     assert playlist.play_time_from is None
+    assert playlist.get_play_days() == [1, 2, 3, 4, 5, 6, 7]
 
 
 @pytest.mark.django_db
@@ -502,16 +529,13 @@ def test_playlist_schedule_lifecycle(client: Client) -> None:
             {'asset_id': asset.asset_id},
         )
 
-    # Schedule for now: a date window around the current moment.
+    # Schedule for now: every weekday, all day.
     local_now = timezone.localtime()
-    fmt = '%Y-%m-%dT%H:%M'
     all_days = [str(day) for day in range(1, 8)]
     response = _hx(
         client,
         reverse('anthias_app:playlists_schedule', args=[playlist.playlist_id]),
         {
-            'start_date': (local_now - timedelta(hours=1)).strftime(fmt),
-            'end_date': (local_now + timedelta(hours=1)).strftime(fmt),
             'play_time_from': '',
             'play_time_to': '',
             'play_days': all_days,
@@ -524,14 +548,15 @@ def test_playlist_schedule_lifecycle(client: Client) -> None:
     assert 'Lunch loop' in schedule_rows('active_rows')
     assert playing_via(playlist.playlist_id) == ['first', 'second']
 
-    # Unschedule — a window wholly in the past stops playback...
+    # Off-window — a day filter that excludes today stops playback...
+    other_days = [
+        str(day) for day in range(1, 8) if day != local_now.isoweekday()
+    ]
     _hx(
         client,
         reverse('anthias_app:playlists_schedule', args=[playlist.playlist_id]),
         {
-            'start_date': (local_now - timedelta(days=2)).strftime(fmt),
-            'end_date': (local_now - timedelta(days=1)).strftime(fmt),
-            'play_days': all_days,
+            'play_days': other_days,
             'return': 'schedule',
         },
     )

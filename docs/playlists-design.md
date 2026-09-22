@@ -4,6 +4,17 @@ Implementation companion to `playlists-feasibility.md`. That document
 establishes feasibility, blast radius, and phasing; this one records the
 decisions taken for the implementation.
 
+> **2026-09 update — expiration removed.** Date-based scheduling
+> (`start_date` / `end_date`) no longer exists as behaviour: assets and
+> playlists are active or inactive (`is_enabled`), optionally narrowed
+> by a day-of-week / time-of-day window, and content plays until an
+> operator disables it. The date columns and every API field that
+> carries them remain in place, inert, purely for REST wire-shape
+> compatibility ("never break the REST API"). Rows in the decisions
+> table that reference date windows describe the original design and
+> are superseded to that extent; the deadline machinery in
+> `playlist_eval` reduces to the 60-second windowed cap.
+
 ## Decisions
 
 | Question | Decision | Rationale |

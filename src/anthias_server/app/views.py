@@ -71,40 +71,6 @@ _ANTHIAS_REPO_URL = 'https://github.com/a10kiloham/Anthias'
 _SAFE_EXT_RE = re.compile(r'\.[A-Za-z0-9]{1,16}')
 
 
-def _parse_local_datetime(value: str) -> datetime:
-    """Parse a date/time the edit-form posts back from Flatpickr.
-
-    Flatpickr formats the value using whatever format we asked for
-    (m/d/Y h:i K, d-m-Y H:i, Y/m/d, etc.) — i.e. the device's
-    configured date_format + use_24_hour_clock pair. Try the active
-    set of formats here, fall back to ISO fromisoformat() so any
-    pre-existing rows / API-side writes still parse cleanly.
-    """
-    settings.load()
-    df = settings['date_format']
-    date_part_map = {
-        'mm/dd/yyyy': '%m/%d/%Y',
-        'dd/mm/yyyy': '%d/%m/%Y',
-        'yyyy/mm/dd': '%Y/%m/%d',
-        'mm-dd-yyyy': '%m-%d-%Y',
-        'dd-mm-yyyy': '%d-%m-%Y',
-        'yyyy-mm-dd': '%Y-%m-%d',
-        'mm.dd.yyyy': '%m.%d.%Y',
-        'dd.mm.yyyy': '%d.%m.%Y',
-        'yyyy.mm.dd': '%Y.%m.%d',
-    }
-    date_fmt = date_part_map.get(df, '%m/%d/%Y')
-    time_fmt = '%H:%M' if settings['use_24_hour_clock'] else '%I:%M %p'
-    candidates = [f'{date_fmt} {time_fmt}', f'{date_fmt} %H:%M']
-    for fmt in candidates:
-        try:
-            # Naive strptime is deliberate — make_aware attaches the tz.
-            return timezone.make_aware(datetime.strptime(value, fmt))  # noqa: DTZ007
-        except ValueError:
-            continue
-    return timezone.make_aware(datetime.fromisoformat(value))
-
-
 def _parse_local_time(value: str) -> time:
     """Parse a time-of-day the edit-form posts back from Flatpickr.
 
@@ -322,7 +288,7 @@ def assets_create(request: HttpRequest) -> HttpResponse:
             is_processing=True,
             play_order=play_order,
             start_date=now,
-            end_date=now + timedelta(days=30),
+            end_date=now + timedelta(days=36500),
         )
         dispatch_download(asset.asset_id, uri)
         return _asset_table_response(
@@ -351,7 +317,7 @@ def assets_create(request: HttpRequest) -> HttpResponse:
         is_processing=False,
         play_order=play_order,
         start_date=now,
-        end_date=now + timedelta(days=30),
+        end_date=now + timedelta(days=36500),
     )
     return _asset_table_response(
         request, toast=('success', 'Asset added'), offer_review_cta=True
@@ -480,7 +446,7 @@ def assets_create_app(request: HttpRequest) -> HttpResponse:
         is_processing=False,
         play_order=play_order,
         start_date=now,
-        end_date=now + timedelta(days=30),
+        end_date=now + timedelta(days=36500),
         metadata=metadata,
     )
     return _asset_table_response(
@@ -716,7 +682,7 @@ def assets_upload(request: HttpRequest) -> HttpResponse:
         is_processing=is_processing,
         play_order=play_order,
         start_date=now,
-        end_date=now + timedelta(days=30),
+        end_date=now + timedelta(days=36500),
         # Stash the operator's original filename. The on-disk file
         # is renamed to <uuid>.<ext> at upload time (see
         # ``final_name = uuid.uuid4().hex`` above) so the operator's
@@ -792,21 +758,6 @@ def assets_update(request: HttpRequest, asset_id: str) -> HttpResponse:
         # viewer's Event.wait (Sentry ANTHIAS-3E).
         asset.duration = clamp_duration(
             request.POST.get('duration') or asset.duration or 0
-        )
-    start = request.POST.get('start_date')
-    end = request.POST.get('end_date')
-    try:
-        if start:
-            asset.start_date = _parse_local_datetime(start)
-        if end:
-            asset.end_date = _parse_local_datetime(end)
-    except ValueError:
-        # The pickers run with allowInput, so a hand-typed value can
-        # be anything. A parse failure is operator input error, not a
-        # server fault — surface a toast instead of a 500.
-        return _asset_table_response(
-            request,
-            toast=('error', 'Could not read the start/end date — not saved'),
         )
     asset.nocache = _checkbox(request, 'nocache')
     asset.skip_asset_check = _checkbox(request, 'skip_asset_check')
@@ -1149,7 +1100,6 @@ def assets_bulk_update(request: HttpRequest) -> HttpResponse:
             toast=('info', 'No matching assets selected'),
         )
 
-    apply_dates = request.POST.get('apply_dates') == 'true'
     apply_duration = request.POST.get('apply_duration') == 'true'
     apply_time = request.POST.get('apply_time') == 'true'
     apply_days = request.POST.get('apply_days') == 'true'
@@ -1157,8 +1107,7 @@ def assets_bulk_update(request: HttpRequest) -> HttpResponse:
     apply_skip = request.POST.get('apply_skip_asset_check') == 'true'
 
     if not (
-        apply_dates
-        or apply_duration
+        apply_duration
         or apply_time
         or apply_days
         or apply_nocache
@@ -1170,25 +1119,6 @@ def assets_bulk_update(request: HttpRequest) -> HttpResponse:
         )
 
     # --- Parse everything up-front; toast on the first bad value ---
-    new_start: datetime | None = None
-    new_end: datetime | None = None
-    if apply_dates:
-        start = request.POST.get('start_date')
-        end = request.POST.get('end_date')
-        try:
-            if start:
-                new_start = _parse_local_datetime(start)
-            if end:
-                new_end = _parse_local_datetime(end)
-        except ValueError:
-            return _asset_table_response(
-                request,
-                toast=(
-                    'error',
-                    'Could not read the start/end date — nothing changed',
-                ),
-            )
-
     new_duration: int | None = None
     if apply_duration:
         # A blank field must NOT silently clobber every selected asset's
@@ -1274,11 +1204,6 @@ def assets_bulk_update(request: HttpRequest) -> HttpResponse:
     # Duration goes through a separate update that excludes videos, so a
     # video row's probe-owned duration is never touched.
     shared: dict[str, object] = {}
-    if apply_dates:
-        if new_start is not None:
-            shared['start_date'] = new_start
-        if new_end is not None:
-            shared['end_date'] = new_end
     if apply_time:
         shared['play_time_from'] = None if clear_time else new_time_from
         shared['play_time_to'] = None if clear_time else new_time_to
@@ -1296,7 +1221,6 @@ def assets_bulk_update(request: HttpRequest) -> HttpResponse:
         )
 
     if not shared and not apply_duration:
-        # e.g. apply_dates ticked but both date fields left blank.
         return _asset_table_response(
             request,
             toast=('info', 'Nothing to change — pick a field to edit'),
@@ -2152,28 +2076,13 @@ def playlists_toggle_repeat(
 @authorized
 @require_http_methods(['POST'])
 def playlists_schedule(request: HttpRequest, playlist_id: str) -> HttpResponse:
-    """Save the per-playlist window: optional date bounds
-    (datetime-local inputs; blank clears), day-of-week checkboxes, and
-    an optional time-of-day pair."""
+    """Save the per-playlist window: day-of-week checkboxes and an
+    optional time-of-day pair."""
     from anthias_server.app.models import ALL_DAYS, Playlist
 
     playlist = Playlist.objects.filter(playlist_id=playlist_id).first()
     if playlist is None:
         return _playlists_response(request)
-
-    def parse_dt(field: str) -> datetime | None:
-        raw = (request.POST.get(field) or '').strip()
-        if not raw:
-            return None
-        try:
-            value = datetime.fromisoformat(raw)
-        except ValueError:
-            raise ValueError(
-                f'Could not parse {field.replace("_", " ")}'
-            ) from None
-        if timezone.is_naive(value):
-            value = timezone.make_aware(value, timezone.get_current_timezone())
-        return value
 
     def parse_t(field: str) -> time | None:
         raw = (request.POST.get(field) or '').strip()
@@ -2187,17 +2096,11 @@ def playlists_schedule(request: HttpRequest, playlist_id: str) -> HttpResponse:
             ) from None
 
     try:
-        start_date = parse_dt('start_date')
-        end_date = parse_dt('end_date')
         play_time_from = parse_t('play_time_from')
         play_time_to = parse_t('play_time_to')
     except ValueError as exc:
         return _playlists_response(request, toast=('error', str(exc)))
 
-    if start_date and end_date and start_date >= end_date:
-        return _playlists_response(
-            request, toast=('error', 'End date must be after start date')
-        )
     if (play_time_from is None) != (play_time_to is None):
         return _playlists_response(
             request,
@@ -2224,8 +2127,6 @@ def playlists_schedule(request: HttpRequest, playlist_id: str) -> HttpResponse:
             ),
         )
 
-    playlist.start_date = start_date
-    playlist.end_date = end_date
     playlist.play_time_from = play_time_from
     playlist.play_time_to = play_time_to
     playlist.play_days = json.dumps(sorted(set(days)) or list(ALL_DAYS))
@@ -2237,26 +2138,45 @@ def playlists_schedule(request: HttpRequest, playlist_id: str) -> HttpResponse:
 @authorized
 @require_http_methods(['POST'])
 def playlist_add_asset(request: HttpRequest, playlist_id: str) -> HttpResponse:
+    """Append one or more assets to a playlist.
+
+    The add-content pane posts a checkbox multi-selection as
+    ``asset_ids``; the single ``asset_id`` field is still honoured so
+    older forms keep working. Duplicates are allowed by design — each
+    row is an independent occurrence.
+    """
     from anthias_server.app.models import Asset, Playlist, PlaylistItem
 
     playlist = Playlist.objects.filter(playlist_id=playlist_id).first()
-    asset = Asset.objects.filter(
-        asset_id=request.POST.get('asset_id', '')
-    ).first()
-    if playlist is None or asset is None:
+    requested_ids = [i for i in request.POST.getlist('asset_ids') if i.strip()]
+    single = (request.POST.get('asset_id') or '').strip()
+    if single:
+        requested_ids.append(single)
+    if playlist is None or not requested_ids:
+        return _playlists_response(
+            request, toast=('error', 'Pick at least one asset to add')
+        )
+    assets_by_id = {
+        a.asset_id: a for a in Asset.objects.filter(asset_id__in=requested_ids)
+    }
+    # Preserve the selection order the form posted, skipping stale ids.
+    to_add = [assets_by_id[i] for i in requested_ids if i in assets_by_id]
+    if not to_add:
         return _playlists_response(
             request, toast=('error', 'Asset or playlist not found')
         )
     last = playlist.items.order_by('-position').first()
-    PlaylistItem.objects.create(
-        playlist=playlist,
-        asset=asset,
-        position=last.position + 1 if last else 0,
+    position = last.position + 1 if last else 0
+    PlaylistItem.objects.bulk_create(
+        PlaylistItem(playlist=playlist, asset=asset, position=position + i)
+        for i, asset in enumerate(to_add)
     )
     ViewerPublisher.get_instance().send_to_viewer('reload')
-    return _playlists_response(
-        request, toast=('success', f'Added “{asset.name}”')
-    )
+    if len(to_add) == 1:
+        toast_msg = f'Added “{to_add[0].name}”'
+    else:
+        toast_msg = f'Added {len(to_add)} assets'
+    return _playlists_response(request, toast=('success', toast_msg))
 
 
 @authorized

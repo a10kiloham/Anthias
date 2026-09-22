@@ -175,45 +175,38 @@ def test_disabled_nested_playlist_gates_only_its_subtree() -> None:
 
 
 @pytest.mark.django_db
-def test_playlist_date_window_is_anded_with_asset_window() -> None:
+def test_playlist_dates_are_inert() -> None:
+    """There is no date-based expiration: a playlist whose stored
+    start_date is in the future — or whose end_date has passed — still
+    plays, and the dates contribute no deadline."""
     now = timezone.now()
     asset = _make_asset('a')
     _remove_from_default(asset)
     future = _make_playlist('future', start_date=now + timedelta(days=2))
+    expired = _make_playlist(
+        'expired', end_date=now - timedelta(hours=1), position=1
+    )
     _add(future, asset=asset)
-
-    occurrences, deadline = evaluate_playlist(now)
-    assert occurrences == []
-    # Inactive because the container hasn't opened: the deadline is the
-    # latest future open along the path — the playlist's start.
-    assert deadline == future.start_date
-
-
-@pytest.mark.django_db
-def test_active_deadline_is_earliest_close_on_the_path() -> None:
-    now = timezone.now()
-    asset = _make_asset('a')  # asset closes in 30 days
-    _remove_from_default(asset)
-    closing = _make_playlist('closing', end_date=now + timedelta(hours=1))
-    _add(closing, asset=asset)
-
-    occurrences, deadline = evaluate_playlist(now)
-    assert [o.asset.asset_id for o in occurrences] == ['a']
-    assert deadline == closing.end_date
-
-
-@pytest.mark.django_db
-def test_expired_container_contributes_no_deadline() -> None:
-    now = timezone.now()
-    asset = _make_asset('a')
-    _remove_from_default(asset)
-    expired = _make_playlist('expired', end_date=now - timedelta(hours=1))
     _add(expired, asset=asset)
 
     occurrences, deadline = evaluate_playlist(now)
-    assert occurrences == []
-    # A window that already closed can never reopen; pinning the
-    # deadline to a past boundary would make every tick "overdue".
+    assert [o.asset.asset_id for o in occurrences] == ['a', 'a']
+    assert deadline is None
+
+
+@pytest.mark.django_db
+def test_asset_dates_are_inert() -> None:
+    """An enabled asset whose stored end_date has passed keeps playing
+    — only the toggle (or a day/time window) takes it off screen."""
+    now = timezone.now()
+    _make_asset(
+        'expired',
+        start_date=now - timedelta(days=60),
+        end_date=now - timedelta(days=30),
+    )
+
+    occurrences, deadline = evaluate_playlist(now)
+    assert [o.asset.asset_id for o in occurrences] == ['expired']
     assert deadline is None
 
 
@@ -235,15 +228,12 @@ def test_playlist_time_window_forces_60s_cap() -> None:
 
 
 @pytest.mark.django_db
-def test_container_window_blocks_but_out_of_date_asset_does_not_cap() -> None:
-    """An asset outside its own dates inside a windowed container must
-    not force 60s polling — the intersected range doesn't contain now."""
+def test_disabled_asset_does_not_force_windowed_cap() -> None:
+    """A disabled asset inside a windowed container must not force 60s
+    polling — only an operator edit can bring it back, and the DB-mtime
+    poll covers that."""
     now = timezone.now()
-    asset = _make_asset(
-        'a',
-        start_date=now + timedelta(days=5),
-        end_date=now + timedelta(days=6),
-    )
+    asset = _make_asset('a', is_enabled=False)
     _remove_from_default(asset)
     windowed = _make_playlist(
         'windowed',
@@ -253,8 +243,7 @@ def test_container_window_blocks_but_out_of_date_asset_does_not_cap() -> None:
     _add(windowed, asset=asset)
 
     _, deadline = evaluate_playlist(now)
-    # Deadline must be the asset's future start, not the 60s cap.
-    assert deadline == asset.start_date
+    assert deadline is None
 
 
 @pytest.mark.django_db
@@ -368,28 +357,33 @@ def test_no_repeat_state_resets_when_membership_changes() -> None:
 
 @pytest.mark.django_db
 def test_no_repeat_state_resets_after_activation_window_flip() -> None:
-    """Close the playlist's window, reopen it: the play-through
-    restarts (once per activation window)."""
+    """Close the playlist's window (its daily time slot ends), reopen
+    it the next day: the play-through restarts (once per activation
+    window)."""
     a = _make_asset('a')
     _remove_from_default(a)
-    now = timezone.now()
     once = _make_playlist(
-        'once', repeat=False, end_date=now + timedelta(hours=1)
+        'once',
+        repeat=False,
+        play_time_from=time(9, 0),
+        play_time_to=time(17, 0),
     )
     _add(once, asset=a)
 
-    scheduler = Scheduler()
-    first = scheduler.get_next_asset()
-    assert first is not None and first['asset_id'] == 'a'
-    assert scheduler.get_next_asset() is None
-
-    # Travel past the window's close (membership -> empty, state
-    # resets), then reopen the window by extending end_date.
-    with time_machine.travel(now + timedelta(hours=2)):
+    # 2026-01-05 is a Monday; noon is inside the 09:00–17:00 slot.
+    with time_machine.travel(_aware(2026, 1, 5, 12)):
+        scheduler = Scheduler()
+        first = scheduler.get_next_asset()
+        assert first is not None and first['asset_id'] == 'a'
         assert scheduler.get_next_asset() is None
-        Playlist.objects.filter(pk=once.pk).update(
-            end_date=timezone.now() + timedelta(hours=1)
-        )
+
+    # Past the slot's close (membership -> empty, state resets)…
+    with time_machine.travel(_aware(2026, 1, 5, 18)):
+        scheduler.update_playlist()
+        assert scheduler.get_next_asset() is None
+
+    # …and inside the next day's slot the play-through restarts.
+    with time_machine.travel(_aware(2026, 1, 6, 10)):
         scheduler.update_playlist()
         replay = scheduler.get_next_asset()
         assert replay is not None and replay['asset_id'] == 'a'

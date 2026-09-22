@@ -457,21 +457,7 @@
           </template>
 
           <section class="modal-section">
-            <h3 class="modal-section__title">Availability</h3>
-            <p class="modal-section__hint">
-              The asset is only shown between these dates and times.
-            </p>
-            <div class="app-form-grid mb-3">
-              <div class="app-floating">
-                <input type="text" class="app-input js-flatpickr-datetime" id="edit-start" name="start_date" :value="editAsset.start_date_local" required autocomplete="off">
-                <label for="edit-start">Start</label>
-              </div>
-              <div class="app-floating">
-                <input type="text" class="app-input js-flatpickr-datetime" id="edit-end" name="end_date" :value="editAsset.end_date_local" required autocomplete="off">
-                <label for="edit-end">End</label>
-              </div>
-            </div>
-
+            <h3 class="modal-section__title">Playback</h3>
             {% comment %} Video assets must stay at duration=0 (v2 API rule) — disable
                the input for videos so the form POST omits it; the server defends too.
             {% endcomment %}
@@ -493,7 +479,7 @@
 
             <div class="modal-section__body" x-show="advancedOpen" x-cloak>
               <p class="modal-section__hint">
-                Restrict playback to specific weekdays and hours within the availability window. Leave times empty to play all day.
+                Restrict playback to specific weekdays and hours. Leave times empty to play all day.
               </p>
               <div class="weekday-picker mb-3">
                 <template x-for="d in [{n:1,l:'Mon'},{n:2,l:'Tue'},{n:3,l:'Wed'},{n:4,l:'Thu'},{n:5,l:'Fri'},{n:6,l:'Sat'},{n:7,l:'Sun'}]" :key="d.n">
