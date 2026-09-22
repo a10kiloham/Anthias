@@ -1,7 +1,7 @@
 import json
 import re
 import uuid
-from datetime import datetime, time
+from datetime import UTC, datetime, time
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from django.db import models
@@ -17,6 +17,22 @@ ALL_DAYS = [1, 2, 3, 4, 5, 6, 7]
 # validation), the form handler (clamping), and mirrored by
 # kMaxReloadIntervalS in src/anthias_webview/src/view.cpp.
 REFRESH_INTERVAL_S_MAX = 86400
+
+
+# Sentinel ``end_date`` stamped on newly created assets. Expiration is
+# gone product-wide — ``is_active()`` never consults dates — so the
+# stored dates exist only for REST wire-shape compatibility. A concrete
+# far-future date rather than NULL because older, date-enforcing code
+# (or a rollback to it) treats an unset bound as "never plays"; the
+# sentinel keeps content alive under every semantics.
+NO_EXPIRY_END_DATE = datetime(2100, 1, 1, tzinfo=UTC)
+
+
+def default_end_date(mimetype: str | None, now: datetime) -> datetime:
+    """Inert schedule end for a newly created asset: the no-expiry
+    sentinel, regardless of mimetype."""
+    del mimetype, now
+    return NO_EXPIRY_END_DATE
 
 
 # Upper bound for ``Asset.duration`` (seconds). The hard constraint is

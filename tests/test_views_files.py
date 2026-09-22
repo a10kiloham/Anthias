@@ -205,6 +205,40 @@ def test_anthias_assets_directory_request_404(
         views_files.anthias_assets(request, filename='subdir')
 
 
+def test_anthias_assets_streams_async_under_asgi(
+    factory: RequestFactory, assets_root: Path
+) -> None:
+    """Regression (issue #3073's mechanism): the webview fetches its
+    media here, and a sync FileResponse iterator would make Django's
+    ASGI handler buffer the whole file into RAM before the first
+    byte. The response must carry an async iterator."""
+    import asyncio
+
+    from django.http import StreamingHttpResponse
+
+    response = _call_anthias_assets(factory, 'hello.txt', DOCKER_BRIDGE_IP)
+    assert isinstance(response, StreamingHttpResponse)
+    assert response.is_async is True
+
+    async def drain() -> bytes:
+        return b''.join([part async for part in aiter(response)])
+
+    assert asyncio.run(drain()) == b'hello'
+
+
+def test_anthias_assets_honours_range(
+    factory: RequestFactory, assets_root: Path
+) -> None:
+    request = factory.get(
+        '/anthias_assets/hello.txt',
+        REMOTE_ADDR=DOCKER_BRIDGE_IP,
+        HTTP_RANGE='bytes=1-3',
+    )
+    response = views_files.anthias_assets(request, filename='hello.txt')
+    assert response.status_code == 206
+    assert response['Content-Range'] == 'bytes 1-3/5'
+
+
 # ---------------------------------------------------------------------------
 # static_with_mime view
 # ---------------------------------------------------------------------------

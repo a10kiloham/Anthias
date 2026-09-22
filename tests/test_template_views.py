@@ -201,6 +201,112 @@ def test_page_context_assets_split(asset: Asset) -> None:
     assert asset.asset_id not in inactive_ids
 
 
+@pytest.fixture
+def now_playing_reply() -> Any:
+    """Route the viewer request-reply wire to a canned answer and
+    reset the module-level timeout mute so earlier tests (whose
+    mocked Redis makes recv_json fail) can't suppress the query."""
+
+    def _install(reply: Any) -> mock.MagicMock:
+        page_context._now_playing_muted_until = 0.0
+        collector = mock.MagicMock()
+        if isinstance(reply, Exception):
+            collector.recv_json.side_effect = reply
+        else:
+            collector.recv_json.return_value = reply
+        return collector
+
+    return _install
+
+
+@pytest.mark.django_db
+def test_now_playing_banner_and_row_highlight(
+    client: Client, asset: Asset, now_playing_reply: Any
+) -> None:
+    """When the viewer reports an on-screen asset, the Schedule
+    partial renders the Now-playing banner (thumb + name) and tags
+    the asset's row with the is-playing highlight class."""
+    collector = now_playing_reply({'current_asset_id': asset.asset_id})
+    with (
+        mock.patch(
+            'anthias_server.settings.ReplyCollector.get_instance',
+            return_value=collector,
+        ),
+        mock.patch(
+            'anthias_server.settings.ViewerPublisher.get_instance',
+        ) as publisher,
+    ):
+        response = client.get(reverse('anthias_app:assets_table'))
+    body = response.content.decode()
+    assert response.status_code == 200
+    assert 'Now playing' in body
+    assert 'is-playing' in body
+    assert (asset.name or '') in body
+    sent = publisher.return_value.send_to_viewer.call_args[0][0]
+    assert sent.startswith('current_asset_id&')
+
+
+@pytest.mark.django_db
+def test_now_playing_highlights_containing_playlists(
+    asset: Asset, now_playing_reply: Any
+) -> None:
+    """The playing asset's ancestor playlists are reported too, so
+    the Schedule table can highlight the playlist row the asset is
+    playing through (including across nesting)."""
+    from anthias_server.app.models import (
+        Playlist,
+        PlaylistItem,
+        get_default_playlist,
+    )
+
+    outer = Playlist.objects.create(name='Outer')
+    inner = Playlist.objects.create(name='Inner')
+    PlaylistItem.objects.create(
+        playlist=get_default_playlist(), child_playlist=outer, position=0
+    )
+    PlaylistItem.objects.create(
+        playlist=outer, child_playlist=inner, position=0
+    )
+    PlaylistItem.objects.create(playlist=inner, asset=asset, position=0)
+
+    collector = now_playing_reply({'current_asset_id': asset.asset_id})
+    with (
+        mock.patch(
+            'anthias_server.settings.ReplyCollector.get_instance',
+            return_value=collector,
+        ),
+        mock.patch('anthias_server.settings.ViewerPublisher.get_instance'),
+    ):
+        now_playing, playlist_ids = page_context._now_playing()
+    assert now_playing is not None
+    assert now_playing.asset_id == asset.asset_id
+    assert inner.playlist_id in playlist_ids
+    assert outer.playlist_id in playlist_ids
+
+
+@pytest.mark.django_db
+def test_now_playing_timeout_mutes_further_queries(
+    now_playing_reply: Any,
+) -> None:
+    """A viewer that doesn't answer costs one stalled query per mute
+    window, not one per 5 s table poll: after a timeout the helper
+    returns immediately without touching the wire."""
+    from anthias_common.errors import ReplyTimeoutError
+
+    collector = now_playing_reply(ReplyTimeoutError())
+    with (
+        mock.patch(
+            'anthias_server.settings.ReplyCollector.get_instance',
+            return_value=collector,
+        ),
+        mock.patch('anthias_server.settings.ViewerPublisher.get_instance'),
+    ):
+        assert page_context._now_playing() == (None, set())
+        assert page_context._now_playing() == (None, set())
+    assert collector.recv_json.call_count == 1
+    page_context._now_playing_muted_until = 0.0
+
+
 @pytest.mark.django_db
 def test_page_context_device_settings_keys() -> None:
     ctx = page_context.device_settings()
@@ -275,6 +381,31 @@ def test_assets_create_via_post(client: Client) -> None:
     first = created.first()
     assert first is not None
     assert first.mimetype == 'image'
+
+
+@pytest.mark.django_db
+def test_assets_create_stamps_no_expiry_sentinel(client: Client) -> None:
+    """Every new asset gets the inert no-expiry sentinel end_date —
+    expiration is gone product-wide, not just for videos."""
+    from anthias_server.app.models import NO_EXPIRY_END_DATE
+
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        client.post(
+            reverse('anthias_app:assets_create'),
+            data={'uri': 'https://anthias.example.com/clip.mp4'},
+        )
+        client.post(
+            reverse('anthias_app:assets_create'),
+            data={'uri': 'https://anthias.example.com/pic.png'},
+        )
+    video = Asset.objects.get(uri='https://anthias.example.com/clip.mp4')
+    image = Asset.objects.get(uri='https://anthias.example.com/pic.png')
+    assert video.mimetype == 'video'
+    assert video.end_date == NO_EXPIRY_END_DATE
+    assert image.end_date == NO_EXPIRY_END_DATE
 
 
 @pytest.mark.django_db
