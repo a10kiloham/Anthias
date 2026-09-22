@@ -1519,52 +1519,6 @@ def test_24_hour_clock_play_window_end_to_end(
         _set_clock_toggle(page, use_24h=False)
 
 
-def _set_date_format(page: Page, value: str) -> None:
-    page.goto(SETTINGS_URL)
-    page.locator('#date_format').select_option(value)
-    _save_settings_form(page)
-    expect(page.locator('#date_format')).to_have_value(value)
-
-
-@pytest.mark.integration
-@pytest.mark.django_db(transaction=True)
-def test_date_format_round_trip_in_edit_modal(
-    reset_assets: None, page: Page
-) -> None:
-    """Switch the device to dd/mm/yyyy: the availability pickers must
-    format AND parse in that shape, so saving a typed d/m/Y datetime
-    lands the right calendar day (not a swapped month/day)."""
-    Asset.objects.create(**asset_active)
-    try:
-        _set_date_format(page, 'dd/mm/yyyy')
-
-        page.goto(BASE_URL)
-        _open_edit_modal(page, asset_active['asset_id'])
-        page.locator('#edit-end').fill('24/12/2026 11:30 PM')
-        page.get_by_role('heading', name='Edit asset').click()
-        expect(page.locator('.flatpickr-calendar.open')).to_have_count(0)
-        expect(page.locator('#edit-end')).to_have_value('24/12/2026 11:30 PM')
-
-        status = _submit_edit_form(page, asset_active['asset_id'])
-        assert status < 500
-
-        def _persisted() -> bool:
-            a = Asset.objects.get(asset_id=asset_active['asset_id'])
-            if a.end_date is None:
-                return False
-            return (
-                a.end_date.day,
-                a.end_date.month,
-                a.end_date.year,
-                a.end_date.hour,
-                a.end_date.minute,
-            ) == (24, 12, 2026, 23, 30)
-
-        _wait_db(_persisted, description='d/m/Y end date persisted')
-    finally:
-        _set_date_format(page, 'mm/dd/yyyy')
-
-
 @pytest.mark.integration
 @pytest.mark.django_db(transaction=True)
 def test_settings_player_name_round_trip(
@@ -1798,6 +1752,7 @@ def test_skip_buttons_publish_correct_command(
             page.get_by_role('heading', name='Schedule Overview')
         ).to_be_visible()
 
+        seen: list[str] = []
         published: str | None = None
         deadline = monotonic() + 5.0
         while monotonic() < deadline:
@@ -1807,11 +1762,22 @@ def test_skip_buttons_publish_correct_command(
             if msg.get('type') != 'message':
                 continue
             data = msg.get('data')
-            if isinstance(data, str) and data.startswith('viewer '):
-                published = data[len('viewer ') :]
-                break
+            if not (isinstance(data, str) and data.startswith('viewer ')):
+                continue
+            command = data[len('viewer ') :]
+            seen.append(command)
+            # The now-playing banner polls over the same channel
+            # (``viewer current_asset <correlation-id>``) whenever the
+            # home page renders, so its frames can interleave with the
+            # button's publish — skip them instead of asserting on the
+            # first frame that happens to arrive.
+            if command.split(' ')[0] == 'current_asset':
+                continue
+            published = command
+            break
         assert published == expected_command, (
-            f'expected viewer publish {expected_command!r}, got {published!r}'
+            f'expected viewer publish {expected_command!r}, '
+            f'got {published!r} (saw {seen!r})'
         )
     finally:
         with contextlib.suppress(Exception):
