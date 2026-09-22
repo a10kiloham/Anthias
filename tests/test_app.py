@@ -1826,11 +1826,11 @@ def test_skip_buttons_publish_correct_command(
             command = data[len('viewer ') :]
             seen.append(command)
             # The now-playing banner polls over the same channel
-            # (``viewer current_asset <correlation-id>``) whenever the
-            # home page renders, so its frames can interleave with the
-            # button's publish — skip them instead of asserting on the
-            # first frame that happens to arrive.
-            if command.split(' ')[0] == 'current_asset':
+            # (``viewer current_asset_id&<correlation-id>``) whenever
+            # the home page renders, so its frames can interleave with
+            # the button's publish — skip them instead of asserting on
+            # the first frame that happens to arrive.
+            if command.startswith('current_asset_id'):
                 continue
             published = command
             break
