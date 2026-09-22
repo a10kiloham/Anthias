@@ -19,6 +19,30 @@
      selection of rows that have since disappeared. {% endcomment %}
   <div x-init="syncVisibleIds({{ active_assets|asset_ids }}, {{ inactive_assets|asset_ids }})" hidden></div>
 
+  {% if now_playing %}
+  {% comment %} Now-playing banner. Lives inside the #asset-table
+     partial so the 5 s poll keeps it fresh. The thumb carries
+     hx-preserve with an id keyed on the asset — htmx keeps the same
+     DOM node across swaps, so the <img>/<video> isn't refetched
+     every poll; when the on-screen asset changes the id changes and
+     a fresh element (and fetch) replaces it. {% endcomment %}
+  <section class="surface surface--active now-playing-card" aria-label="Now playing">
+    <span class="now-playing-card__thumb" id="now-playing-thumb-{{ now_playing.asset_id }}" hx-preserve>
+      {% if now_playing.mimetype == 'image' %}
+      <img src="{% url 'anthias_app:assets_preview' asset_id=now_playing.asset_id %}" alt="">
+      {% elif now_playing.mimetype == 'video' %}
+      <video src="{% url 'anthias_app:assets_preview' asset_id=now_playing.asset_id %}" muted preload="metadata" disablepictureinpicture playsinline tabindex="-1"></video>
+      {% else %}
+      <i class="ti ti-world"></i>
+      {% endif %}
+    </span>
+    <span class="now-playing-card__meta">
+      <span class="now-playing-card__label"><span class="now-playing-card__dot" aria-hidden="true"></span>Now playing</span>
+      <span class="now-playing-card__name" title="{{ now_playing.name|default:now_playing.uri }}">{{ now_playing.name|default:now_playing.uri }}</span>
+    </span>
+  </section>
+  {% endif %}
+
   <section id="active-assets-section" class="surface surface--active">
     <header class="surface__header">
       <div class="surface__header-left">

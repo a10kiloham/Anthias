@@ -1,6 +1,6 @@
 {% load asset_filters %}
 {% with pills=asset|schedule_pills %}
-<tr data-asset-id="{{ asset.asset_id }}" data-processing="{{ asset.is_processing|yesno:'true,false' }}" data-name="{{ asset.name|default:''|escape }}" data-duration="{{ asset.duration|default:0 }}" :class="isSelected('{{ asset.asset_id }}') && 'is-selected'">
+<tr data-asset-id="{{ asset.asset_id }}" class="{% if now_playing and asset.asset_id == now_playing.asset_id %}is-playing{% endif %}" data-processing="{{ asset.is_processing|yesno:'true,false' }}" data-name="{{ asset.name|default:''|escape }}" data-duration="{{ asset.duration|default:0 }}" :class="isSelected('{{ asset.asset_id }}') && 'is-selected'">
   <td class="asset-select-col" data-label="Select" data-no-label>
     <label class="asset-select">
       <input type="checkbox" class="app-check-input js-row-select"
