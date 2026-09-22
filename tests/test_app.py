@@ -1168,57 +1168,6 @@ def test_edit_play_window_with_12_hour_time_picker(
 
 @pytest.mark.integration
 @pytest.mark.django_db(transaction=True)
-def test_edit_availability_window_with_12_hour_datetime_picker(
-    reset_assets: None, page: Page
-) -> None:
-    """The Start / End availability pickers post the full
-    "06/15/2026 02:30 PM" shape under the default 12-hour clock —
-    saving must succeed and land the right aware datetimes."""
-    assert settings['use_24_hour_clock'] is False, (
-        'precondition: this test exercises the 12-hour clock default'
-    )
-    Asset.objects.create(**asset_active)
-    page.goto(BASE_URL)
-    _open_edit_modal(page, asset_active['asset_id'])
-
-    # Type the full datetime strings (allowInput is on; this is the
-    # same wire format the picker itself produces for m/d/Y h:i K).
-    page.locator('#edit-start').fill('06/15/2026 09:00 AM')
-    page.locator('#edit-end').fill('12/24/2026 11:30 PM')
-    # Focusing the inputs pops the calendar panel, which overlays the
-    # footer's Save button — click a neutral spot to dismiss it.
-    page.get_by_role('heading', name='Edit asset').click()
-    expect(page.locator('.flatpickr-calendar.open')).to_have_count(0)
-    # Flatpickr re-formats to its h:i K mask on close (leading-zero
-    # hour drops: '09:00 AM' → '9:00 AM') but must keep the typed
-    # date/time semantics intact — no month/day swap, no reset to
-    # the seeded values.
-    expect(page.locator('#edit-start')).to_have_value('06/15/2026 9:00 AM')
-    expect(page.locator('#edit-end')).to_have_value('12/24/2026 11:30 PM')
-
-    status = _submit_edit_form(page, asset_active['asset_id'])
-    assert status < 500, (
-        f'assets_update returned HTTP {status} for 12-hour datetimes'
-    )
-
-    def _persisted() -> bool:
-        a = Asset.objects.get(asset_id=asset_active['asset_id'])
-        if a.start_date is None or a.end_date is None:
-            return False
-        start = a.start_date
-        end = a.end_date
-        return (start.month, start.day, start.hour, start.minute) == (
-            6,
-            15,
-            9,
-            0,
-        ) and (end.month, end.day, end.hour, end.minute) == (12, 24, 23, 30)
-
-    _wait_db(_persisted, description='12-hour availability window persisted')
-
-
-@pytest.mark.integration
-@pytest.mark.django_db(transaction=True)
 def test_edit_play_days_and_clear_play_window(
     reset_assets: None, page: Page
 ) -> None:

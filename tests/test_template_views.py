@@ -1470,11 +1470,15 @@ def test_assets_update_clears_play_window_when_both_empty(
 
 
 @pytest.mark.django_db
-def test_assets_update_parses_12_hour_start_end_dates(
+def test_assets_update_ignores_posted_dates(
     client: Client, asset: Asset
 ) -> None:
-    """The Start / End availability pickers post 'm/d/Y h:i K' under
-    the default 12-hour clock + mm/dd/yyyy date format."""
+    """Expiration is gone: a form (or hand-crafted POST) carrying
+    start/end dates must neither fail nor write them — the stored
+    values are inert API-compatibility columns the edit form no
+    longer owns."""
+    original_start = asset.start_date
+    original_end = asset.end_date
     with mock.patch(
         'anthias_server.settings.ViewerPublisher.send_to_viewer',
         return_value=None,
@@ -1485,49 +1489,14 @@ def test_assets_update_parses_12_hour_start_end_dates(
                 'name': asset.name,
                 'duration': '20',
                 'start_date': '06/15/2026 9:00 AM',
-                'end_date': '12/24/2026 11:30 PM',
+                'end_date': 'sometime soon',
             },
         )
     assert response.status_code in (200, 302)
     asset.refresh_from_db()
-    assert asset.start_date is not None and asset.end_date is not None
-    assert (
-        asset.start_date.month,
-        asset.start_date.day,
-        asset.start_date.hour,
-        asset.start_date.minute,
-    ) == (6, 15, 9, 0)
-    assert (
-        asset.end_date.month,
-        asset.end_date.day,
-        asset.end_date.hour,
-        asset.end_date.minute,
-    ) == (12, 24, 23, 30)
-
-
-@pytest.mark.django_db
-def test_assets_update_invalid_start_date_toasts_instead_of_500(
-    client: Client, asset: Asset
-) -> None:
-    original_start = asset.start_date
-    with mock.patch(
-        'anthias_server.settings.ViewerPublisher.send_to_viewer',
-        return_value=None,
-    ):
-        response = client.post(
-            reverse('anthias_app:assets_update', args=[asset.asset_id]),
-            data={
-                'name': asset.name,
-                'duration': '20',
-                'start_date': 'sometime soon',
-                'end_date': '2027-01-01T00:00',
-            },
-            headers={'HX-Request': 'true'},
-        )
-    assert response.status_code == 200
-    assert 'error' in response.headers.get('HX-Trigger', '')
-    asset.refresh_from_db()
     assert asset.start_date == original_start
+    assert asset.end_date == original_end
+    assert asset.duration == 20
 
 
 @pytest.mark.django_db
@@ -1788,14 +1757,17 @@ def test_assets_bulk_update_unmatched_ids_keeps_selection(
 
 
 @pytest.mark.django_db
-def test_assets_bulk_update_dates(
+def test_assets_bulk_update_ignores_dates(
     client: Client, bulk_assets: list[Asset]
 ) -> None:
+    """Expiration is gone: a stale form posting the old apply_dates
+    group is treated as 'nothing to change' and no row is written."""
+    originals = {a.asset_id: (a.start_date, a.end_date) for a in bulk_assets}
     with mock.patch(
         'anthias_server.settings.ViewerPublisher.send_to_viewer',
         return_value=None,
     ):
-        client.post(
+        response = client.post(
             reverse('anthias_app:assets_bulk_update'),
             data={
                 'ids': _bulk_ids_csv(bulk_assets),
@@ -1803,15 +1775,15 @@ def test_assets_bulk_update_dates(
                 'start_date': '01/02/2030 09:00 AM',
                 'end_date': '01/03/2030 09:00 AM',
             },
+            headers={'HX-Request': 'true'},
         )
+    import json as _json
+
+    trigger = _json.loads(response['HX-Trigger'])
+    assert trigger['toast']['kind'] == 'info'
     for a in bulk_assets:
         a.refresh_from_db()
-        assert a.start_date is not None
-        assert (a.start_date.year, a.start_date.month, a.start_date.day) == (
-            2030,
-            1,
-            2,
-        )
+        assert (a.start_date, a.end_date) == originals[a.asset_id]
 
 
 @pytest.mark.django_db
@@ -2929,12 +2901,14 @@ def test_assets_upload_jpeg_skips_normalization(client: Client) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Schedule-window template filter (status dot + relative phrasing)
+# playback_status template filter (status dot on the schedule rows)
 
 
 @pytest.mark.django_db
-def test_schedule_window_live() -> None:
-    from anthias_server.app.templatetags.asset_filters import schedule_window
+def test_playback_status_dates_are_irrelevant() -> None:
+    """An enabled asset is 'live' no matter what its inert stored
+    dates say — including a long-past end_date."""
+    from anthias_server.app.templatetags.asset_filters import playback_status
 
     now = timezone.now()
     a = Asset.objects.create(
@@ -2945,20 +2919,18 @@ def test_schedule_window_live() -> None:
         is_enabled=True,
         is_processing=False,
         play_order=0,
-        start_date=now - timedelta(days=2),
-        end_date=now + timedelta(days=30),
+        start_date=now - timedelta(days=30),
+        end_date=now - timedelta(days=5),
     )
-    out = schedule_window(a)
+    out = playback_status(a)
     assert out['kind'] == 'live'
-    assert 'Live' in out['primary']
-    assert '→' in out['secondary']
+    assert out['primary'] == 'Active'
 
 
 @pytest.mark.django_db
-def test_schedule_window_disabled_overrides_state() -> None:
-    from anthias_server.app.templatetags.asset_filters import schedule_window
+def test_playback_status_disabled_overrides_state() -> None:
+    from anthias_server.app.templatetags.asset_filters import playback_status
 
-    now = timezone.now()
     a = Asset.objects.create(
         name='disabled',
         uri='https://x',
@@ -2967,52 +2939,45 @@ def test_schedule_window_disabled_overrides_state() -> None:
         is_enabled=False,
         is_processing=False,
         play_order=0,
-        start_date=now - timedelta(days=1),
-        end_date=now + timedelta(days=30),
     )
-    out = schedule_window(a)
+    out = playback_status(a)
     assert out['kind'] == 'disabled'
     assert out['primary'] == 'Disabled'
 
 
 @pytest.mark.django_db
-def test_schedule_window_upcoming_and_expired() -> None:
-    from anthias_server.app.templatetags.asset_filters import schedule_window
+def test_playback_status_off_window() -> None:
+    """Enabled but outside its day-of-week window right now."""
+    import json as _json
 
-    now = timezone.now()
-    upcoming = Asset.objects.create(
-        name='upcoming',
+    from anthias_server.app.templatetags.asset_filters import playback_status
+
+    today = timezone.localtime().isoweekday()
+    other_days = [d for d in range(1, 8) if d != today]
+    a = Asset.objects.create(
+        name='weekday-bound',
         uri='https://x',
         mimetype='webpage',
         duration=10,
         is_enabled=True,
         is_processing=False,
         play_order=0,
-        start_date=now + timedelta(days=3),
-        end_date=now + timedelta(days=30),
+        play_days=_json.dumps(other_days),
     )
-    expired = Asset.objects.create(
-        name='expired',
-        uri='https://x',
-        mimetype='webpage',
-        duration=10,
-        is_enabled=True,
-        is_processing=False,
-        play_order=1,
-        start_date=now - timedelta(days=30),
-        end_date=now - timedelta(days=5),
-    )
-    assert schedule_window(upcoming)['kind'] == 'upcoming'
-    assert schedule_window(expired)['kind'] == 'expired'
+    out = playback_status(a)
+    assert out['kind'] == 'scheduled'
+    assert out['primary'] == 'Off-window now'
 
 
 @pytest.mark.django_db
-def test_schedule_window_missing_dates_falls_back() -> None:
-    from anthias_server.app.templatetags.asset_filters import schedule_window
+def test_playback_status_works_for_playlists() -> None:
+    from anthias_server.app.models import Playlist
+    from anthias_server.app.templatetags.asset_filters import playback_status
 
-    a = Asset(name='empty', mimetype='webpage', is_enabled=True)
-    out = schedule_window(a)
-    assert out['kind'] == 'unknown'
+    playlist = Playlist.objects.create(name='p')
+    assert playback_status(playlist)['kind'] == 'live'
+    playlist.is_enabled = False
+    assert playback_status(playlist)['kind'] == 'disabled'
 
 
 # ---------------------------------------------------------------------------

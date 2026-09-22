@@ -153,22 +153,26 @@ def test_generate_asset_list_assets_should_return_list_sorted_by_play_order(
 def test_generate_asset_list_check_deadline_if_both_active(
     restore_shuffle_setting: None,
 ) -> None:
+    """Dates are inert and neither asset has a day/time window, so
+    nothing can flip on its own — no deadline."""
     _create_assets([ASSET_X, ASSET_Y])
     _, deadline = generate_asset_list()
-    assert deadline == ASSET_Y['end_date']
+    assert deadline is None
 
 
 @pytest.mark.django_db
-def test_generate_asset_list_check_deadline_if_asset_scheduled(
+def test_generate_asset_list_future_dated_asset_plays_now(
     restore_shuffle_setting: None,
 ) -> None:
-    """If ASSET_X is active and ASSET_X[end_date] == (now + 3) and
-    ASSET_TOMORROW will be active tomorrow then deadline should be
-    ASSET_TOMORROW[start_date]
-    """
+    """There is no date-based scheduling: an enabled asset whose
+    stored start_date is tomorrow still plays right now."""
     _create_assets([ASSET_X, ASSET_TOMORROW])
-    _, deadline = generate_asset_list()
-    assert deadline == ASSET_TOMORROW['start_date']
+    assets, deadline = generate_asset_list()
+    assert {a['asset_id'] for a in assets} == {
+        ASSET_X['asset_id'],
+        ASSET_TOMORROW['asset_id'],
+    }
+    assert deadline is None
 
 
 @pytest.mark.django_db
@@ -283,18 +287,27 @@ def test_get_db_mtime_tracks_wal_sidecar(
 def test_playlist_should_be_updated_after_deadline_reached(
     restore_shuffle_setting: None,
 ) -> None:
-    _create_assets([ASSET_X, ASSET_Y])
-    _, deadline = generate_asset_list()
-    assert deadline is not None
+    """The windowed 60s cap is the only deadline left; crossing a
+    day boundary through it drops the asset whose day filter no
+    longer matches."""
+    # 2026-01-05 is a Monday; 'mon-only' plays Mondays only.
+    with time_machine.travel(_aware(2026, 1, 5, 23, 59)):
+        _create_assets(
+            [
+                _scheduled_asset('all-days'),
+                _scheduled_asset('mon-only', play_days='[1]'),
+            ]
+        )
+        scheduler = Scheduler()
+        assert {a['asset_id'] for a in scheduler.assets} == {
+            'all-days',
+            'mon-only',
+        }
+        assert scheduler.deadline is not None
 
-    traveller = time_machine.travel(deadline + timedelta(seconds=1))
-    traveller.start()
-
-    scheduler = Scheduler()
-    scheduler.refresh_playlist()
-
-    assert [_bare(a) for a in scheduler.assets] == [ASSET_X]
-    traveller.stop()
+    with time_machine.travel(_aware(2026, 1, 6, 0, 1)):  # Tuesday
+        scheduler.refresh_playlist()
+        assert [a['asset_id'] for a in scheduler.assets] == ['all-days']
 
 
 def _aware(
@@ -438,7 +451,7 @@ def test_windowed_cap_applies_when_any_asset_has_window() -> None:
 def test_windowed_cap_does_not_apply_without_window() -> None:
     Asset.objects.create(**ASSET_X)
     _, deadline = generate_asset_list()
-    assert deadline == ASSET_X['end_date']
+    assert deadline is None
 
 
 @pytest.mark.django_db
@@ -452,46 +465,41 @@ def test_windowed_cap_does_not_apply_for_partial_time_window() -> None:
         **_scheduled_asset(play_time_from=time(9, 0), play_time_to=None)
     )
     _, deadline = generate_asset_list()
-    # Cap should NOT apply: deadline tracks the asset's end_date, not now+60s
-    assert deadline is not None
-    assert (deadline - timezone.now()).total_seconds() > 60
+    # Cap must NOT apply, and nothing else can produce a deadline.
+    assert deadline is None
 
 
 @pytest.mark.django_db
-def test_windowed_cap_does_not_apply_before_start_date() -> None:
-    """A windowed asset whose start_date is in the future shouldn't
-    drag the cap into the picture — its activeness can't flip until
-    start_date arrives, so the deadline should track start_date, not
-    now+60s."""
+def test_windowed_cap_applies_regardless_of_stored_dates() -> None:
+    """Dates are inert: a windowed asset gets the 60s cap even when
+    its stored start_date is in the future or its end_date has long
+    passed."""
     Asset.objects.create(
         **_scheduled_asset(
+            'future-dated',
             play_days='[1]',
             start_date=_aware(2027, 1, 1, 0, 0),
             end_date=_aware(2027, 12, 31, 0, 0),
         )
     )
-    with time_machine.travel(_aware(2026, 1, 5, 12, 0)):
-        now = timezone.now()
-        _, deadline = generate_asset_list()
-    assert deadline is not None
-    assert (deadline - now).total_seconds() > 60
-
-
-@pytest.mark.django_db
-def test_windowed_cap_does_not_apply_after_end_date() -> None:
-    """An expired windowed asset can never become active again, so it
-    must not keep the cap firing every 60s."""
     Asset.objects.create(
         **_scheduled_asset(
+            'past-dated',
             play_days='[1]',
             start_date=_aware(2024, 1, 1, 0, 0),
             end_date=_aware(2024, 12, 31, 0, 0),
         )
     )
-    with time_machine.travel(_aware(2026, 1, 5, 12, 0)):
-        _, deadline = generate_asset_list()
-    # No live deadlines at all: end_date is past, no cap, no other assets.
-    assert deadline is None
+    with time_machine.travel(_aware(2026, 1, 5, 12, 0)):  # Monday
+        now = timezone.now()
+        assets, deadline = generate_asset_list()
+        assert {a['asset_id'] for a in assets} == {
+            'future-dated',
+            'past-dated',
+        }
+        assert deadline is not None
+        cap = now + timedelta(seconds=WINDOWED_DEADLINE_CAP_SECONDS)
+        assert abs((deadline - cap).total_seconds()) <= 1
 
 
 @pytest.mark.django_db

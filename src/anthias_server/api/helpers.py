@@ -115,11 +115,9 @@ def persist_new_asset(serializer: Any) -> Asset:
 
 
 def get_active_asset_ids() -> list[str]:
-    enabled_assets = Asset.objects.filter(
-        is_enabled=True,
-        start_date__isnull=False,
-        end_date__isnull=False,
-    ).order_by('play_order')
+    enabled_assets = Asset.objects.filter(is_enabled=True).order_by(
+        'play_order'
+    )
     return [asset.asset_id for asset in enabled_assets if asset.is_active()]
 
 

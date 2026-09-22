@@ -39,8 +39,8 @@ from anthias_server.app.models import (
 logger = logging.getLogger(__name__)
 
 # Re-evaluate windowed playlists at most this often. Day-of-week and
-# time-of-day boundaries don't show up in start_date/end_date, so we
-# need a polling cap to ensure transitions are picked up.
+# time-of-day boundaries don't name an exact instant, so a polling cap
+# ensures transitions are picked up.
 WINDOWED_DEADLINE_CAP_SECONDS = 60
 
 
@@ -158,15 +158,10 @@ def _occurrence_is_active(occurrence: Occurrence, now: datetime) -> bool:
 
 
 def _is_candidate(occurrence: Occurrence) -> bool:
-    """Mirror of the pre-playlist SQL candidate filter: enabled asset
-    with both dates set. Rows failing this can never become active, so
+    """An enabled asset. Rows failing this can never become active
+    without an operator edit (which the DB-mtime poll picks up), so
     they contribute neither playback nor deadline."""
-    asset = occurrence.asset
-    return bool(
-        asset.is_enabled
-        and asset.start_date is not None
-        and asset.end_date is not None
-    )
+    return bool(occurrence.asset.is_enabled)
 
 
 def evaluate_playlist(
@@ -175,90 +170,41 @@ def evaluate_playlist(
     """Active occurrences (in DFS play order, unshuffled) plus the
     soonest future moment the playlist might need re-evaluating.
 
-    Active filter and deadline computation share a single ``now`` so a
-    row can't be filtered as active while its end_date is skipped as
-    past in the deadline pass — the two would otherwise disagree across
-    a midnight tick. Shuffle is the caller's business: the viewer and
-    the API shuffle their own copies (with their own RNGs), and the
-    viewer's membership guard needs the unshuffled list anyway.
+    Active filter and deadline computation share a single ``now`` so
+    the two can't disagree across a midnight tick. Shuffle is the
+    caller's business: the viewer and the API shuffle their own copies
+    (with their own RNGs), and the viewer's membership guard needs the
+    unshuffled list anyway.
     """
     if now is None:
         now = timezone.now()
 
     candidates = [o for o in expand_occurrences() if _is_candidate(o)]
-    active_flags = [_occurrence_is_active(o, now) for o in candidates]
-    active = [o for o, ok in zip(candidates, active_flags) if ok]
+    active = [o for o in candidates if _occurrence_is_active(o, now)]
 
-    deadline = compute_deadline(candidates, active_flags, now)
+    deadline = compute_deadline(candidates, now)
     return active, deadline
 
 
 def compute_deadline(
     occurrences: list[Occurrence],
-    active_flags: list[bool],
     now: datetime,
 ) -> datetime | None:
     """Soonest future moment when the playlist might need re-evaluating.
 
-    Every occurrence carries a stack of windows — the asset's own dates
-    plus each ancestor playlist's optional dates, all ANDed. Deadline is
-    the soonest of, per occurrence:
-
-      - **active** → the earliest close among the windows on its path
-        (whichever date bound shuts first ends the occurrence);
-      - **inactive** because some window hasn't opened yet (and none has
-        permanently closed) → the latest future open — the first moment
-        every date window admits ``now``. If any window on the path has
-        already closed, the occurrence can never come back, so it
-        contributes nothing (a permanently-past boundary must not pin
-        the deadline to "always overdue"); if it's date-eligible but
-        blocked by a day/time window or a disabled ancestor, the date
-        columns can't name the flip — the windowed cap (below) or the
-        operator's edit (DB-mtime poll) covers it;
-      - now + WINDOWED_DEADLINE_CAP_SECONDS, if any node on some
-        occurrence's path has a day/time window filter AND the
-        **intersected** date range contains ``now`` (an occurrence
-        outside its dates can't flip on a window boundary, so it must
-        not force 60s polling).
+    With no date-based expiration, the only boundaries that can flip an
+    occurrence on their own are day-of-week / time-of-day windows, and
+    those don't name an exact instant — so the deadline is simply
+    ``now + WINDOWED_DEADLINE_CAP_SECONDS`` when any candidate
+    occurrence with a fully-enabled path carries a window filter
+    anywhere on it, and ``None`` otherwise (operator edits are picked
+    up by the DB-mtime poll, not the deadline).
     """
-    candidates: list[datetime] = []
-    has_windowed = False
-
-    for occurrence, is_active in zip(occurrences, active_flags):
-        asset = occurrence.asset
-        starts = [asset.start_date] + [
-            p.start_date for p in occurrence.path if p.start_date is not None
-        ]
-        ends = [asset.end_date] + [
-            p.end_date for p in occurrence.path if p.end_date is not None
-        ]
-        # _is_candidate guarantees the asset's own bounds are set.
-        assert asset.start_date is not None and asset.end_date is not None
-
-        if is_active:
-            candidates.append(min(d for d in ends if d is not None))
-        elif all(d is not None and d > now for d in ends):
-            future_starts = [d for d in starts if d is not None and d > now]
-            if future_starts:
-                candidates.append(max(future_starts))
-
-        in_date_range = all(d is not None and d < now for d in starts) and all(
-            d is not None and d > now for d in ends
-        )
+    for occurrence in occurrences:
         path_enabled = all(p.is_enabled for p in occurrence.path)
-        occurrence_has_window = asset.has_window_filter() or any(
+        occurrence_has_window = occurrence.asset.has_window_filter() or any(
             p.has_window_filter() for p in occurrence.path
         )
-        if occurrence_has_window and in_date_range and path_enabled:
-            has_windowed = True
-
-    if has_windowed:
-        candidates.append(
-            now + timedelta(seconds=WINDOWED_DEADLINE_CAP_SECONDS)
-        )
-
-    # Guard against a candidate that is exactly ``now`` (or a hair
-    # behind after the loop's own runtime) pinning the caller to an
-    # always-overdue deadline.
-    future = [d for d in candidates if d > now]
-    return min(future) if future else None
+        if occurrence_has_window and path_enabled:
+            return now + timedelta(seconds=WINDOWED_DEADLINE_CAP_SECONDS)
+    return None

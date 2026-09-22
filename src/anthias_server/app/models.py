@@ -345,23 +345,29 @@ class Asset(PlayWindowMixin):
         return str(self.name)
 
     def is_active(self, now: datetime | None = None) -> bool:
-        if not (self.is_enabled and self.start_date and self.end_date):
+        """Enabled and inside its day/time window.
+
+        There is deliberately no date-based expiration: an enabled
+        asset plays until the operator disables it. ``start_date`` /
+        ``end_date`` are retained as inert columns purely for REST API
+        wire-shape compatibility (v1–v2 accept and return them) and
+        have no effect on playback.
+        """
+        if not self.is_enabled:
             return False
         if now is None:
             now = timezone.now()
-        if not (self.start_date < now < self.end_date):
-            return False
         return self._matches_play_window(timezone.localtime(now))
 
 
 class Playlist(PlayWindowMixin):
     """A named, orderable, schedulable container of playlist items.
 
-    Scheduling fields use the same vocabulary as ``Asset`` with one
-    deliberate difference: ``start_date`` / ``end_date`` are optional,
-    and an unset bound means "unbounded" (an asset must carry both
-    dates to play; a playlist without dates is always date-eligible).
-    An occurrence plays iff its asset is active AND every ancestor
+    Scheduling fields use the same vocabulary as ``Asset``: enabled or
+    not, plus an optional day-of-week / time-of-day window. There is no
+    date-based expiration — ``start_date`` / ``end_date`` exist only
+    for API wire-shape compatibility and are never enforced. An
+    occurrence plays iff its asset is active AND every ancestor
     playlist admits ``now``.
 
     ``repeat=True`` (the default) loops the playlist's content forever —
@@ -401,18 +407,16 @@ class Playlist(PlayWindowMixin):
     def admits(self, now: datetime | None = None) -> bool:
         """Does this playlist's own window admit ``now``?
 
-        The playlist-local half of activeness — is_enabled, optional
-        date bounds, day/time window. Ancestors are ANDed in by the
-        expansion walk in ``playlist_eval``, not here.
+        The playlist-local half of activeness — is_enabled plus the
+        day/time window. Ancestors are ANDed in by the expansion walk
+        in ``playlist_eval``, not here. Like ``Asset.is_active``, there
+        is no date-based expiration: ``start_date`` / ``end_date`` are
+        inert API-compatibility columns.
         """
         if not self.is_enabled:
             return False
         if now is None:
             now = timezone.now()
-        if self.start_date and now <= self.start_date:
-            return False
-        if self.end_date and now >= self.end_date:
-            return False
         return self._matches_play_window(timezone.localtime(now))
 
 

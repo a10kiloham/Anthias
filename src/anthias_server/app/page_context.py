@@ -808,30 +808,36 @@ def playlists() -> dict[str, Any]:
 
     def build_node(playlist: Any, depth: int) -> dict[str, Any]:
         entries: list[dict[str, Any]] = []
+        total_seconds = 0
+        asset_count = 0
         for item in items_by_playlist.get(playlist.playlist_id, []):
             if item.asset is not None:
                 entries.append(
                     {'item': item, 'asset': item.asset, 'child': None}
                 )
+                total_seconds += item.asset.duration or 0
+                asset_count += 1
             elif (
                 item.child_playlist_id in all_playlists
                 and depth + 1 < MAX_PLAYLIST_DEPTH
             ):
-                entries.append(
-                    {
-                        'item': item,
-                        'asset': None,
-                        'child': build_node(
-                            all_playlists[item.child_playlist_id],
-                            depth + 1,
-                        ),
-                    }
+                child = build_node(
+                    all_playlists[item.child_playlist_id],
+                    depth + 1,
                 )
+                entries.append({'item': item, 'asset': None, 'child': child})
+                total_seconds += child['total_seconds']
+                asset_count += child['asset_count']
         return {
             'playlist': playlist,
             'entries': entries,
             'depth': depth,
             'can_nest': depth + 1 < MAX_PLAYLIST_DEPTH,
+            # Rolled-up runtime (sum of asset durations, nested
+            # playlists included) — the number an operator plans a
+            # rotation around, shown in the card header.
+            'total_seconds': total_seconds,
+            'asset_count': asset_count,
         }
 
     return {

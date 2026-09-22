@@ -36,7 +36,7 @@
         hx-target="#asset-table"
         hx-swap="outerHTML"
         hx-on::after-request="if (window.bulkSucceeded(event)) window.dispatchEvent(new CustomEvent('bulk-done', {detail: {closeEdit: true}}))"
-        x-data="{ applyDates: false, applyDuration: false, applyTime: false, applyDays: false, applyNocache: false, applySkip: false }"
+        x-data="{ applyDuration: false, applyTime: false, applyDays: false, applyNocache: false, applySkip: false }"
       >
         {% csrf_token %}
         <input type="hidden" name="ids" :value="selectedIds.join(',')">
@@ -45,24 +45,6 @@
             Tick a field to change it on every selected asset. Unticked
             fields are left as they are.
           </p>
-
-          {# ---- Availability dates ---- #}
-          <section class="bulk-field" :class="applyDates && 'is-on'">
-            <label class="app-check app-switch bulk-field__toggle m-0">
-              <input type="checkbox" class="app-check-input" name="apply_dates" value="true" x-model="applyDates">
-              <span class="app-check-label ml-2">Start &amp; end dates</span>
-            </label>
-            <div class="app-form-grid mt-3" x-show="applyDates" x-cloak>
-              <div class="app-floating">
-                <input type="text" class="app-input js-flatpickr-datetime" id="bulk-start" name="start_date" :disabled="!applyDates" autocomplete="off">
-                <label for="bulk-start">Start</label>
-              </div>
-              <div class="app-floating">
-                <input type="text" class="app-input js-flatpickr-datetime" id="bulk-end" name="end_date" :disabled="!applyDates" autocomplete="off">
-                <label for="bulk-end">End</label>
-              </div>
-            </div>
-          </section>
 
           {# ---- Duration ---- #}
           <section class="bulk-field" :class="applyDuration && 'is-on'">
