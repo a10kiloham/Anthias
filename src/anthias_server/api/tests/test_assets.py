@@ -475,6 +475,66 @@ def test_v2_patch_refresh_interval_out_of_range_rejected(
 
 
 @pytest.mark.django_db
+def test_v2_post_and_patch_loops_round_trip(api_client: APIClient) -> None:
+    """``loops`` mirrors ``refresh_interval_s``: metadata-backed,
+    surfaced as a top-level field, default 1, and the default is
+    stored as an absent key."""
+    response = api_client.post(
+        reverse('api:asset_list_v2'),
+        data={**ASSET_CREATION_DATA, 'loops': 3},
+        format='json',
+    )
+    assert response.status_code == status.HTTP_201_CREATED
+    assert response.data['loops'] == 3
+    assert response.data['metadata'] == {'loops': 3}
+
+    asset_id = response.data['asset_id']
+    detail_url = reverse('api:asset_detail_v2', args=[asset_id])
+    detail = api_client.get(detail_url)
+    assert detail.data['loops'] == 3
+
+    # PATCH back to the default removes the metadata key.
+    response = api_client.patch(detail_url, data={'loops': 1}, format='json')
+    assert response.status_code == status.HTTP_200_OK
+    assert response.data['loops'] == 1
+    assert response.data['metadata'] == {}
+
+
+@pytest.mark.django_db
+def test_v2_post_without_loops_defaults_to_one(
+    api_client: APIClient,
+) -> None:
+    response = api_client.post(
+        reverse('api:asset_list_v2'),
+        data=ASSET_CREATION_DATA,
+        format='json',
+    )
+    assert response.status_code == status.HTTP_201_CREATED
+    assert response.data['loops'] == 1
+    assert response.data['metadata'] == {}
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'value',
+    [0, -1, 101],
+    ids=['zero', 'negative', 'over-cap'],
+)
+def test_v2_patch_loops_out_of_range_rejected(
+    api_client: APIClient, v2_asset_detail_url: str, value: int
+) -> None:
+    """Both bounds of the documented LOOPS_MIN..LOOPS_MAX range must
+    400 on write; the form paths clamp instead."""
+    response = api_client.patch(
+        v2_asset_detail_url,
+        data={'loops': value},
+        format='json',
+    )
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert 'loops' in response.data
+
+
+@pytest.mark.django_db
 @pytest.mark.parametrize(
     'value',
     [-1, DURATION_S_MAX + 1],

@@ -47,6 +47,7 @@
   </td>
   {% endwith %}
   <td data-label="Duration">{{ asset.duration|humanize_duration }}</td>
+  <td data-label="Loops">{{ asset|asset_loops }}×</td>
   <td data-label="Enabled">
     {% if asset.is_processing %}
     <span class="processing-pill"><i class="ti ti-refresh"></i>Processing</span>

@@ -107,6 +107,16 @@ def _to_dict(obj: Any) -> Any:
                 meta['refresh_interval_s']
             )
             out['metadata'] = meta
+        # Same clamp for ``loops`` so a hand-edited value can't put the
+        # edit modal's <input type="number" min/max> in :invalid state
+        # and block the whole form.
+        meta = out.get('metadata')
+        if isinstance(meta, dict) and 'loops' in meta:
+            from anthias_server.app.models import clamp_loops
+
+            meta = dict(meta)
+            meta['loops'] = clamp_loops(meta['loops'])
+            out['metadata'] = meta
         # Sanitise metadata['headers'] the same way, so a legacy /
         # hand-edited row can't seed the edit modal's textarea with an
         # unsafe (CR/LF) value or a non-string blob (#2215).
@@ -195,6 +205,18 @@ def playback_status(asset: Any) -> dict[str, str]:
             'secondary': 'Plays inside its weekday / time window',
         }
     return {'kind': 'live', 'primary': 'Active', 'secondary': ''}
+
+
+@register.filter
+def asset_loops(asset: Any) -> int:
+    """Clamped ``metadata['loops']`` for the table's Loops column —
+    defaults to 1 (play once) when unset or junk."""
+    from anthias_server.app.models import clamp_loops
+
+    metadata = getattr(asset, 'metadata', None) or {}
+    if not isinstance(metadata, dict):
+        return 1
+    return clamp_loops(metadata.get('loops', 1))
 
 
 @register.filter

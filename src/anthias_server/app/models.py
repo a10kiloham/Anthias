@@ -49,6 +49,33 @@ def default_end_date(mimetype: str | None, now: datetime) -> datetime:
 DURATION_S_MAX = 365 * 24 * 60 * 60
 
 
+# Bounds for ``Asset.metadata['loops']`` — how many consecutive times
+# the viewer shows the asset before rotating (a video replays, an
+# image/webpage holds the screen for duration × loops). Missing key or
+# junk means 1 (today's behaviour). The cap is a typo guard and keeps
+# ``duration × loops`` far inside the viewer's Event.wait ceiling
+# (DURATION_S_MAX × LOOPS_MAX ≈ 100 years < the ~292-year PyTime_t
+# range that crash-looped the viewer in Sentry ANTHIAS-3E).
+LOOPS_MIN = 1
+LOOPS_MAX = 100
+
+
+def clamp_loops(value: Any) -> int:
+    """Coerce an arbitrary ``metadata['loops']`` value to a safe int in
+    ``[LOOPS_MIN, LOOPS_MAX]``.
+
+    Same contract as ``clamp_refresh_interval``: the API write path
+    rejects out-of-range values, the form paths clamp, and every read
+    site funnels through this so a hand-edited row can't crash the
+    viewer or wedge rotation. Garbage coerces to 1 (play once).
+    """
+    try:
+        loops = int(value)
+    except (TypeError, ValueError):
+        return LOOPS_MIN
+    return max(LOOPS_MIN, min(loops, LOOPS_MAX))
+
+
 # Per-asset custom HTTP request headers for webpage assets (feature
 # #2215). Stored in ``Asset.metadata['headers']`` as a ``{name: value}``
 # object and injected by the C++ webview's request interceptor on
