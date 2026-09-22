@@ -24,11 +24,14 @@ from anthias_server.api.serializers import UpdateAssetSerializer
 from anthias_server.api.serializers.mixins import CreateAssetSerializerMixin
 from anthias_server.app.models import (
     DURATION_S_MAX,
+    LOOPS_MAX,
+    LOOPS_MIN,
     MAX_ASSET_HEADERS,
     REFRESH_INTERVAL_S_MAX,
     Asset,
     Playlist,
     PlaylistItem,
+    clamp_loops,
     clamp_refresh_interval,
     normalize_asset_headers,
     validate_asset_headers,
@@ -190,6 +193,7 @@ class AssetSerializerV2(ModelSerializer[Asset], CreateAssetSerializerMixin):
     is_active = SerializerMethodField()
     play_days = SerializerMethodField()
     refresh_interval_s = SerializerMethodField()
+    loops = SerializerMethodField()
     custom_headers = SerializerMethodField()
     metadata = SerializerMethodField()
 
@@ -220,6 +224,13 @@ class AssetSerializerV2(ModelSerializer[Asset], CreateAssetSerializerMixin):
             (obj.metadata or {}).get('refresh_interval_s', 0)
         )
 
+    @extend_schema_field(OpenApiTypes.INT)
+    def get_loops(self, obj: Asset) -> int:
+        # Consecutive plays before rotating. Same metadata-backed
+        # posture as refresh_interval_s; default 1 = play once,
+        # mirroring the viewer's handling for assets without the key.
+        return clamp_loops((obj.metadata or {}).get('loops', 1))
+
     @extend_schema_field(
         {'type': 'object', 'additionalProperties': {'type': 'string'}}
     )
@@ -244,6 +255,8 @@ class AssetSerializerV2(ModelSerializer[Asset], CreateAssetSerializerMixin):
             raw['refresh_interval_s'] = clamp_refresh_interval(
                 raw['refresh_interval_s']
             )
+        if 'loops' in raw:
+            raw['loops'] = clamp_loops(raw['loops'])
         # Same posture for the custom headers bag: keep the embedded
         # ``metadata.headers`` consistent with the top-level
         # ``custom_headers`` field a client also reads off this response.
@@ -275,6 +288,7 @@ class AssetSerializerV2(ModelSerializer[Asset], CreateAssetSerializerMixin):
             'last_reachability_check',
             'metadata',
             'refresh_interval_s',
+            'loops',
             'custom_headers',
         ]
         read_only_fields: ClassVar = [
@@ -339,6 +353,15 @@ class CreateAssetSerializerV2(
         min_value=0,
         max_value=REFRESH_INTERVAL_S_MAX,
     )
+    # write_only for the same reason as ``refresh_interval_s`` above —
+    # ``loops`` lives inside ``metadata`` and is surfaced back via
+    # ``AssetSerializerV2.get_loops``.
+    loops = IntegerField(
+        required=False,
+        write_only=True,
+        min_value=LOOPS_MIN,
+        max_value=LOOPS_MAX,
+    )
     # write_only for the same reason as ``refresh_interval_s`` above:
     # ``Asset`` has no ``custom_headers`` column — the value lives inside
     # ``metadata['headers']`` and is surfaced back via
@@ -375,6 +398,16 @@ class CreateAssetSerializerV2(
             metadata = dict(prepared.get('metadata') or {})
             metadata['refresh_interval_s'] = int(data['refresh_interval_s'])
             prepared['metadata'] = metadata
+        # POST round-trip for loops, mirroring refresh_interval_s. The
+        # default (1) is stored as an absent key so ``metadata`` stays
+        # a clean ``{}`` for assets that play once.
+        if 'loops' in data:
+            metadata = dict(prepared.get('metadata') or {})
+            if int(data['loops']) == 1:
+                metadata.pop('loops', None)
+            else:
+                metadata['loops'] = int(data['loops'])
+            prepared['metadata'] = metadata
         # POST round-trip for the per-asset custom headers, mirroring the
         # refresh-interval handling above: fold into ``metadata`` so a
         # freshly-created webpage asset carries its headers without a
@@ -410,6 +443,11 @@ class UpdateAssetSerializerV2(UpdateAssetSerializer):
         min_value=0,
         max_value=REFRESH_INTERVAL_S_MAX,
     )
+    loops = IntegerField(
+        required=False,
+        min_value=LOOPS_MIN,
+        max_value=LOOPS_MAX,
+    )
     # No ``child=CharField`` — see CreateAssetSerializerV2.custom_headers:
     # the unvalidated child preserves value types so a non-string value is
     # rejected (not coerced) and header values aren't trimmed.
@@ -443,6 +481,17 @@ class UpdateAssetSerializerV2(UpdateAssetSerializer):
             metadata['refresh_interval_s'] = int(
                 validated_data['refresh_interval_s']
             )
+            instance.metadata = metadata
+        if 'loops' in validated_data:
+            # Merge into metadata like refresh_interval_s; the default
+            # (1) is stored as an absent key so a reset-to-1 PATCH
+            # leaves the row identical to a never-edited one.
+            metadata = dict(instance.metadata or {})
+            loops = int(validated_data['loops'])
+            if loops == 1:
+                metadata.pop('loops', None)
+            else:
+                metadata['loops'] = loops
             instance.metadata = metadata
         if 'custom_headers' in validated_data:
             # Merge into metadata for the same reason as

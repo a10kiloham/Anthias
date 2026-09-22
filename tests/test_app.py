@@ -806,6 +806,65 @@ def test_edit_changes_duration(reset_assets: None, page: Page) -> None:
 
 @pytest.mark.integration
 @pytest.mark.django_db(transaction=True)
+def test_edit_changes_loops(reset_assets: None, page: Page) -> None:
+    """The Loops field in the edit modal persists to metadata and the
+    table's Loops column reflects it after the swap."""
+    Asset.objects.create(**asset_active)
+    page.goto(BASE_URL)
+    _open_edit_modal(page, asset_active['asset_id'])
+
+    page.locator('#edit-loops').fill('3')
+    status = _submit_edit_form(page, asset_active['asset_id'])
+    assert status < 500
+
+    _wait_db(
+        lambda: (
+            Asset.objects.get(asset_id=asset_active['asset_id']).metadata.get(
+                'loops'
+            )
+            == 3
+        ),
+        description='loops update persisted',
+    )
+    row = page.locator(f'tr[data-asset-id="{asset_active["asset_id"]}"]')
+    expect(row.locator('td[data-label="Loops"]')).to_contain_text('3×')
+
+
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
+def test_bulk_edit_loops_via_modal(reset_assets: None, page: Page) -> None:
+    """Drive the real bulk-edit modal end to end: select a row, open
+    Edit from the bulk bar, tick Loops, apply, and verify persistence
+    — the whole surface the apply_dates group used to occupy."""
+    Asset.objects.create(**asset_active)
+    page.goto(BASE_URL)
+    row = page.locator(f'tr[data-asset-id="{asset_active["asset_id"]}"]')
+    expect(row).to_be_visible()
+    _disable_asset_poll(page)
+
+    row.locator('input.js-row-select').click()
+    expect(page.locator('.bulk-bar')).to_be_visible()
+    page.locator('.bulk-bar button:has-text("Edit")').click()
+
+    apply_toggle = page.locator('input[name="apply_loops"]')
+    expect(apply_toggle).to_be_visible()
+    apply_toggle.check()
+    page.locator('#bulk-loops').fill('4')
+    page.locator('form[action*="bulk/update"] button[type="submit"]').click()
+
+    _wait_db(
+        lambda: (
+            Asset.objects.get(asset_id=asset_active['asset_id']).metadata.get(
+                'loops'
+            )
+            == 4
+        ),
+        description='bulk loops persisted',
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
 def test_edit_renames_asset(reset_assets: None, page: Page) -> None:
     Asset.objects.create(**asset_active)
     page.goto(BASE_URL)

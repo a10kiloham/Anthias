@@ -39,6 +39,7 @@
   </td>
   {% endwith %}
   <td data-label="Duration">—</td>
+  <td data-label="Loops">—</td>
   <td data-label="Enabled">
     <form method="post" action="{% url 'anthias_app:playlists_toggle' row.playlist.playlist_id %}" class="m-0">
       {% csrf_token %}

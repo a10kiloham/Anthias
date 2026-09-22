@@ -1370,6 +1370,62 @@ def test_assets_update_writes_refresh_interval_to_metadata(
 
 
 @pytest.mark.django_db
+def test_assets_update_writes_loops_to_metadata(
+    client: Client, asset: Asset
+) -> None:
+    """The Loops field on the edit modal merges into ``Asset.metadata``
+    (pipeline-owned keys survive) and clamps out-of-range values."""
+    asset.metadata = {'original_ext': '.heic'}
+    asset.save(update_fields=['metadata'])
+
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        client.post(
+            reverse('anthias_app:assets_update', args=[asset.asset_id]),
+            data={'name': asset.name, 'duration': '20', 'loops': '3'},
+        )
+    asset.refresh_from_db()
+    assert asset.metadata == {'original_ext': '.heic', 'loops': 3}
+
+    # Out-of-range clamps (form path never 400s), key stays present.
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        client.post(
+            reverse('anthias_app:assets_update', args=[asset.asset_id]),
+            data={'name': asset.name, 'duration': '20', 'loops': '9999'},
+        )
+    asset.refresh_from_db()
+    from anthias_server.app.models import LOOPS_MAX
+
+    assert asset.metadata['loops'] == LOOPS_MAX
+
+
+@pytest.mark.django_db
+def test_assets_update_loops_reset_to_one_removes_key(
+    client: Client, asset: Asset
+) -> None:
+    """Loops=1 is the default — resetting stores no key, so unedited
+    and reset rows are indistinguishable."""
+    asset.metadata = {'loops': 4, 'original_ext': '.png'}
+    asset.save(update_fields=['metadata'])
+
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        client.post(
+            reverse('anthias_app:assets_update', args=[asset.asset_id]),
+            data={'name': asset.name, 'duration': '20', 'loops': '1'},
+        )
+    asset.refresh_from_db()
+    assert asset.metadata == {'original_ext': '.png'}
+
+
+@pytest.mark.django_db
 def test_assets_update_clears_refresh_interval_on_empty_input(
     client: Client, asset: Asset
 ) -> None:
@@ -1968,6 +2024,87 @@ def test_assets_bulk_update_blank_duration_does_not_clobber(
     for a in bulk_assets:
         a.refresh_from_db()
         assert a.duration == 10
+
+
+@pytest.mark.django_db
+def test_assets_bulk_update_loops(
+    client: Client, bulk_assets: list[Asset]
+) -> None:
+    """Bulk Loops applies to every selected asset (videos included —
+    a video replays), merging into each row's own metadata so
+    pipeline-owned keys survive."""
+    webpage_one, _webpage_two, _video = bulk_assets
+    webpage_one.metadata = {'original_ext': '.heic'}
+    webpage_one.save(update_fields=['metadata'])
+
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        response = client.post(
+            reverse('anthias_app:assets_bulk_update'),
+            data={
+                'ids': _bulk_ids_csv(bulk_assets),
+                'apply_loops': 'true',
+                'loops': '3',
+            },
+            headers={'HX-Request': 'true'},
+        )
+    import json as _json
+
+    trigger = _json.loads(response['HX-Trigger'])
+    assert trigger['toast']['message'] == '3 assets updated'
+    for a in bulk_assets:
+        a.refresh_from_db()
+        assert a.metadata['loops'] == 3
+    webpage_one.refresh_from_db()
+    assert webpage_one.metadata['original_ext'] == '.heic'
+
+    # Reset to 1 removes the key on every row.
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        client.post(
+            reverse('anthias_app:assets_bulk_update'),
+            data={
+                'ids': _bulk_ids_csv(bulk_assets),
+                'apply_loops': 'true',
+                'loops': '1',
+            },
+        )
+    for a in bulk_assets:
+        a.refresh_from_db()
+        assert 'loops' not in (a.metadata or {})
+
+
+@pytest.mark.django_db
+def test_assets_bulk_update_loops_rejects_blank_and_junk(
+    client: Client, bulk_assets: list[Asset]
+) -> None:
+    """A blank or non-numeric Loops value toasts an error and changes
+    nothing (mirrors the duration contract)."""
+    import json as _json
+
+    for bad in ('', 'lots', '0'):
+        with mock.patch(
+            'anthias_server.settings.ViewerPublisher.send_to_viewer',
+            return_value=None,
+        ):
+            response = client.post(
+                reverse('anthias_app:assets_bulk_update'),
+                data={
+                    'ids': _bulk_ids_csv(bulk_assets),
+                    'apply_loops': 'true',
+                    'loops': bad,
+                },
+                headers={'HX-Request': 'true'},
+            )
+        trigger = _json.loads(response['HX-Trigger'])
+        assert trigger['toast']['kind'] == 'error', bad
+    for a in bulk_assets:
+        a.refresh_from_db()
+        assert 'loops' not in (a.metadata or {})
 
 
 @pytest.mark.django_db

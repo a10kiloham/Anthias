@@ -461,11 +461,20 @@
             {% comment %} Video assets must stay at duration=0 (v2 API rule) — disable
                the input for videos so the form POST omits it; the server defends too.
             {% endcomment %}
-            <div class="app-floating">
-              <input type="number" class="app-input" id="edit-duration" name="duration"
-                :value="editAsset.mimetype === 'video' ? 0 : editAsset.duration"
-                :disabled="editAsset.mimetype === 'video'" required>
-              <label for="edit-duration">Duration (seconds)</label>
+            <div class="app-form-grid">
+              <div class="app-floating">
+                <input type="number" class="app-input" id="edit-duration" name="duration"
+                  :value="editAsset.mimetype === 'video' ? 0 : editAsset.duration"
+                  :disabled="editAsset.mimetype === 'video'" required>
+                <label for="edit-duration">Duration (seconds)</label>
+              </div>
+              <div class="app-floating">
+                <input type="number" class="app-input" id="edit-loops" name="loops"
+                  min="1" max="{{ loops_max }}" step="1"
+                  :value="(editAsset.metadata && editAsset.metadata.loops) || 1"
+                  required>
+                <label for="edit-loops">Loops (plays per turn)</label>
+              </div>
             </div>
           </section>
 

@@ -64,6 +64,7 @@ from anthias_common.utils import (
 )
 from anthias_server.app.models import (
     clamp_duration,
+    clamp_loops,
     clamp_refresh_interval,
     normalize_asset_headers,
 )
@@ -1671,7 +1672,9 @@ def view_image(uri: str, skip_ssl_verify: bool = False) -> None:
         logger.info(_webview_output.text())
 
 
-def view_video(uri: str, duration: int | str) -> None:
+def view_video(uri: str, duration: int | str) -> bool:
+    """Play the video once. Returns True when a skip cut it short, so
+    a multi-loop caller knows to stop replaying."""
     logger.debug('Displaying video %s for %s ', uri, duration)
     media_player = MediaPlayerProxy.get_instance()
 
@@ -1680,11 +1683,13 @@ def view_video(uri: str, duration: int | str) -> None:
 
     view_image('null')
 
+    skipped = False
     try:
         skip_event = get_skip_event()
         skip_event.clear()
         if skip_event.wait(timeout=int(duration)):
             logger.info('Skip detected during video playback, stopping video')
+            skipped = True
             media_player.stop()
         else:
             pass
@@ -1695,6 +1700,7 @@ def view_video(uri: str, duration: int | str) -> None:
         )
 
     media_player.stop()
+    return skipped
 
 
 def load_settings() -> None:
@@ -2414,6 +2420,10 @@ def asset_loop(scheduler: Any) -> None:
         # rejects such values on write, but a pre-existing row must
         # not take the screen down.
         duration = clamp_duration(asset['duration'])
+        # Consecutive plays before rotating (feature: Loops column).
+        # Clamped on read like duration/refresh_interval so a
+        # hand-edited row can't wedge rotation on one asset.
+        loops = clamp_loops((asset.get('metadata') or {}).get('loops', 1))
         logger.info('Showing asset %s (%s)', name, mime)
         logger.debug('Asset URI %s', uri)
         watchdog()
@@ -2462,20 +2472,27 @@ def asset_loop(scheduler: Any) -> None:
             # or ('streaming' in mime)`` — the truthy literal short-
             # circuits and the branch runs for every mimetype, making
             # the ``else: Unknown MimeType`` arm below unreachable.
-            view_video(uri, duration)
+            for _ in range(loops):
+                if view_video(uri, duration):
+                    # Skip cuts the whole slot short, not just the
+                    # current replay.
+                    break
         else:
             logger.error('Unknown MimeType %s', mime)
 
         if 'image' in mime or 'web' in mime:
-            logger.info('Sleeping for %s', duration)
+            logger.info('Sleeping for %s (x%s)', duration, loops)
             skip_event = get_skip_event()
             skip_event.clear()
-            if skip_event.wait(timeout=duration):
-                # Skip was triggered, continue immediately to next iteration
-                logger.info('Skip detected, moving to next asset immediately')
-            else:
-                # Duration elapsed normally, continue to next asset
-                pass
+            # One wait per loop rather than one duration×loops wait:
+            # each timeout stays inside the clamp Event.wait was sized
+            # for, and a skip ends the slot at the next check.
+            for _ in range(loops):
+                if skip_event.wait(timeout=duration):
+                    logger.info(
+                        'Skip detected, moving to next asset immediately'
+                    )
+                    break
 
     else:
         # Same journal-budget problem as the empty-playlist arm above, but

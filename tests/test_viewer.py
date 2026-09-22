@@ -1569,6 +1569,99 @@ def test_asset_loop_clamps_out_of_range_duration() -> None:
     skip_event.wait.assert_called_once_with(timeout=DURATION_S_MAX)
 
 
+def _looping_asset(mimetype: str, loops: object) -> dict[str, object]:
+    return {
+        'asset_id': 'looper',
+        'name': 'looper',
+        'uri': 'https://example.com/looper',
+        'mimetype': mimetype,
+        'duration': 7,
+        'skip_asset_check': True,
+        'is_reachable': True,
+        'nocache': False,
+        'metadata': {'loops': loops},
+    }
+
+
+def test_asset_loop_holds_image_for_each_loop() -> None:
+    """``metadata['loops']`` = N holds an image/webpage on screen for N
+    duration-waits before rotating (one wait per loop so each timeout
+    stays inside the Event.wait clamp)."""
+    scheduler = mock.Mock()
+    scheduler.get_next_asset.return_value = _looping_asset('image', 3)
+    skip_event = mock.Mock()
+    skip_event.wait.return_value = False
+    with (
+        mock.patch('anthias_viewer.view_image'),
+        mock.patch('anthias_viewer.watchdog'),
+        mock.patch('anthias_viewer.get_skip_event', return_value=skip_event),
+    ):
+        viewer.asset_loop(scheduler)
+    assert skip_event.wait.call_count == 3
+    skip_event.wait.assert_called_with(timeout=7)
+
+
+def test_asset_loop_skip_ends_all_remaining_loops() -> None:
+    """A skip command cuts the whole slot short, not just the current
+    replay."""
+    scheduler = mock.Mock()
+    scheduler.get_next_asset.return_value = _looping_asset('image', 5)
+    skip_event = mock.Mock()
+    skip_event.wait.return_value = True  # skip fires on the first wait
+    with (
+        mock.patch('anthias_viewer.view_image'),
+        mock.patch('anthias_viewer.watchdog'),
+        mock.patch('anthias_viewer.get_skip_event', return_value=skip_event),
+    ):
+        viewer.asset_loop(scheduler)
+    assert skip_event.wait.call_count == 1
+
+
+def test_asset_loop_replays_video_per_loops() -> None:
+    scheduler = mock.Mock()
+    scheduler.get_next_asset.return_value = _looping_asset('video', 3)
+    with (
+        mock.patch(
+            'anthias_viewer.view_video', return_value=False
+        ) as view_video,
+        mock.patch('anthias_viewer.watchdog'),
+    ):
+        viewer.asset_loop(scheduler)
+    assert view_video.call_count == 3
+
+
+def test_asset_loop_video_skip_stops_replaying() -> None:
+    """view_video reporting a skip (True) must stop further replays."""
+    scheduler = mock.Mock()
+    scheduler.get_next_asset.return_value = _looping_asset('video', 4)
+    with (
+        mock.patch(
+            'anthias_viewer.view_video', side_effect=[False, True]
+        ) as view_video,
+        mock.patch('anthias_viewer.watchdog'),
+    ):
+        viewer.asset_loop(scheduler)
+    assert view_video.call_count == 2
+
+
+def test_asset_loop_clamps_junk_loops_to_one() -> None:
+    """A hand-edited row with garbage in ``metadata['loops']`` plays
+    once rather than wedging rotation."""
+    scheduler = mock.Mock()
+    scheduler.get_next_asset.return_value = _looping_asset(
+        'image', 'not-a-number'
+    )
+    skip_event = mock.Mock()
+    skip_event.wait.return_value = False
+    with (
+        mock.patch('anthias_viewer.view_image'),
+        mock.patch('anthias_viewer.watchdog'),
+        mock.patch('anthias_viewer.get_skip_event', return_value=skip_event),
+    ):
+        viewer.asset_loop(scheduler)
+    assert skip_event.wait.call_count == 1
+
+
 # ---------------------------------------------------------------------------
 # _handle_reload / _skip_if_current_asset_inactive — issue #2430
 # ---------------------------------------------------------------------------

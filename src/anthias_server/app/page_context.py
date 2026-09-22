@@ -789,7 +789,7 @@ def assets() -> dict[str, Any]:
     active_rows.sort(key=lambda row: row['sort'])
     inactive_rows.sort(key=lambda row: row['sort'])
 
-    from anthias_server.app.models import REFRESH_INTERVAL_S_MAX
+    from anthias_server.app.models import LOOPS_MAX, REFRESH_INTERVAL_S_MAX
 
     now_playing, now_playing_playlist_ids = _now_playing()
 
@@ -809,6 +809,9 @@ def assets() -> dict[str, Any]:
         # same constant the v2 serializer / form handler use, so the
         # client-side and server-side caps can't drift.
         'refresh_interval_s_max': REFRESH_INTERVAL_S_MAX,
+        # Same single-source-of-truth posture for the Loops inputs in
+        # the edit + bulk-edit modals.
+        'loops_max': LOOPS_MAX,
     }
 
 

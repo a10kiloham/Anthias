@@ -38,6 +38,7 @@ from anthias_common.utils import (
 from anthias_server.app import page_context
 from anthias_server.app.models import (
     clamp_duration,
+    clamp_loops,
     clamp_refresh_interval,
     default_end_date,
     parse_header_lines,
@@ -836,6 +837,21 @@ def assets_update(request: HttpRequest, asset_id: str) -> HttpResponse:
         )
         asset.metadata = metadata
 
+    # Loops — consecutive plays before rotating. Same metadata-backed,
+    # clamp-not-400 posture as refresh_interval_s; a missing field
+    # means "form predates the feature, leave the bag alone". The
+    # default (1) is stored as an absent key so unedited rows stay
+    # byte-identical.
+    raw_loops = request.POST.get('loops')
+    if raw_loops is not None:
+        metadata = dict(asset.metadata or {})
+        loops = clamp_loops(raw_loops.strip() or 1)
+        if loops == 1:
+            metadata.pop('loops', None)
+        else:
+            metadata['loops'] = loops
+        asset.metadata = metadata
+
     # Per-asset custom request headers — feature #2215. Same
     # ``metadata``-backed, webpage-only posture as refresh_interval_s: a
     # missing field means "non-webpage edit, leave the bag alone"; an
@@ -1064,8 +1080,8 @@ def assets_bulk_action(request: HttpRequest) -> HttpResponse:
 def assets_bulk_update(request: HttpRequest) -> HttpResponse:
     """Apply common schedule fields to a set of assets at once.
 
-    Mirrors the per-asset ``assets_update`` parsing for dates,
-    duration, time-of-day, weekday filters, and the No cache /
+    Mirrors the per-asset ``assets_update`` parsing for duration,
+    loops, time-of-day, weekday filters, and the No cache /
     Skip asset check flags (#3137), but each group is opt-in via an
     ``apply_*`` flag so an operator only overwrites the fields they
     ticked — an unticked group is left untouched on every selected
@@ -1099,6 +1115,7 @@ def assets_bulk_update(request: HttpRequest) -> HttpResponse:
         )
 
     apply_duration = request.POST.get('apply_duration') == 'true'
+    apply_loops = request.POST.get('apply_loops') == 'true'
     apply_time = request.POST.get('apply_time') == 'true'
     apply_days = request.POST.get('apply_days') == 'true'
     apply_nocache = request.POST.get('apply_nocache') == 'true'
@@ -1106,6 +1123,7 @@ def assets_bulk_update(request: HttpRequest) -> HttpResponse:
 
     if not (
         apply_duration
+        or apply_loops
         or apply_time
         or apply_days
         or apply_nocache
@@ -1144,6 +1162,33 @@ def assets_bulk_update(request: HttpRequest) -> HttpResponse:
                     'Duration must be zero or more — nothing changed',
                 ),
             )
+
+    new_loops: int | None = None
+    if apply_loops:
+        # Same blank-field posture as duration: bulk has no per-row
+        # "existing" value to preserve, so require one.
+        raw_loops = (request.POST.get('loops') or '').strip()
+        if not raw_loops:
+            return _asset_table_response(
+                request,
+                toast=('error', 'Enter a loop count — nothing changed'),
+            )
+        try:
+            parsed_loops = int(raw_loops)
+        except (TypeError, ValueError):
+            return _asset_table_response(
+                request,
+                toast=('error', 'Loops must be a number — nothing changed'),
+            )
+        if parsed_loops < 1:
+            return _asset_table_response(
+                request,
+                toast=(
+                    'error',
+                    'Loops must be at least 1 — nothing changed',
+                ),
+            )
+        new_loops = clamp_loops(parsed_loops)
 
     new_time_from: time | None = None
     new_time_to: time | None = None
@@ -1218,7 +1263,7 @@ def assets_bulk_update(request: HttpRequest) -> HttpResponse:
             request.POST.get('skip_asset_check') == 'true'
         )
 
-    if not shared and not apply_duration:
+    if not shared and not apply_duration and not apply_loops:
         return _asset_table_response(
             request,
             toast=('info', 'Nothing to change — pick a field to edit'),
@@ -1237,8 +1282,24 @@ def assets_bulk_update(request: HttpRequest) -> HttpResponse:
         nonvideo_count = nonvideo_qs.count()
         if nonvideo_count:
             nonvideo_qs.update(duration=new_duration)
+    if apply_loops and new_loops is not None:
+        # ``loops`` lives inside the per-row metadata bag alongside
+        # pipeline-owned keys, so a shared queryset UPDATE would
+        # clobber them — merge per row and write back in one
+        # bulk_update. The default (1) is stored as an absent key so
+        # bulk-resetting to 1 leaves rows byte-identical to unedited
+        # ones.
+        rows = list(base_qs)
+        for row in rows:
+            row_metadata = dict(row.metadata or {})
+            if new_loops == 1:
+                row_metadata.pop('loops', None)
+            else:
+                row_metadata['loops'] = new_loops
+            row.metadata = row_metadata
+        Asset.objects.bulk_update(rows, ['metadata'])
 
-    count = matched if shared else nonvideo_count
+    count = matched if shared or apply_loops else nonvideo_count
     if not count:
         # Duration-only edit on an all-video selection — nothing the
         # duration rule allows us to change.
