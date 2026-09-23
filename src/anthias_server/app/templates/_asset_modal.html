@@ -458,14 +458,19 @@
 
           <section class="modal-section">
             <h3 class="modal-section__title">Playback</h3>
-            {% comment %} Video assets must stay at duration=0 (v2 API rule) — disable
-               the input for videos so the form POST omits it; the server defends too.
+            {% comment %} Video duration is owned by the ffprobe pipeline — the input
+               is disabled for videos so the probed value can't be clobbered (a
+               disabled input is omitted from the POST; the server defends too).
+               It still SHOWS the probed length: rendering 0 here made every
+               video look length-less in the edit modal.
             {% endcomment %}
             <div class="app-form-grid">
               <div class="app-floating">
                 <input type="number" class="app-input" id="edit-duration" name="duration"
-                  :value="editAsset.mimetype === 'video' ? 0 : editAsset.duration"
-                  :disabled="editAsset.mimetype === 'video'" required>
+                  :value="editAsset.duration"
+                  :disabled="editAsset.mimetype === 'video'"
+                  :title="editAsset.mimetype === 'video' ? 'Measured from the video file — not editable' : null"
+                  required>
                 <label for="edit-duration">Duration (seconds)</label>
               </div>
               <div class="app-floating">

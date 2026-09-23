@@ -977,13 +977,15 @@ def test_edit_duration_disabled_for_video(
     reset_assets: None, page: Page
 ) -> None:
     """Video duration is owned by the ffprobe pipeline; the edit form
-    must render it disabled so the probed value can't be clobbered."""
+    must render it disabled so the probed value can't be clobbered —
+    but it must SHOW the probed length, not a hardcoded 0."""
     Asset.objects.create(
         **{**asset_active, 'mimetype': 'video', 'duration': 42}
     )
     page.goto(BASE_URL)
     _open_edit_modal(page, asset_active['asset_id'])
     expect(page.locator('#edit-duration')).to_be_disabled()
+    expect(page.locator('#edit-duration')).to_have_value('42')
 
     status = _submit_edit_form(page, asset_active['asset_id'])
     assert status < 500
