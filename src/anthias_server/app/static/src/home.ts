@@ -13,6 +13,13 @@ import {
   type AppsTabData,
   type EditAsset as AppEditAsset,
 } from './apps'
+import {
+  type Chunk,
+  chunkSizeFromMeta,
+  needsChunking,
+  planChunks,
+} from './home/chunking'
+import { uploadErrorMessage, type UploadFailure } from './home/upload-error'
 
 declare global {
   interface Window {
@@ -48,13 +55,36 @@ interface AssetEdit {
 type UploadState = null | 'sending' | 'processing'
 
 interface ToastStoreLike {
-  push(kind: 'success' | 'error' | 'info', message: string): number
+  push(
+    kind: 'success' | 'error' | 'info',
+    message: string,
+    ttlMs?: number,
+  ): number
 }
+
+// Longer than the 4s default in vendor.ts: these are the longest
+// strings the store carries and a dismissed toast cannot be brought
+// back.
+const UPLOAD_ERROR_TOAST_MS = 8000
+
+// Said when a file is dropped on a page that is busy showing something
+// else — an edit form, a preview, a delete prompt. Deliberately names
+// the way forward rather than the refusal: the file is still on the
+// operator's desktop and the gesture works a second later.
+const DROP_BLOCKED_MESSAGE =
+  'Close this dialog first, then drop your file to upload it.'
 
 type SectionKey = 'active' | 'inactive'
 
 interface HomeAppData {
   mode: 'add' | 'edit' | null
+  // Which pane of the Add modal is showing, and the "From URL" tab's
+  // input. Both live here rather than in a nested x-data on the modal
+  // so openAdd() can reset them — and so a file dropped on the page can
+  // open the modal straight onto the upload pane. Neither is reachable
+  // from a child scope.
+  tab: 'uri' | 'file' | 'apps'
+  addUri: string
   editAsset: AssetEdit | null
   previewAsset: AssetEdit | null
   pendingDeleteId: string | null
@@ -64,7 +94,16 @@ interface HomeAppData {
   uploadFileName: string
   uploadIndex: number
   uploadTotal: number
-  dragActive: boolean
+  // True while a file drag is anywhere over the window. Drives the
+  // page-wide drop overlay AND the modal dropzone's highlight: a drop
+  // lands in the same place wherever it is released, so one flag is
+  // the honest thing to bind both to.
+  pageDragActive: boolean
+  // How many nested elements the drag is currently inside. dragenter
+  // and dragleave fire once per element the pointer crosses, so
+  // without a counter the overlay would blink off every time the drag
+  // moved from one table row to the next.
+  pageDragDepth: number
   // Bulk selection / actions (#3046)
   selectedIds: string[]
   visibleIds: Record<SectionKey, string[]>
@@ -77,10 +116,19 @@ interface HomeAppData {
   openDelete(id: string, name: string): void
   closeModal(): void
   closePreview(): void
+  closeDelete(): void
+  closeBulkDelete(): void
+  resetPageDrag(): void
   bindFlatpickr(): void
   uploadFiles(input: HTMLInputElement): Promise<void>
   dropFiles(event: DragEvent): void
+  acceptsPageDrop(): boolean
+  onPageDragEnter(event: DragEvent): void
+  onPageDragOver(event: DragEvent): void
+  onPageDragLeave(event: DragEvent): void
+  onPageDrop(event: DragEvent): void
   uploadOne(url: string, csrf: string, file: File): Promise<UploadResult>
+  sendUpload(opts: UploadRequest): Promise<RawUploadResponse>
   // Bulk selection helpers
   isSelected(id: string): boolean
   toggleSelect(id: string): void
@@ -98,8 +146,165 @@ interface HomeAppData {
 // 'rejected' — server reached, but it refused this file (HTTP 200 +
 //              error toast, e.g. invalid type). The toast already
 //              informed the user; the batch skips it and carries on.
-// 'error'    — transport failure / non-2xx. Aborts the batch.
-type UploadResult = 'ok' | 'rejected' | 'error'
+// 'error'    — transport failure / non-2xx. Aborts the batch, and
+//              carries the failure so the toast can say why — see
+//              home/upload-error.
+type UploadResult =
+  | { status: 'ok' }
+  | { status: 'rejected' }
+  | { status: 'error'; failure: UploadFailure }
+
+// One POST of an upload: the whole file, or one chunk of it.
+// `sentBytes` is what preceded it, so progress reads against the
+// whole file.
+interface UploadRequest {
+  url: string
+  csrf: string
+  body: Blob
+  filename: string
+  range?: string
+  uploadId?: string
+  sentBytes: number
+  totalBytes: number
+}
+
+// One request's outcome, before it means anything. `status` is 0 when
+// no response arrived at all. `bodySent` says the browser finished
+// handing over the request body, which is what separates "the server
+// never saw this chunk" from "the server may have acted on it".
+interface RawUploadResponse {
+  status: number
+  text: string
+  trigger: string | null
+  bodySent: boolean
+  // An expired session answers a 2xx carrying HX-Redirect rather than
+  // a 302 an XHR would follow invisibly. Carried here because this
+  // handler no longer classifies the response itself: without it the
+  // chunk loop cannot see the header at all, and every file over the
+  // chunk size would be dropped from the batch with the operator never
+  // sent to sign in.
+  redirect: string | null
+}
+
+// Chunking turns one request into dozens, so one dropped connection
+// should not lose an upload the operator has been waiting on.
+const CHUNK_RETRIES = 2
+const CHUNK_RETRY_DELAY_MS = 500
+
+// An expired session is not a failure of this upload, it is the end of
+// the batch: every remaining file answers the same way. Navigating is
+// what resolves it; the failure kind exists so a slow navigation still
+// explains itself.
+function followRedirect(res: RawUploadResponse): UploadResult | null {
+  if (!res.redirect) return null
+  window.location.href = res.redirect
+  return { status: 'error', failure: { kind: 'auth' } }
+}
+
+// Resend only what might not fail again — a 4xx is the server's
+// considered answer. Staging a chunk is idempotent, so anything that
+// goes wrong there is safe to resend.
+//
+// The final chunk commits: the server renames the partial into place
+// and only then answers, so once its body has gone out, neither a
+// dropped socket nor a 5xx tells us whether the asset exists. Behind a
+// proxy the lost-commit case usually arrives as a gateway 502 or 504
+// rather than a socket error, so exempting only `status === 0` would
+// leave the common shape of it being resent — into the 409 that says
+// the upload cannot be resumed, for an upload that worked.
+async function sendWithRetry(
+  send: (opts: UploadRequest) => Promise<RawUploadResponse>,
+  opts: UploadRequest,
+  isFinal: boolean,
+): Promise<RawUploadResponse> {
+  for (let attempt = 0; ; attempt++) {
+    const res = await send(opts)
+    const mayHaveCommitted = isFinal && res.bodySent
+    const retryable =
+      !mayHaveCommitted &&
+      (res.status === 0 || (res.status >= 500 && res.status !== 507))
+    if (!retryable || attempt === CHUNK_RETRIES) return res
+    await new Promise((r) => setTimeout(r, CHUNK_RETRY_DELAY_MS))
+  }
+}
+
+// Decide what the response to a request that COMMITS means — the
+// whole file on the single-shot path, or the last chunk of a split
+// one. Both create the asset and answer afterwards, so both carry the
+// same ambiguity when the answer does not arrive intact, and both go
+// through here so neither can drift from the other.
+function interpretFinalResponse(res: RawUploadResponse): UploadResult {
+  const authFailure = followRedirect(res)
+  if (authFailure) return authFailure
+  const kind = fireToastFromHeader(res.trigger)
+  // The server's own words where it gave any — the 409 that says to
+  // check the asset list, the 507 that names the disk — beat anything
+  // derivable from a status code.
+  const message = jsonStringField(res.text, 'error')
+  if (message) {
+    return {
+      status: 'error',
+      failure: { kind: 'server', message, status: res.status },
+    }
+  }
+  // The bytes went out and nothing intelligible came back: the asset
+  // may already exist, so don't report a plain failure and don't send
+  // the operator off to upload a second copy. A body that never
+  // finished sending cannot have committed, so it falls through.
+  if (res.bodySent && (res.status === 0 || res.status >= 500)) {
+    return { status: 'error', failure: { kind: 'unconfirmed' } }
+  }
+  if (res.status === 0) {
+    return { status: 'error', failure: { kind: 'network' } }
+  }
+  if (res.status < 200 || res.status >= 300) {
+    // A proxy-generated 413 never reaches Django, so there is no
+    // HX-Trigger toast to replay and the status is all there is.
+    return { status: 'error', failure: { kind: 'http', status: res.status } }
+  }
+  // The server validates and may refuse a file with a 200 + error
+  // toast (invalid type, missing file). Treat that as a rejected
+  // file, not a silent success.
+  return { status: kind === 'error' ? 'rejected' : 'ok' }
+}
+
+// One string field of a JSON response body — undefined if the body is
+// not JSON, lacks the field, or holds a non-string there. The chunk
+// endpoint answers with `{upload_id}` on success and `{error}` on
+// refusal, and anything else is the server not answering as a chunk
+// endpoint at all, which both callers handle the same way.
+function jsonStringField(text: string, key: string): string | undefined {
+  try {
+    const parsed: unknown = JSON.parse(text)
+    if (parsed && typeof parsed === 'object' && key in parsed) {
+      const value = (parsed as Record<string, unknown>)[key]
+      if (typeof value === 'string' && value.length > 0) return value
+    }
+  } catch {
+    // Not JSON: the same answer as a body without the field.
+  }
+  return undefined
+}
+
+// Minted here, not taken from the server: a retry of chunk 0 would
+// otherwise arrive with no id, the server would mint a second one, and
+// the bytes staged under the first would sit orphaned while the upload
+// continued elsewhere.
+function newUploadId(): string {
+  const bytes = new Uint8Array(16)
+  crypto.getRandomValues(bytes)
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+// Whether a drag is carrying files, i.e. whether it is an upload
+// gesture at all. Dragging selected text, an image already on the page
+// or a link fires the very same events, and `types` is the only thing
+// a drag reveals before it is released — dataTransfer.files stays
+// empty until the drop, by design.
+function dragCarriesFiles(event: DragEvent): boolean {
+  const types = event.dataTransfer?.types
+  return types ? Array.from(types).includes('Files') : false
+}
 
 function metaContent(name: string): string {
   const el = document.querySelector<HTMLMetaElement>(
@@ -120,6 +325,8 @@ function csrfToken(): string {
 function homeApp(): HomeAppData {
   return {
     mode: null,
+    tab: 'uri',
+    addUri: '',
     editAsset: null,
     previewAsset: null,
     pendingDeleteId: null,
@@ -129,7 +336,8 @@ function homeApp(): HomeAppData {
     uploadFileName: '',
     uploadIndex: 0,
     uploadTotal: 0,
-    dragActive: false,
+    pageDragActive: false,
+    pageDragDepth: 0,
     selectedIds: [],
     visibleIds: { active: [], inactive: [] },
     bulkEditOpen: false,
@@ -195,6 +403,23 @@ function homeApp(): HomeAppData {
     openAdd() {
       this.mode = 'add'
       this.editAsset = null
+      // The modal is only hidden (x-show), never torn down, so whatever
+      // the last Add left behind is still sitting there on the next
+      // open — the previous asset's URL in the input above all.
+      // Reset the whole Add pane here rather than in closeModal(): open
+      // is the one path every entry point goes through, so the form is
+      // fresh however the last one ended.
+      this.addUri = ''
+      // Exception: an upload the operator hid with the modal still runs,
+      // and its progress UI lives on the file tab. Reopening is how they
+      // check on it, so go there — the tab they happened to be looking
+      // at when they hid the modal (the tab strip stays clickable during
+      // a batch) is not where the progress is.
+      this.tab = this.uploadState ? 'file' : 'uri'
+      // The Apps pane is its own component (appsTab in apps.ts), so it
+      // resets itself off this event — otherwise a reopened modal is
+      // still parked on the last app's filled-in config form.
+      window.dispatchEvent(new CustomEvent('add-modal-open'))
     },
     openEdit(asset: AssetEdit) {
       this.mode = 'edit'
@@ -219,11 +444,7 @@ function homeApp(): HomeAppData {
       // anyway.
       this.mode = null
       this.editAsset = null
-      // Clear any leftover drag highlight: dragging into the dropzone and
-      // then closing the modal (Esc/backdrop/Cancel) before dragleave
-      // fires would otherwise leave dragActive true, so the dropzone
-      // re-opens still highlighted.
-      this.dragActive = false
+      this.resetPageDrag()
       if (!this.uploadState) {
         this.uploadProgress = 0
         this.uploadFileName = ''
@@ -231,8 +452,33 @@ function homeApp(): HomeAppData {
         this.uploadTotal = 0
       }
     },
-    closePreview() {
+    closePreview(this: HomeAppData) {
       this.previewAsset = null
+      this.resetPageDrag()
+    },
+    // The delete-confirm and bulk-delete overlays used to close by
+    // assigning their flag inline from the template (four call sites
+    // each: Escape, backdrop, the X, Cancel). They go through a method
+    // so closing them clears the drag state like every other overlay —
+    // an inline assignment cannot.
+    closeDelete(this: HomeAppData) {
+      this.pendingDeleteId = null
+      this.resetPageDrag()
+    },
+    closeBulkDelete(this: HomeAppData) {
+      this.bulkDeleteOpen = false
+      this.resetPageDrag()
+    },
+    // Every overlay close path calls this. A drag cancelled with
+    // Escape, or an overlay closed before the browser delivers the
+    // matching dragleave, otherwise leaves the page believing a drag
+    // is still in progress: the next Add shows its dropzone lit, and
+    // the page overlay / preview-iframe shield can stay armed
+    // indefinitely. A genuine ongoing drag re-arms both on the next
+    // dragover, so resetting here costs nothing.
+    resetPageDrag(this: HomeAppData) {
+      this.pageDragActive = false
+      this.pageDragDepth = 0
     },
 
     // --- Bulk selection (#3046) ---------------------------------------
@@ -294,8 +540,9 @@ function homeApp(): HomeAppData {
     openBulkEdit() {
       this.bulkEditOpen = true
     },
-    closeBulkEdit() {
+    closeBulkEdit(this: HomeAppData) {
       this.bulkEditOpen = false
+      this.resetPageDrag()
     },
     // Bridged from the bulk forms' hx-on::after-request via a global
     // window 'bulk-done' CustomEvent (hx-on runs in global scope and
@@ -308,7 +555,7 @@ function homeApp(): HomeAppData {
         (event as CustomEvent<{ closeDelete?: boolean; closeEdit?: boolean }>)
           .detail || {}
       this.clearSelection()
-      if (detail.closeDelete) this.bulkDeleteOpen = false
+      if (detail.closeDelete) this.closeBulkDelete()
       if (detail.closeEdit) this.closeBulkEdit()
     },
 
@@ -338,20 +585,20 @@ function homeApp(): HomeAppData {
 
       this.uploadTotal = files.length
       let succeeded = 0
-      let aborted = false
+      let failure: UploadFailure | null = null
       for (let i = 0; i < files.length; i++) {
         this.uploadIndex = i + 1
         this.uploadFileName = files[i].name
         const result = await this.uploadOne(url, csrf, files[i])
-        if (result === 'error') {
+        if (result.status === 'error') {
           // Transport failure — something's wrong with the request
           // itself, so stop the batch rather than hammering on.
-          aborted = true
+          failure = result.failure
           break
         }
         // 'rejected' files already surfaced their own server toast;
         // skip them and keep uploading the rest of the selection.
-        if (result === 'ok') succeeded += 1
+        if (result.status === 'ok') succeeded += 1
       }
 
       // Clear the input so re-selecting the same file(s) fires change
@@ -363,11 +610,22 @@ function homeApp(): HomeAppData {
       this.uploadIndex = 0
       this.uploadTotal = 0
 
-      if (aborted) {
+      if (failure) {
+        // Every outcome that tells the operator the asset may already
+        // be there — ours, and the server's own 409 — is unactionable
+        // with the Add modal sitting on top of the asset list.
+        const mayAlreadyExist =
+          failure.kind === 'unconfirmed' ||
+          (failure.kind === 'server' && failure.status === 409)
+        if (mayAlreadyExist) this.mode = null
         const store = window.Alpine.store('toasts') as
           | ToastStoreLike
           | undefined
-        store?.push('error', 'Upload failed — check the file and try again')
+        store?.push(
+          'error',
+          uploadErrorMessage(failure),
+          UPLOAD_ERROR_TOAST_MS,
+        )
       }
       if (succeeded > 0) {
         this.mode = null
@@ -383,10 +641,10 @@ function homeApp(): HomeAppData {
       }
     },
 
-    // Drag-and-drop entry point for the dropzone. Assigns the dropped
-    // FileList to the hidden <input> (so input.form / re-select still
-    // behave) and runs it through the same sequential uploadFiles()
-    // batch path the input's change event uses.
+    // Drag-and-drop entry point. Assigns the dropped FileList to the
+    // hidden <input> (so input.form / re-select still behave) and runs
+    // it through the same sequential uploadFiles() batch path the
+    // input's change event uses.
     dropFiles(event: DragEvent) {
       const dropped = event.dataTransfer?.files
       if (!dropped || !dropped.length || this.uploadState) return
@@ -398,6 +656,116 @@ function homeApp(): HomeAppData {
       void this.uploadFiles(input)
     },
 
+    // --- Page-wide drag and drop --------------------------------------
+    // Dropping a file anywhere on the Schedule Overview uploads it.
+    // Only the dropzone inside the Add-asset modal used to take drops,
+    // so the gesture everybody actually tries first — drag a video
+    // straight onto the asset list — hit the browser's own default and
+    // navigated the tab away to the local file, losing the page.
+    //
+    // The listeners are bound with Alpine's .window modifier, so this
+    // is one handler set for the whole page rather than a drop target
+    // per region.
+
+    // Whether the page is listening for a drop at all. Bound by the
+    // overlay as well as consulted by the drop handler, so the two
+    // cannot drift: an overlay promising "drop to upload" over a modal
+    // that then ignores the drop is worse than no overlay at all.
+    // A batch already in flight is deliberately NOT a refusal here —
+    // the drop still opens the modal onto the running upload, which is
+    // the answer to "why was my file ignored". The overlay reads
+    // uploadState itself and says so before the drop.
+    acceptsPageDrop(this: HomeAppData) {
+      // Each of these owns the screen with an overlay of its own, and a
+      // file released over one is not aimed at the asset list. Opening
+      // the Add modal underneath would also bury whatever the operator
+      // was in the middle of.
+      return (
+        this.mode !== 'edit' &&
+        !this.previewAsset &&
+        !this.bulkEditOpen &&
+        !this.bulkDeleteOpen &&
+        !this.pendingDeleteId
+      )
+    },
+
+    onPageDragEnter(this: HomeAppData, event: DragEvent) {
+      if (!dragCarriesFiles(event)) return
+      // Claim the drag. A drop only fires on a target that cancelled
+      // the preceding dragenter/dragover — without this the browser
+      // keeps the drag for itself and opens the file.
+      event.preventDefault()
+      this.pageDragDepth += 1
+      this.pageDragActive = true
+    },
+
+    // Fires continuously while the drag moves, so it stays free of
+    // reactive writes except the one that recovers a highlight we
+    // never got to raise (a dragenter swallowed by an element that
+    // stopped propagation, or a drag that began off-window).
+    onPageDragOver(this: HomeAppData, event: DragEvent) {
+      if (!dragCarriesFiles(event)) return
+      event.preventDefault()
+      if (!this.pageDragActive) {
+        this.pageDragActive = true
+        // Seed the counter as well. Re-arming with a depth of 0 leaves
+        // the next enter/leave pair (the pointer crossing one table
+        // row) running 0 -> 1 -> 0, which hides the overlay while the
+        // file is still over the page; it would only come back on the
+        // following dragover, so the highlight flickers for the rest
+        // of the drag. Math.max keeps a genuine deeper nesting intact.
+        this.pageDragDepth = Math.max(1, this.pageDragDepth)
+      }
+    },
+
+    onPageDragLeave(this: HomeAppData, event: DragEvent) {
+      if (!dragCarriesFiles(event)) return
+      // Floor at zero: a dragleave with no matching dragenter (the
+      // recovery case above) would otherwise push the counter negative
+      // and leave the overlay stuck on for the rest of the session.
+      this.pageDragDepth = Math.max(0, this.pageDragDepth - 1)
+      if (this.pageDragDepth === 0) this.pageDragActive = false
+    },
+
+    onPageDrop(this: HomeAppData, event: DragEvent) {
+      if (!dragCarriesFiles(event)) return
+      // Claimed even when the drop is refused below: whatever is on
+      // screen, letting the browser navigate to the dropped file would
+      // throw the page away.
+      event.preventDefault()
+      this.pageDragDepth = 0
+      this.pageDragActive = false
+      if (!this.acceptsPageDrop()) {
+        // Every dragover on the page is cancelled, so the cursor has
+        // been promising the operator a drop target the whole way in.
+        // Refusing in silence after that reads as a file that
+        // evaporated — say which way out of it.
+        const store = window.Alpine?.store('toasts') as
+          | ToastStoreLike
+          | undefined
+        store?.push('info', DROP_BLOCKED_MESSAGE)
+        return
+      }
+      // The batch's progress UI lives in the Add modal's upload pane,
+      // so open it there: a dropped file reports "File 2 of 5 · 40%"
+      // exactly as a picked one does, and uploadFiles() closes the
+      // modal again once the last file lands. A drop arriving while a
+      // batch is already running is ignored by dropFiles(), and
+      // opening the modal is what explains why — it shows the upload
+      // still in flight.
+      //
+      // Through openAdd() only when the modal is not already up, so a
+      // drop gets the same reset every other way in does (a stale URL
+      // in the From-URL box, the Apps pane parked on the last config
+      // form). Reopening one that is already open would wipe what the
+      // operator is part-way through typing into it — the drop moves
+      // them to the upload pane, and the URL they had half-entered is
+      // still there when they come back.
+      if (this.mode !== 'add') this.openAdd()
+      this.tab = 'file'
+      this.dropFiles(event)
+    },
+
     // POST a single file and resolve an UploadResult: 'ok' on a 2xx
     // with no error toast, 'rejected' on a 2xx carrying an error toast
     // (server refused the file), 'error' on a non-2xx or transport
@@ -406,47 +774,182 @@ function homeApp(): HomeAppData {
     // replay them here since this isn't an htmx-managed request.
     // Progress flips to "processing" once the bytes are up (the server
     // still has to write to disk + ffprobe).
-    uploadOne(
+    // POST one request of an upload: the whole file, or one chunk of
+    // it. Resolves the raw response so the caller can decide what a
+    // given status means for a chunk versus a final commit.
+    sendUpload(
+      this: HomeAppData,
+      opts: UploadRequest,
+    ): Promise<RawUploadResponse> {
+      return new Promise<RawUploadResponse>((resolve) => {
+        const xhr = new XMLHttpRequest()
+        xhr.open('POST', opts.url)
+        xhr.setRequestHeader('X-CSRFToken', opts.csrf)
+        // Mark as an htmx request so assets_upload returns the table
+        // partial (+ HX-Trigger toast) instead of a full-page redirect.
+        xhr.setRequestHeader('HX-Request', 'true')
+        if (opts.range) xhr.setRequestHeader('Content-Range', opts.range)
+        if (opts.uploadId) xhr.setRequestHeader('X-Upload-Id', opts.uploadId)
+        this.uploadState = 'sending'
+        let bodySent = false
+        // Fires once the whole request body has gone out — before any
+        // response, and regardless of what comes back.
+        xhr.upload.addEventListener('load', () => {
+          bodySent = true
+        })
+        xhr.upload.addEventListener('progress', (ev) => {
+          if (!ev.lengthComputable || opts.totalBytes === 0) return
+          // Against the whole file, not this request: otherwise a
+          // chunked upload would run 0-100% once per chunk.
+          const done = opts.sentBytes + ev.loaded
+          this.uploadProgress = Math.min(
+            99,
+            Math.round((done / opts.totalBytes) * 100),
+          )
+          if (done >= opts.totalBytes) this.uploadState = 'processing'
+        })
+        xhr.addEventListener('load', () => {
+          // Not hardcoded true: a proxy enforcing a body limit answers
+          // and closes while the browser is still writing, so a
+          // response can arrive with the body unfinished — the one
+          // case this flag exists to catch.
+          resolve({
+            status: xhr.status,
+            text: xhr.responseText,
+            trigger: xhr.getResponseHeader('HX-Trigger'),
+            bodySent,
+            redirect: xhr.getResponseHeader('HX-Redirect'),
+          })
+        })
+        // No response at all (dropped connection, DNS, TLS): status is
+        // 0 here, so it is not an HTTP failure.
+        const failed = () =>
+          resolve({
+            status: 0,
+            text: '',
+            trigger: null,
+            bodySent,
+            redirect: null,
+          })
+        xhr.addEventListener('error', failed)
+        xhr.addEventListener('abort', failed)
+        const fd = new FormData()
+        fd.append('csrfmiddlewaretoken', opts.csrf)
+        fd.append('file_upload', opts.body, opts.filename)
+        xhr.send(fd)
+      })
+    },
+
+    async uploadOne(
       this: HomeAppData,
       url: string,
       csrf: string,
       file: File,
     ): Promise<UploadResult> {
-      return new Promise<UploadResult>((resolve) => {
-        const xhr = new XMLHttpRequest()
-        xhr.open('POST', url)
-        xhr.setRequestHeader('X-CSRFToken', csrf)
-        // Mark as an htmx request so assets_upload returns the table
-        // partial (+ HX-Trigger toast) instead of a full-page redirect.
-        xhr.setRequestHeader('HX-Request', 'true')
-        this.uploadState = 'sending'
-        this.uploadProgress = 0
-        xhr.upload.addEventListener('progress', (ev) => {
-          if (!ev.lengthComputable || ev.total === 0) return
-          this.uploadProgress = Math.min(
-            99,
-            Math.round((ev.loaded / ev.total) * 100),
-          )
-          if (ev.loaded >= ev.total) this.uploadState = 'processing'
+      this.uploadProgress = 0
+      const chunkSize = chunkSizeFromMeta(
+        metaContent('anthias-upload-chunk-mb') || null,
+      )
+
+      if (!needsChunking(file.size, chunkSize)) {
+        const res = await this.sendUpload({
+          url,
+          csrf,
+          body: file,
+          filename: file.name,
+          sentBytes: 0,
+          totalBytes: file.size,
         })
-        xhr.addEventListener('load', () => {
-          const kind = fireToastFromHeader(xhr.getResponseHeader('HX-Trigger'))
-          if (xhr.status < 200 || xhr.status >= 300) {
-            resolve('error')
-            return
+        return interpretFinalResponse(res)
+      }
+
+      const chunks = planChunks(file.size, chunkSize)
+      const uploadId = newUploadId()
+
+      // A 413 means something in front of the device refused this
+      // request. On the single-shot path that is "your file is too
+      // large"; here the file has already been split, so the honest
+      // answer names the chunk size instead.
+      const named = (result: UploadResult): UploadResult =>
+        result.status === 'error' &&
+        result.failure.kind === 'http' &&
+        result.failure.status === 413
+          ? { status: 'error', failure: { kind: 'chunk-too-large' } }
+          : result
+
+      const sendChunk = (
+        chunk: Chunk,
+        isFinal: boolean,
+      ): Promise<RawUploadResponse> =>
+        sendWithRetry(
+          (opts) => this.sendUpload(opts),
+          {
+            url,
+            csrf,
+            // Re-wrapped with the file's own type: File.slice()
+            // reports application/octet-stream, and the server reads
+            // that type to catch an extension that lies (a HEIC
+            // renamed .jpg) — without it, normalisation is skipped and
+            // the asset renders blank.
+            body: new Blob([file.slice(chunk.start, chunk.end + 1)], {
+              type: file.type,
+            }),
+            filename: file.name,
+            range: chunk.header,
+            uploadId,
+            sentBytes: chunk.start,
+            totalBytes: file.size,
+          },
+          isFinal,
+        )
+
+      // All but the last only stage bytes; the server acknowledges
+      // each with the upload id and nothing else.
+      for (const chunk of chunks.slice(0, -1)) {
+        const res = await sendChunk(chunk, false)
+        if (res.status < 200 || res.status >= 300) {
+          // The server's own wording where it gave one; the status
+          // code is the fallback. No ambiguity to weigh here: a
+          // staging chunk commits nothing.
+          const message = jsonStringField(res.text, 'error')
+          return named({
+            status: 'error',
+            failure: message
+              ? { kind: 'server', message, status: res.status }
+              : res.status === 0
+                ? { kind: 'network' }
+                : { kind: 'http', status: res.status },
+          })
+        }
+        // A 200 that is not the acknowledgement is the server
+        // refusing the file (wrong type, nothing uploaded) and
+        // answering with the asset table and its own toast: one file
+        // rejected, not a transport failure. Replay and carry on, as
+        // single-shot does.
+        if (jsonStringField(res.text, 'upload_id') === undefined) {
+          const authFailure = followRedirect(res)
+          if (authFailure) return authFailure
+          // Only a rejection if the server actually said so.
+          // fireToastFromHeader pushes nothing when there is no
+          // HX-Trigger, so treating every unrecognised 2xx as a
+          // rejection drops the file with no asset, no error and a
+          // progress bar that completed — which is what a login page,
+          // a captive portal or a proxy's own 200 looks like here.
+          const kind = fireToastFromHeader(res.trigger)
+          if (kind === null) {
+            return {
+              status: 'error',
+              failure: { kind: 'http', status: res.status },
+            }
           }
-          // The server validates and may refuse a file with a 200 +
-          // error toast (invalid type, missing file). Treat that as a
-          // rejected file, not a silent success.
-          resolve(kind === 'error' ? 'rejected' : 'ok')
-        })
-        xhr.addEventListener('error', () => resolve('error'))
-        xhr.addEventListener('abort', () => resolve('error'))
-        const fd = new FormData()
-        fd.append('csrfmiddlewaretoken', csrf)
-        fd.append('file_upload', file)
-        xhr.send(fd)
-      })
+          return { status: 'rejected' }
+        }
+      }
+
+      // The last carries the final byte, so it creates the asset.
+      return named(
+        interpretFinalResponse(await sendChunk(chunks[chunks.length - 1], true)),
+      )
     },
   }
 }

@@ -196,15 +196,16 @@ fi
 # which is confusing on a `docker ps` audit later.
 sudo -E docker compose "${COMPOSE_FILES[@]}" up -d --remove-orphans
 
-# Drop stale upstream-namespace images left behind by a device that
-# previously ran ghcr.io/screenly / screenly images (this fork pulls
-# robkanthias/anthias-*). The rmi is best-effort: an image still in
-# use by some container is skipped rather than failing the upgrade;
-# what matters is reclaiming the ~1 GB an orphaned upstream image set
-# eats on an SD card.
-set +e
-sudo docker images \
-    --format '{{.Repository}}:{{.Tag}}' \
-    | grep -E '^(ghcr\.io/screenly|screenly)/(anthias|srly-ose)-' \
-    | xargs -r sudo docker rmi >/dev/null 2>&1
-set -e
+# Drop the images the release we just replaced was running on, plus any
+# stale upstream-namespace images left from before this fork switched
+# devices to robkanthias/anthias-* (the purge script's repo list covers
+# both — the fork's image-pipeline policy lives there now). Deliberately
+# the last thing we do, and only once the new stack is up, so a pull or a
+# start that failed above still leaves the previous images to fall back on.
+# Best effort: losing the cleanup must not fail the upgrade itself. The
+# existence check covers the operator who pulled only this script down
+# instead of updating the whole checkout.
+PURGE_SCRIPT="${SCRIPT_DIR}/purge_stale_images.sh"
+if [ -f "${PURGE_SCRIPT}" ]; then
+    bash "${PURGE_SCRIPT}" || true
+fi

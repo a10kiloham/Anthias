@@ -21,8 +21,13 @@
     </div>
 
     {# ---- Add mode ---- #}
-    <div x-show="mode === 'add'" x-data="{ tab: 'uri' }">
-      <div class="modal-card__body" style="padding-bottom: var(--space-3)">
+    {% comment %} `tab` lives in homeApp(), not a nested x-data here, so
+       openAdd() can reset the pane between opens — the modal is only
+       hidden, so anything left in it survives a close — and so a file
+       dropped on the page can open straight onto the upload pane.
+    {% endcomment %}
+    <div x-show="mode === 'add'">
+      <div class="modal-card__body" style="padding-bottom: calc(var(--spacing) * 3)">
         <ul class="app-tabs mb-4" id="add-asset-nav-tabs">
           <li class="app-tab-item">
             <button type="button" id="tab-uri"
@@ -60,7 +65,7 @@
         {% csrf_token %}
         <div class="modal-card__body" style="padding-top: 0">
           <div class="app-floating mb-3">
-            <input type="url" class="app-input" id="add-uri" name="uri" placeholder=" " required>
+            <input type="url" class="app-input" id="add-uri" name="uri" placeholder=" " required x-model="addUri">
             <label for="add-uri">Asset URL</label>
           </div>
           <p class="muted-label m-0">Web pages, hosted images, hosted videos, and streaming URLs are all supported.</p>
@@ -91,22 +96,21 @@
       >
         {% csrf_token %}
         <div class="modal-card__body" style="padding-top: 0">
-          {% comment %} The dashed dropzone reads as a drop target, so it
-             accepts drops as well as clicks. dropFiles() hands the
-             dropped FileList to the same uploadFiles() batch path the
-             <input>'s change event uses. {% endcomment %}
+          {% comment %} The dashed dropzone reads as a drop target, and
+             it is one — but it carries no drop handler of its own. The
+             page-wide listeners in home.html own every file drop on
+             this page, including the ones released in here, so there
+             is exactly one path into uploadFiles() and no chance of a
+             drop being handled twice. All this element does is echo
+             the drag state the page is already tracking. {% endcomment %}
           <label
             for="add-file"
             class="upload-dropzone"
-            :class="{ 'is-disabled': uploadState, 'is-dragover': dragActive }"
+            :class="{ 'is-disabled': uploadState, 'is-dragover': pageDragActive }"
             x-show="!uploadState"
-            @dragover.prevent
-            @dragenter.prevent="dragActive = true"
-            @dragleave.self.prevent="dragActive = false"
-            @drop.prevent="dragActive = false; dropFiles($event)"
           >
             <i class="ti ti-cloud-upload" style="font-size: 2.25rem; opacity: 0.55"></i>
-            <p class="mb-1 font-semibold mt-2">Click to choose files</p>
+            <p class="mb-1 font-semibold mt-2">Click to choose files, or drop them anywhere</p>
             <p class="muted-label mb-0">Images or videos. Select one or many — upload starts immediately.</p>
             {% comment %}
               Browser MIME globs cover JPEG/PNG/WebP/GIF/MP4/WebM/MKV out of
@@ -160,6 +164,7 @@
         x-show="tab === 'apps'"
         x-data="appsTab()"
         x-effect="if (tab === 'apps') load()"
+        @add-modal-open.window="reset()"
       >
         {# Loading #}
         <div class="modal-card__body app-cfg-state" x-show="phase === 'loading'" x-cloak>
@@ -171,7 +176,7 @@
         <div class="modal-card__body app-cfg-state" x-show="phase === 'error'" x-cloak>
           <i class="ti ti-plug-connected-x" style="font-size: 2rem; opacity: .55" aria-hidden="true"></i>
           <p class="mb-2" x-text="error"></p>
-          <button type="button" class="app-btn app-btn-secondary" @click="retry()">
+          <button type="button" class="app-btn app-btn-outline-dark" @click="retry()">
             <i class="ti ti-refresh"></i><span>Try again</span>
           </button>
         </div>
@@ -235,7 +240,7 @@
           <input type="hidden" name="app_values" :value="valuesJson">
           <input type="hidden" name="refresh_interval_s" :value="refreshIntervalS">
 
-          <div class="modal-card__body" style="padding-top: var(--space-2)">
+          <div class="modal-card__body" style="padding-top: calc(var(--spacing) * 2)">
             <button type="button" class="app-cfg-back" @click="back()">
               <i class="ti ti-arrow-left"></i><span>All apps</span>
             </button>
@@ -257,7 +262,12 @@
             </div>
 
             <div class="app-floating mt-4 mb-3">
-              <input type="text" class="app-input" id="app-asset-name" name="name" :value="assetName" @input="nameEdited = true" placeholder=" " required>
+              {% comment %} x-model, not :value — a one-way bind lets the
+                 DOM drift from assetName the moment the operator types,
+                 so re-selecting the same app (identical seed, no
+                 reactive change) would leave the previous install's
+                 name in the box. {% endcomment %}
+              <input type="text" class="app-input" id="app-asset-name" name="name" x-model="assetName" @input="nameEdited = true" placeholder=" " required>
               <label for="app-asset-name">Name</label>
             </div>
 
@@ -376,7 +386,7 @@
                      style="user-select: all"
                 ><code x-text="editAsset.metadata.error_recipe"></code></pre>
                 <button type="button"
-                        class="app-btn app-btn-secondary modal-alert__copy"
+                        class="app-btn app-btn-outline-dark modal-alert__copy"
                         @click="copyRecipe()"
                         :aria-label="copied ? 'Copied' : 'Copy ffmpeg command'">
                   <i class="ti" :class="copied ? 'ti-check' : 'ti-copy'"></i>
@@ -428,7 +438,7 @@
             style="border-bottom: 1px solid var(--color-border);"
           >
             <span class="muted-label">Type</span>
-            <span class="schedule-chip text-capitalize"
+            <span class="schedule-chip capitalize"
               x-text="isAppAsset ? 'App' : editAsset.mimetype"></span>
           </div>
 
@@ -551,7 +561,7 @@
               <template x-if="editAsset.mimetype === 'webpage'">
                 <div>
                   <div class="modal-section__divider"></div>
-                  <div class="app-floating">
+                  <div class="app-floating app-floating--lifted">
                     <input type="number" class="app-input" id="edit-refresh-interval"
                       name="refresh_interval_s"
                       min="0" max="{{ refresh_interval_s_max }}" step="1"
@@ -572,7 +582,7 @@
                     parses + sanitises via parse_header_lines.
                   {% endcomment %}
                   <div class="modal-section__divider"></div>
-                  <div class="app-floating">
+                  <div class="app-floating app-floating--lifted">
                     <textarea class="app-input" id="edit-custom-headers"
                       name="custom_headers" rows="3"
                       placeholder="Authorization: Bearer <token>"

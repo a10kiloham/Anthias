@@ -20,26 +20,26 @@ namespaces = false
 
 [dependency-groups]
 dev-host = [
-    "ansible-lint==26.6.0",
+    "ansible-lint==26.8.0",
     "celery-types==0.26.0",
-    "django-stubs==6.0.9",
-    "djangorestframework-stubs==3.18.0",
-    "mypy==2.3.0",
-    "ruff==0.16.2",
+    "django-stubs==6.1.1",
+    "djangorestframework-stubs==3.18.1",
+    "mypy==2.3.1",
+    "ruff==0.16.8",
     "tenacity==9.1.4",
-    "types-gunicorn==26.0.0.20260807",
+    "types-gunicorn==26.2.0.20260827",
     # Direct dev dep: types-psutil used to arrive transitively via
     # djangorestframework-stubs, which dropped it in 3.17.1 — pin it
     # directly so the psutil import in the server keeps its stubs.
-    "types-psutil==7.2.2.20260518",
+    "types-psutil==7.2.2.20260906",
     "types-python-dateutil==2.9.0.20260807",
     "types-pytz==2026.3.1.20260727",
     "types-PyYAML==6.0.12.20260518",
 ]
 docker-image-builder = [
-    "click==8.4.2",
+    "click==8.5.0",
     "jinja2==3.1.6",
-    "pygit2==1.20.0",
+    "pygit2==1.20.1",
     "requests==2.34.2",
     "python-on-whales==0.81.0",
 ]
@@ -48,10 +48,10 @@ server = [
     "certifi==2026.7.22",
     "channels==4.3.2",
     "channels-redis==4.3.0",
-    "Django==5.2.14",
-    "djangorestframework==3.18.0",
-    "django-dbbackup==5.3.0",
-    "django-stubs-ext==6.0.9",
+    "Django==5.2.17",
+    "djangorestframework==3.18.1",
+    "django-dbbackup==5.3.1",
+    "django-stubs-ext==6.1.1",
     "drf-spectacular==0.30.0",
     "Jinja2==3.1.6",
     "packaging==26.3",
@@ -80,46 +80,46 @@ server = [
     "PyYAML==6.0.3",
     "redis==8.1.0",
     "requests==2.34.2",
-    "sentry-sdk==2.66.1",
+    "sentry-sdk==2.69.2",
     "tenacity==9.1.4",
     "sh==2.4.0",
-    "urllib3==2.7.0",
-    "uvicorn[standard]==0.52.1",
+    "urllib3==2.8.0",
+    "uvicorn[standard]==0.53.0",
     "whitenoise==6.12.0",
     "yt-dlp>=2026.7.4",
 ]
 viewer = [
     "certifi==2026.7.22",
-    "Django==5.2.14",
+    "Django==5.2.17",
     "Jinja2==3.1.6",
     "pydbus==0.6.0",
     "python-dateutil==2.9.0.post0",
     "pytz==2026.3.post1",
     "redis==8.1.0",
     "requests==2.34.2",
-    "sentry-sdk==2.66.1",
+    "sentry-sdk==2.69.2",
     "tenacity==9.1.4",
     "sh==2.4.0",
-    "urllib3==2.7.0",
+    "urllib3==2.8.0",
 ]
 dev = [
     "pytest==9.1.1",
     "pytest-cov==7.1.0",
-    "pytest-django==4.13.0",
+    "pytest-django==4.14.0",
     "pytest-mock==3.15.1",
     "pytest-xdist==3.8.0",
-    "playwright==1.62.0",
-    "pytest-playwright==0.8.0",
-    "time-machine==3.3.1",
+    "playwright==1.63.0",
+    "pytest-playwright==0.9.0",
+    "time-machine==3.5.1",
 ]
 host = [
-    "ansible-core==2.21.2",
+    "ansible-core==2.21.4",
     "redis==8.1.0",
     "requests==2.34.2",
     "tenacity==9.1.4",
 ]
 local = [
-    "click==8.4.2",
+    "click==8.5.0",
     "requests==2.34.2",
     "tenacity==9.1.4",
 ]
@@ -142,10 +142,10 @@ mypy = [
     { include-group = "docker-image-builder" },
     "channels==4.3.2",
     "channels-redis==4.3.0",
-    "Django==5.2.14",
-    "django-dbbackup==5.3.0",
-    "django-stubs-ext==6.0.9",
-    "djangorestframework==3.18.0",
+    "Django==5.2.17",
+    "django-dbbackup==5.3.1",
+    "django-stubs-ext==6.1.1",
+    "djangorestframework==3.18.1",
     "drf-spectacular==0.30.0",
     # Pillow ships PEP 561 stubs (py.typed). The processing module
     # imports PIL at top level, so mypy needs the package resolvable
@@ -155,7 +155,7 @@ mypy = [
     # ignored, mirroring the pydbus / sh pattern.
     "Pillow==12.3.0",
     "pytz==2026.3.post1",
-    "sentry-sdk==2.66.1",
+    "sentry-sdk==2.69.2",
     "whitenoise==6.12.0",
 ]
 
@@ -243,9 +243,14 @@ exclude = [
 [[tool.mypy.overrides]]
 # Third-party libs without type stubs. Listed explicitly so a future stub
 # release is noticed (and the override removed) instead of silently ignored.
-# `channels` itself is covered by partial PEP 561 stubs in stubs/channels-stubs/;
-# only the helpers we actually call are typed there.
+# `channels` and asgiref's untyped `testing` module are covered by partial
+# PEP 561 stubs in stubs/channels-stubs/ and stubs/asgiref-stubs/; only the
+# helpers we actually call are typed there. (asgiref ships py.typed itself,
+# but not for asgiref.testing — the partial marker keeps the real stubs for
+# every other asgiref module.)
 module = [
+    # Dev-only: emails/render_logo.py, run through `uv run --no-project`.
+    "cairosvg",
     "channels_redis.*",
     "gi",
     "gi.*",
