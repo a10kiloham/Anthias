@@ -2472,7 +2472,16 @@ def asset_loop(scheduler: Any) -> None:
             # or ('streaming' in mime)`` — the truthy literal short-
             # circuits and the branch runs for every mimetype, making
             # the ``else: Unknown MimeType`` arm below unreachable.
-            for _ in range(loops):
+            for loop_index in range(loops):
+                if loop_index:
+                    # One line per replay so a log read can answer
+                    # "is it looping?" without doing timestamp math
+                    # against the asset duration.
+                    logger.info(
+                        'Replaying video (loop %d of %d)',
+                        loop_index + 1,
+                        loops,
+                    )
                 if view_video(uri, duration):
                     # Skip cuts the whole slot short, not just the
                     # current replay.
