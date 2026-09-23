@@ -10,6 +10,8 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 
 import asyncio
 import configparser
+import logging
+import math
 import platform
 import secrets
 import socket
@@ -54,9 +56,24 @@ BASE_DIR = Path(__file__).resolve().parents[3]
 # this module pointed at the production /data path on local pytest
 # runs. Detect pytest itself by inspecting argv (covers `pytest ...`,
 # `python -m pytest ...`, and `uv run pytest ...`) so the test branch
-# is taken regardless of import order. Used by both the Sentry DSN
-# default here and the DATABASES test branch further down.
+# is taken regardless of import order. Used by IS_TEST below.
 _running_under_pytest = any('pytest' in (a or '') for a in sys.argv)
+
+# The deployment environment: 'development', 'test', or 'production'
+# (the default). Everything environment-dependent in this file derives
+# from these two names rather than re-reading the env var.
+ENVIRONMENT = getenv('ENVIRONMENT', 'production')
+
+# Deliberately not folded into ENVIRONMENT, and deliberately not
+# derived from DEBUG:
+#
+#   * Keeping the argv sniff out of ENVIRONMENT keeps it out of DEBUG.
+#     A stray process whose argv mentions pytest must never be able to
+#     turn debug error pages on in production.
+#   * pytest-django sets settings.DEBUG = False for the duration of a
+#     run, so DEBUG is not readable as "is this a test". IS_TEST is
+#     computed once at import and cannot be mutated that way.
+IS_TEST = ENVIRONMENT == 'test' or _running_under_pytest
 
 # Operators can point crash reporting at their own Sentry project by
 # setting SENTRY_DSN, or disable it entirely by setting it to an
@@ -70,7 +87,7 @@ _running_under_pytest = any('pytest' in (a or '') for a in sys.argv)
 # deliberately.
 _default_sentry_dsn = (
     ''
-    if getenv('ENVIRONMENT') == 'test' or _running_under_pytest
+    if IS_TEST
     else (
         'https://da18c7bdab65c9adc4afcd311f5b6f09'
         '@o4511522371534848.ingest.us.sentry.io/4511522375794688'
@@ -260,7 +277,7 @@ sentry_sdk.init(
     # or 'production' (the default) — lets dev events be filtered out
     # in Sentry. (Test runs don't send at all — see the DSN default
     # above.)
-    environment=getenv('ENVIRONMENT', 'production'),
+    environment=ENVIRONMENT,
     # CalVer (pyproject [project].version, via the same helper the
     # System Info page and v2 info API use) plus the image's git
     # short hash — see get_sentry_release above.
@@ -278,19 +295,29 @@ sentry_sdk.init(
 def get_board_model(model_file: str = '/proc/device-tree/model') -> str:
     """Host board model from the device tree, '' when unavailable.
 
-    ``/proc/device-tree`` resolves to ``/sys/firmware/devicetree/base``,
-    which Docker exposes read-only inside every container — no bind
-    mount needed. x86 hosts have no device tree; boards that have one
-    expose the model as a NUL-terminated UTF-8 string, decoded and
-    trimmed with the same idiom as device_helper's board detection.
+    x86 hosts have no device tree; boards that have one expose the
+    model as a NUL-terminated UTF-8 string.
+
+    Read through ``device_helper.read_firmware_file`` like every other
+    firmware string, so the bound and the sanitising are shared rather
+    than reimplemented here: a Sentry tag is one more sink for a value
+    we don't author. The import is function-local and ``device_helper``
+    has no imports of its own, so settings load stays as light as it
+    was.
+
+    Note this reads '' in the server container on *every* board:
+    ``/proc/device-tree`` resolves to ``/sys/firmware/devicetree/base``
+    and Docker masks ``/sys/firmware`` in unprivileged containers, so
+    the Sentry ``board_model`` tag is only populated where the tree is
+    readable (the host, the privileged viewer). Reading the
+    host_agent's Redis key instead is not an option here — settings
+    load must stay import-light and can't block on a Redis that may
+    not be up yet — so triage should lean on ``device_type`` /
+    ``kernel_machine`` for server-side events.
     """
-    try:
-        with open(model_file, 'rb') as f:
-            # Kernel writes a null-terminated UTF-8 string — decode
-            # and trim exactly like device_helper's board detection.
-            return f.read().decode('utf-8', 'replace').strip('\x00 \n\t')
-    except OSError:
-        return ''
+    from anthias_common.device_helper import read_firmware_file
+
+    return read_firmware_file(model_file)
 
 
 # Board / kernel context for fleet triage. Events are sent from inside
@@ -335,7 +362,7 @@ if _board_model:
 
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = getenv('ENVIRONMENT', 'production') in ['development', 'test']
+DEBUG = ENVIRONMENT in ['development', 'test']
 
 if not DEBUG:
     if not device_settings.get('django_secret_key'):
@@ -519,7 +546,7 @@ else:
 # preserve their existing layout by exporting
 # `ANTHIAS_TEST_DB_PATH=/data/.anthias/test.db` (see
 # docker-compose.test.yml).
-if getenv('ENVIRONMENT') == 'test' or _running_under_pytest:
+if IS_TEST:
     db_path = getenv('ANTHIAS_TEST_DB_PATH') or str(
         BASE_DIR / '.anthias-test.db'
     )
@@ -679,9 +706,14 @@ def get_configured_time_zone(
         config_file = str(Path(home) / CONFIG_DIR / CONFIG_FILE)
     parser = configparser.ConfigParser()
     try:
+        # See get_configured_upload_chunk_size_mb: this is read on
+        # every request too, so the same refusal of non-plain files
+        # and of undecodable content applies.
+        if not Path(config_file).is_file():
+            return None
         parser.read(config_file)
         time_zone = parser.get('main', 'timezone', fallback='').strip()
-    except (configparser.Error, OSError):
+    except (configparser.Error, OSError, UnicodeDecodeError):
         return None
     if not time_zone:
         return None
@@ -760,6 +792,93 @@ APP_STORE_INDEX_URL = getenv(
     'APP_STORE_INDEX_URL',
     'https://signage-apps.com/manifest.json',
 )
+
+# Size of each request a large browser upload is split into, for an
+# operator behind a proxy that caps request bodies. The ceiling keeps a
+# chunk under FILE_UPLOAD_MAX_MEMORY_SIZE above (25 MB), where Django
+# holds it in RAM rather than spooling it to the SD card; below the
+# floor a large video becomes thousands of sequential requests. Mirrored
+# in home/chunking.ts, which a test pins.
+UPLOAD_CHUNK_SIZE_MB_DEFAULT = 16
+UPLOAD_CHUNK_SIZE_MB_MAX = 24
+UPLOAD_CHUNK_SIZE_MB_MIN = 1
+
+
+def get_configured_upload_chunk_size_mb(
+    config_file: str | None = None,
+) -> str:
+    """Raw ``[main] upload_chunk_size_mb`` from anthias.conf, or ''.
+
+    Refuses anything that is not a plain file, and undecodable content:
+    a FIFO here blocks the import forever and the container never
+    starts. Same guards as ``get_configured_time_zone`` above.
+    """
+    if config_file is None:
+        home = getenv('HOME')
+        if not home:
+            return ''
+        config_file = str(Path(home) / CONFIG_DIR / CONFIG_FILE)
+    try:
+        if not Path(config_file).is_file():
+            return ''
+        parser = configparser.ConfigParser()
+        parser.read(config_file)
+        return parser.get('main', 'upload_chunk_size_mb', fallback='').strip()
+    except (configparser.Error, OSError, UnicodeDecodeError):
+        return ''
+
+
+def resolve_upload_chunk_size_mb() -> int:
+    """Effective upload chunk size in MB, clamped to [MIN, MAX].
+
+    anthias.conf first — the rung that survives an upgrade, since
+    docker-compose.yml is regenerated from its template every run —
+    then ANTHIAS_UPLOAD_CHUNK_SIZE_MB, which is how a balena dashboard
+    variable arrives. Resolved once at import; there is no Settings
+    field for it, so changing it already means a restart.
+
+    Read as a decimal and rounded down, because MB is decimal and an
+    operator writing 8.5 to fit a 10 MB cap must not be handed 16.
+    Nothing here may raise: on a headless device a bad value would mean
+    a container that never starts, with no shell to find out why.
+    """
+    raw = get_configured_upload_chunk_size_mb()
+    if not raw:
+        raw = (getenv('ANTHIAS_UPLOAD_CHUNK_SIZE_MB') or '').strip()
+    if not raw:
+        return UPLOAD_CHUNK_SIZE_MB_DEFAULT
+
+    logger = logging.getLogger(__name__)
+    try:
+        # float() then floor: one except covers a stray unit, nan, and
+        # the thousand-digit integer that overflows on the way down.
+        parsed = math.floor(float(raw))
+    except (ValueError, OverflowError):
+        logger.warning(
+            'Ignoring unparseable upload chunk size %r; using %d MB.',
+            raw,
+            UPLOAD_CHUNK_SIZE_MB_DEFAULT,
+        )
+        return UPLOAD_CHUNK_SIZE_MB_DEFAULT
+
+    clamped = max(
+        UPLOAD_CHUNK_SIZE_MB_MIN, min(parsed, UPLOAD_CHUNK_SIZE_MB_MAX)
+    )
+    if clamped != parsed:
+        # Reported as written, not as parsed: 0.5 logged as "0 is
+        # outside [1, 24]" sends the operator hunting for a zero.
+        logger.warning(
+            'Upload chunk size %r is outside [%d, %d]; using %d MB.',
+            raw,
+            UPLOAD_CHUNK_SIZE_MB_MIN,
+            UPLOAD_CHUNK_SIZE_MB_MAX,
+            clamped,
+        )
+    return clamped
+
+
+UPLOAD_CHUNK_SIZE_MB = resolve_upload_chunk_size_mb()
+
 
 # Host suffixes an installed app's launch URL / manifest may live on.
 # The catalog is fetched client-side, so the create endpoint can't

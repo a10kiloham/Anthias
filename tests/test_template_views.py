@@ -10,7 +10,9 @@ accumulate coverage. These tests do.
 
 from __future__ import annotations
 
+import uuid
 from datetime import time, timedelta
+from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
@@ -20,6 +22,7 @@ from django.urls import reverse
 from django.utils import timezone
 
 from anthias_common import storage_health
+from anthias_common.utils import STAGED_UPLOAD_DIR
 from anthias_server.app import page_context
 from anthias_server.app.models import DURATION_S_MAX, Asset
 from anthias_server.app.templatetags.asset_filters import to_json
@@ -75,6 +78,23 @@ def test_home_exposes_apps_tab_and_store_index(client: Client) -> None:
     assert dj_settings.APP_STORE_INDEX_URL in body
     assert 'id="tab-apps"' in body
     assert 'appsTab()' in body
+
+
+@pytest.mark.django_db
+def test_home_exposes_the_upload_chunk_size(client: Client) -> None:
+    """The one link carrying the configured chunk size to the browser:
+    settings -> helpers.template -> base.html -> the <meta> tag
+    chunkSizeFromMeta reads. Without it the tag renders empty and every
+    device falls back to the browser's own default, ignoring whatever
+    the operator set."""
+    from django.conf import settings as dj_settings
+
+    body = client.get(reverse('anthias_app:home')).content.decode()
+
+    assert (
+        f'<meta name="anthias-upload-chunk-mb" '
+        f'content="{dj_settings.UPLOAD_CHUNK_SIZE_MB}">'
+    ) in body
 
 
 @pytest.mark.django_db
@@ -2815,6 +2835,571 @@ def test_assets_upload_disk_full_during_write_cleans_up_partial(
 
 
 @pytest.mark.django_db
+def test_assets_upload_chunked_round_trip_is_byte_exact(
+    client: Client, tmp_path: Any
+) -> None:
+    """Three chunks must reassemble into exactly the bytes sent.
+
+    A wrong range fails silently rather than loudly: the view
+    truncates to the declared total, so an off-by-one produces an
+    asset of the right length that will not play."""
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    from anthias_server.settings import settings as anthias_settings
+
+    payload = bytes(range(256)) * 12
+    chunk = len(payload) // 3
+    bounds = [
+        (0, chunk - 1),
+        (chunk, 2 * chunk - 1),
+        (2 * chunk, len(payload) - 1),
+    ]
+
+    upload_id = None
+    with (
+        mock.patch.dict(anthias_settings, {'assetdir': str(tmp_path)}),
+        # The commit creates a video asset, and the view dispatches
+        # normalisation for real — which reaches for the Celery result
+        # backend. Mocked like every other video-upload test here so
+        # the documented no-Redis host run stays green.
+        mock.patch('anthias_server.celery_tasks.normalize_video_asset.delay'),
+    ):
+        for start, end in bounds:
+            headers = {
+                'HX-Request': 'true',
+                'Content-Range': f'bytes {start}-{end}/{len(payload)}',
+            }
+            if upload_id:
+                headers['X-Upload-Id'] = upload_id
+            response = client.post(
+                reverse('anthias_app:assets_upload'),
+                data={
+                    'file_upload': SimpleUploadedFile(
+                        'clip.mp4',
+                        payload[start : end + 1],
+                        content_type='video/mp4',
+                    ),
+                },
+                headers=headers,
+            )
+            assert response.status_code == 200
+            if (start, end) != bounds[-1]:
+                upload_id = response.json()['upload_id']
+
+        assert Asset.objects.count() == 1
+        asset = Asset.objects.get()
+        assert asset.uri is not None
+        with open(asset.uri, 'rb') as f:
+            assert f.read() == payload
+        # The staging directory must not keep the partial around.
+        staged = tmp_path / STAGED_UPLOAD_DIR
+        assert not list(staged.glob('*.part'))
+
+
+@pytest.mark.django_db
+def test_assets_upload_chunk_disk_full_is_reported_not_raised(
+    client: Client, tmp_path: Any
+) -> None:
+    """ENOSPC while staging must surface as 507 with the partial
+    removed, not escape as a 500. Chunked uploads are by definition the
+    large ones, so this is the path most likely to fill a card."""
+    import errno
+
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    from anthias_server.settings import settings as anthias_settings
+
+    with (
+        mock.patch.dict(anthias_settings, {'assetdir': str(tmp_path)}),
+        mock.patch(
+            'anthias_server.app.views.os.open',
+            side_effect=OSError(errno.ENOSPC, 'No space left on device'),
+        ),
+    ):
+        response = client.post(
+            reverse('anthias_app:assets_upload'),
+            data={
+                'file_upload': SimpleUploadedFile(
+                    'clip.mp4', b'01234', content_type='video/mp4'
+                ),
+            },
+            headers={
+                'HX-Request': 'true',
+                'Content-Range': 'bytes 0-4/10',
+            },
+        )
+
+    assert response.status_code == 507
+    assert Asset.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_assets_upload_single_shot_ignores_a_stray_upload_id(
+    client: Client, tmp_path: Any
+) -> None:
+    """Without Content-Range the original path must run untouched, even
+    if a client sends an id: honouring one there would let a plain
+    upload truncate an unrelated staged file."""
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    from anthias_server.settings import settings as anthias_settings
+
+    with mock.patch.dict(anthias_settings, {'assetdir': str(tmp_path)}):
+        response = client.post(
+            reverse('anthias_app:assets_upload'),
+            data={
+                'file_upload': SimpleUploadedFile(
+                    'photo.png', b'\x89PNG\r\n', content_type='image/png'
+                ),
+            },
+            headers={'HX-Request': 'true', 'X-Upload-Id': 'a' * 32},
+        )
+
+    assert response.status_code == 200
+    assert Asset.objects.count() == 1
+    assert not (tmp_path / STAGED_UPLOAD_DIR).exists()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'upload_id',
+    ['../../etc/passwd', 'a' * 31, 'a' * 33, '', 'g' * 32, 'a/b'],
+)
+def test_assets_upload_rejects_a_malformed_upload_id(
+    client: Client, tmp_path: Any, upload_id: str
+) -> None:
+    """The id lands in a filesystem path, so anything but the exact
+    shape we mint is refused."""
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    from anthias_server.settings import settings as anthias_settings
+
+    with mock.patch.dict(anthias_settings, {'assetdir': str(tmp_path)}):
+        response = client.post(
+            reverse('anthias_app:assets_upload'),
+            data={
+                'file_upload': SimpleUploadedFile(
+                    'clip.mp4', b'01234', content_type='video/mp4'
+                ),
+            },
+            headers={
+                'HX-Request': 'true',
+                'Content-Range': 'bytes 0-4/10',
+                'X-Upload-Id': upload_id,
+            },
+        )
+
+    assert response.status_code == 400
+    assert Asset.objects.count() == 0
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'content_range',
+    [
+        'bytes */100',
+        'bytes 5-1/10',
+        'bytes 0-10/10',
+        'bytes 0-9/5',
+        'bytes 0-0/0',
+        'bytes 0-4/' + '9' * 5000,
+        'nonsense',
+    ],
+)
+def test_assets_upload_rejects_a_malformed_range(
+    client: Client, tmp_path: Any, content_range: str
+) -> None:
+    """A client-controlled header must never reach a 500. The long
+    total is the case that used to: int() raises above 4300 digits."""
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    from anthias_server.settings import settings as anthias_settings
+
+    with mock.patch.dict(anthias_settings, {'assetdir': str(tmp_path)}):
+        response = client.post(
+            reverse('anthias_app:assets_upload'),
+            data={
+                'file_upload': SimpleUploadedFile(
+                    'clip.mp4', b'01234', content_type='video/mp4'
+                ),
+            },
+            headers={
+                'HX-Request': 'true',
+                'Content-Range': content_range,
+            },
+        )
+
+    assert response.status_code == 400
+    assert Asset.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_assets_upload_chunk_past_the_end_drops_the_partial(
+    client: Client, tmp_path: Any
+) -> None:
+    """A gap cannot be told from a resumed upload whose partial has
+    gone, and writing it would leave a hole reading back as zeros. The
+    upload is abandoned rather than silently corrupted."""
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    from anthias_server.settings import settings as anthias_settings
+
+    with mock.patch.dict(anthias_settings, {'assetdir': str(tmp_path)}):
+        first = client.post(
+            reverse('anthias_app:assets_upload'),
+            data={
+                'file_upload': SimpleUploadedFile(
+                    'clip.mp4', b'0' * 10, content_type='video/mp4'
+                ),
+            },
+            headers={
+                'HX-Request': 'true',
+                'Content-Range': 'bytes 0-9/100',
+            },
+        )
+        upload_id = first.json()['upload_id']
+
+        gapped = client.post(
+            reverse('anthias_app:assets_upload'),
+            data={
+                'file_upload': SimpleUploadedFile(
+                    'clip.mp4', b'1' * 10, content_type='video/mp4'
+                ),
+            },
+            headers={
+                'HX-Request': 'true',
+                'Content-Range': 'bytes 50-59/100',
+                'X-Upload-Id': upload_id,
+            },
+        )
+
+        assert gapped.status_code == 409
+        # One way to land here is a commit whose response was lost and
+        # whose asset therefore exists, so the message must not say
+        # "upload it again" without qualification.
+        assert 'asset list' in gapped.json()['error']
+        assert Asset.objects.count() == 0
+        assert not list((tmp_path / STAGED_UPLOAD_DIR).glob('*.part'))
+
+
+@pytest.mark.django_db
+def test_assets_upload_drops_the_partial_when_a_chunk_is_rejected(
+    client: Client, tmp_path: Any
+) -> None:
+    """A rejection abandons the upload, so the bytes already staged are
+    dead weight on the card until the hourly sweep. The client starts
+    over under a fresh id and never asks for them again."""
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    from anthias_server.settings import settings as anthias_settings
+
+    upload_id = uuid.uuid4().hex
+    with mock.patch.dict(anthias_settings, {'assetdir': str(tmp_path)}):
+        staged = client.post(
+            reverse('anthias_app:assets_upload'),
+            data={
+                'file_upload': SimpleUploadedFile(
+                    'clip.mp4', b'0' * 10, content_type='video/mp4'
+                ),
+            },
+            headers={
+                'HX-Request': 'true',
+                'Content-Range': 'bytes 0-9/100',
+                'X-Upload-Id': upload_id,
+            },
+        )
+        assert staged.status_code == 200
+        assert list((tmp_path / STAGED_UPLOAD_DIR).glob('*.part'))
+
+        # Rejected before a single byte of it is written, and before
+        # the range is even parsed.
+        rejected = client.post(
+            reverse('anthias_app:assets_upload'),
+            data={
+                'file_upload': SimpleUploadedFile(
+                    'clip.mp4', b'1' * 10, content_type='video/mp4'
+                ),
+            },
+            headers={
+                'HX-Request': 'true',
+                'Content-Range': 'bytes not-a-range/100',
+                'X-Upload-Id': upload_id,
+            },
+        )
+
+        assert rejected.status_code == 400
+        assert not list((tmp_path / STAGED_UPLOAD_DIR).glob('*.part'))
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('ext', ['.tmp', '.part'])
+def test_assets_upload_never_stores_an_asset_under_a_reserved_ext(
+    client: Client, tmp_path: Any, ext: str
+) -> None:
+    """An asset stored as `<uuid>.tmp` deletes itself: the celery sweep
+    removes `*.tmp` from the asset dir after an hour and the row is
+    left pointing at nothing. `<uuid>.part` survives but is dropped
+    from every backup by _exclude_from_backup.
+
+    A browser cannot reach this — it sends application/octet-stream for
+    an unknown extension, which the type gate rejects — but a crafted
+    multipart part naming `video/tmp` passes, and did produce exactly
+    that before the extension was refused."""
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    from anthias_server.settings import settings as anthias_settings
+
+    with (
+        mock.patch.dict(anthias_settings, {'assetdir': str(tmp_path)}),
+        mock.patch('anthias_server.celery_tasks.normalize_video_asset.delay'),
+    ):
+        client.post(
+            reverse('anthias_app:assets_upload'),
+            data={
+                'file_upload': SimpleUploadedFile(
+                    f'clip{ext}',
+                    b'\x00fake',
+                    content_type=f'video/{ext.lstrip(".")}',
+                ),
+            },
+            headers={'HX-Request': 'true'},
+        )
+
+    asset = Asset.objects.get()
+    assert asset.uri is not None
+    assert not asset.uri.endswith(ext)
+
+
+@pytest.mark.django_db
+def test_assets_upload_checks_free_space_on_every_chunk(
+    client: Client, tmp_path: Any
+) -> None:
+    """`total_bytes` is re-read from each request and never pinned, so
+    a declared total that grows after the first chunk would never be
+    measured against the disk if the check ran only at byte 0 — the
+    refusal would read as a property of the upload while being a
+    property of its first request."""
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    from anthias_server.settings import settings as anthias_settings
+
+    upload_id = uuid.uuid4().hex
+
+    def post(body: bytes, content_range: str) -> Any:
+        return client.post(
+            reverse('anthias_app:assets_upload'),
+            data={
+                'file_upload': SimpleUploadedFile(
+                    'clip.mp4', body, content_type='video/mp4'
+                ),
+            },
+            headers={
+                'HX-Request': 'true',
+                'Content-Range': content_range,
+                'X-Upload-Id': upload_id,
+            },
+        )
+
+    with (
+        mock.patch.dict(anthias_settings, {'assetdir': str(tmp_path)}),
+        mock.patch(
+            'anthias_server.app.views.shutil.disk_usage',
+            return_value=SimpleNamespace(total=0, used=0, free=100),
+        ),
+    ):
+        # Declares 50 against 100 free, so it passes.
+        assert post(b'0' * 10, 'bytes 0-9/50').status_code == 200
+        # Then grows its claim to 300. 290 still to come, 100 free.
+        assert post(b'1' * 290, 'bytes 10-299/300').status_code == 507
+
+    assert Asset.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_assets_upload_rejects_a_chunk_that_lies_about_its_length(
+    client: Client, tmp_path: Any
+) -> None:
+    """A body shorter or longer than its declared range would be
+    written at the wrong offset, leaving the asset misaligned at
+    exactly the right size."""
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    from anthias_server.settings import settings as anthias_settings
+
+    with mock.patch.dict(anthias_settings, {'assetdir': str(tmp_path)}):
+        response = client.post(
+            reverse('anthias_app:assets_upload'),
+            data={
+                'file_upload': SimpleUploadedFile(
+                    'clip.mp4', b'0123456789', content_type='video/mp4'
+                ),
+            },
+            headers={
+                'HX-Request': 'true',
+                'Content-Range': 'bytes 0-4/20',
+            },
+        )
+
+    assert response.status_code == 400
+    assert Asset.objects.count() == 0
+    assert not list((tmp_path / STAGED_UPLOAD_DIR).glob('*.part'))
+
+
+@pytest.mark.django_db
+def test_assets_upload_proceeds_when_free_space_is_unknowable(
+    client: Client, tmp_path: Any
+) -> None:
+    """If the filesystem will not say how much room is left, take the
+    upload rather than refuse it: a working upload matters more than a
+    check that cannot run."""
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    from anthias_server.settings import settings as anthias_settings
+
+    with (
+        mock.patch.dict(anthias_settings, {'assetdir': str(tmp_path)}),
+        mock.patch(
+            'anthias_server.app.views.shutil.disk_usage',
+            side_effect=OSError('cannot stat'),
+        ),
+    ):
+        response = client.post(
+            reverse('anthias_app:assets_upload'),
+            data={
+                'file_upload': SimpleUploadedFile(
+                    'clip.mp4', b'01234', content_type='video/mp4'
+                ),
+            },
+            headers={
+                'HX-Request': 'true',
+                'Content-Range': 'bytes 0-4/10',
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()['upload_id']
+
+
+@pytest.mark.django_db
+def test_assets_upload_does_not_mistake_any_oserror_for_a_full_disk(
+    client: Client, tmp_path: Any
+) -> None:
+    """Only ENOSPC becomes the disk-full answer. Anything else is a
+    real fault and must surface rather than be reported to the
+    operator as something they can fix by freeing space."""
+    import errno
+
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    from anthias_server.settings import settings as anthias_settings
+
+    with (
+        mock.patch.dict(anthias_settings, {'assetdir': str(tmp_path)}),
+        mock.patch(
+            'anthias_server.app.views.os.open',
+            side_effect=OSError(errno.EACCES, 'Permission denied'),
+        ),
+        pytest.raises(OSError),
+    ):
+        client.post(
+            reverse('anthias_app:assets_upload'),
+            data={
+                'file_upload': SimpleUploadedFile(
+                    'clip.mp4', b'01234', content_type='video/mp4'
+                ),
+            },
+            headers={
+                'HX-Request': 'true',
+                'Content-Range': 'bytes 0-4/10',
+            },
+        )
+
+    assert Asset.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_assets_upload_refuses_a_file_larger_than_free_space(
+    client: Client, tmp_path: Any
+) -> None:
+    """Checked before any bytes are written: the alternative is an
+    hour of uploading followed by failure."""
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    from anthias_server.settings import settings as anthias_settings
+
+    usage = mock.Mock(free=10)
+    with (
+        mock.patch.dict(anthias_settings, {'assetdir': str(tmp_path)}),
+        mock.patch(
+            'anthias_server.app.views.shutil.disk_usage', return_value=usage
+        ),
+    ):
+        response = client.post(
+            reverse('anthias_app:assets_upload'),
+            data={
+                'file_upload': SimpleUploadedFile(
+                    'clip.mp4', b'01234', content_type='video/mp4'
+                ),
+            },
+            headers={
+                'HX-Request': 'true',
+                'Content-Range': 'bytes 0-4/1000',
+            },
+        )
+
+    assert response.status_code == 507
+    assert Asset.objects.count() == 0
+    assert not list((tmp_path / STAGED_UPLOAD_DIR).glob('*.part'))
+
+
+@pytest.mark.django_db
+def test_assets_upload_final_chunk_truncates_a_longer_earlier_attempt(
+    client: Client, tmp_path: Any
+) -> None:
+    """A partial longer than the file being committed must not leave
+    its tail on the end of the asset.
+
+    The staged file is whatever an earlier attempt under this id left
+    behind — abandoned, swept late, or simply longer. Every request
+    here declares the same total for the file it is actually sending:
+    the server does not compare a chunk's total against what earlier
+    chunks declared, and nothing should come to depend on that."""
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    from anthias_server.settings import settings as anthias_settings
+
+    upload_id = uuid.uuid4().hex
+    staged = tmp_path / STAGED_UPLOAD_DIR
+    staged.mkdir()
+    (staged / f'{upload_id}.part').write_bytes(b'0' * 40)
+
+    with (
+        mock.patch.dict(anthias_settings, {'assetdir': str(tmp_path)}),
+        # See the round-trip test: the commit dispatches video
+        # normalisation, which needs the Celery result backend.
+        mock.patch('anthias_server.celery_tasks.normalize_video_asset.delay'),
+    ):
+        client.post(
+            reverse('anthias_app:assets_upload'),
+            data={
+                'file_upload': SimpleUploadedFile(
+                    'clip.mp4', b'1' * 10, content_type='video/mp4'
+                ),
+            },
+            headers={
+                'HX-Request': 'true',
+                'Content-Range': 'bytes 0-9/10',
+                'X-Upload-Id': upload_id,
+            },
+        )
+
+        asset = Asset.objects.get()
+        assert asset.uri is not None
+        with open(asset.uri, 'rb') as f:
+            assert f.read() == b'1' * 10
+
+
+@pytest.mark.django_db
 def test_settings_recover_invalid_archive_warns_not_error(
     client: Client,
 ) -> None:
@@ -3280,6 +3865,20 @@ def test_schedule_pills_everyday_short_circuit(asset: Asset) -> None:
 # get_device_model_parts — (primary, secondary) for the two-line card
 
 
+@pytest.fixture
+def no_device_tree(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the device-tree read to "no board name".
+
+    ``get_device_model_parts`` consults the device tree before DMI, so
+    without this the x86 branches below would short-circuit whenever
+    the suite runs on a host that has a tree (any SBC dev box, and the
+    arm64 CI runner).
+    """
+    from anthias_common import device_helper
+
+    monkeypatch.setattr(device_helper, 'read_device_tree_model', lambda: '')
+
+
 def test_device_model_parts_pi(monkeypatch: pytest.MonkeyPatch) -> None:
     from anthias_common import device_helper
 
@@ -3300,6 +3899,7 @@ def test_device_model_parts_pi(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_device_model_parts_x86_with_dmi(
     monkeypatch: pytest.MonkeyPatch,
+    no_device_tree: None,
 ) -> None:
     from anthias_common import device_helper
 
@@ -3331,6 +3931,7 @@ def test_device_model_parts_x86_with_dmi(
 
 def test_device_model_parts_x86_drops_redundant_vendor(
     monkeypatch: pytest.MonkeyPatch,
+    no_device_tree: None,
 ) -> None:
     """Reference / whitebox boards set sys_vendor to the CPU maker
     ('Intel Corporation' next to an 'Intel Celeron' CPU). The stuttering
@@ -3363,6 +3964,7 @@ def test_device_model_parts_x86_drops_redundant_vendor(
 
 def test_device_model_parts_x86_keeps_branded_vendor(
     monkeypatch: pytest.MonkeyPatch,
+    no_device_tree: None,
 ) -> None:
     """A branded OEM vendor that differs from the CPU maker is kept, but
     its corporate suffix ('Inc.') is trimmed."""
@@ -3393,6 +3995,7 @@ def test_device_model_parts_x86_keeps_branded_vendor(
 
 def test_device_model_parts_drops_virt_chassis(
     monkeypatch: pytest.MonkeyPatch,
+    no_device_tree: None,
 ) -> None:
     from anthias_common import device_helper
 
@@ -3423,6 +4026,7 @@ def test_device_model_parts_drops_virt_chassis(
 
 def test_device_model_parts_generic_fallback(
     monkeypatch: pytest.MonkeyPatch,
+    no_device_tree: None,
 ) -> None:
     from anthias_common import device_helper
 
@@ -3689,6 +4293,25 @@ def test_no_bootstrap_class_names_in_templates() -> None:
         'container-fluid',
         'col-12',
         'col-md-6',
+        # Bootstrap text utilities whose Tailwind spellings differ, so
+        # they style to nothing and read as working code. `text-capitalize`
+        # sat in _asset_modal.html for exactly that reason; Tailwind
+        # spells it `capitalize`.
+        'text-capitalize',
+        'text-lowercase',
+        'text-uppercase',
+        'text-nowrap',
+        'text-truncate',
+        'text-start',
+        'font-weight-bold',
+        'font-weight-normal',
+        'align-items-center',
+        'justify-content-between',
+        'justify-content-center',
+        'justify-content-end',
+        'flex-column',
+        'flex-row',
+        'sr-only-focusable',
     }
     # Prefix-match tokens — anything starting with these is forbidden.
     # Catches `bi-archive`, `bi-collection-play` etc. without enumerating
@@ -3725,6 +4348,124 @@ def test_no_bootstrap_class_names_in_templates() -> None:
         'Bootstrap-shaped class names reintroduced — components live '
         'under .app-* now, and Bootstrap Icons were replaced by Tabler '
         '(.ti / .ti-*):\n  ' + '\n  '.join(seen)
+    )
+
+
+def test_every_app_class_in_templates_is_styled() -> None:
+    """An .app-* class in a template must exist in the stylesheet.
+
+    The same failure mode as the text-capitalize case above, one step
+    further in: the name is right for our own namespace, so it reads as
+    a working component, but nothing defines it and the element renders
+    unstyled. `app-btn-secondary` sat in _asset_modal.html at two call
+    sites doing nothing, and was only noticed when the design page tried
+    to draw it.
+
+    Covers Alpine's `:class` / `x-bind:class` as well as the plain
+    attribute. Those are the easier ones to get wrong, because the value
+    is a JS expression rather than a class list, and this guard used to
+    read straight past them: a bare `class="…"` pattern matches inside
+    `:class="…"` too, so the bindings looked covered while every name in
+    them sat inside a string literal that no token scan would reach.
+
+    Scoped to the .app-* namespace on purpose. Utility classes come from
+    Tailwind and are generated on demand, so they cannot be checked
+    against a static list.
+    """
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    scss = (
+        root / 'src/anthias_server/app/static/sass/_styles.scss'
+    ).read_text()
+
+    # Resolve `&` against the enclosing selector, because most component
+    # children are written nested: `.app-card { &__name { … } }` defines
+    # .app-card__name, which a literal search would never see.
+    defined: set[str] = set()
+    stack: list[list[str]] = []
+    class_re = re.compile(r'\.(app-[a-z0-9_-]+)')
+
+    def resolve(selector: str, parents: list[str]) -> list[str]:
+        out = []
+        for part in (p.strip() for p in selector.split(',')):
+            if not part or part.startswith('@'):
+                continue
+            out += (
+                [part.replace('&', p) for p in parents]
+                if '&' in part
+                else [part]
+            )
+        return out
+
+    # Brace-driven rather than line-driven: `.app-input,` on its own
+    # line, opening a selector list that closes three lines later, is
+    # the common shape here and a line-by-line scan misses all of it.
+    stripped = re.sub(r'/\*.*?\*/', ' ', scss, flags=re.DOTALL)
+    stripped = re.sub(r'//[^\n]*', ' ', stripped)
+    buf = ''
+    for char in stripped:
+        if char == '{':
+            parents = stack[-1] if stack else ['']
+            resolved = resolve(buf, parents)
+            for sel in resolved:
+                defined.update(class_re.findall(sel))
+            stack.append(resolved or parents)
+            buf = ''
+        elif char == '}':
+            if stack:
+                stack.pop()
+            buf = ''
+        elif char == ';':
+            buf = ''
+        else:
+            buf += char
+
+    django_tag_re = re.compile(r'\{%[^%]*%\}|\{\{[^}]*\}\}')
+    # Group 1 is what separates a bound attribute from a plain one, and
+    # it has to be captured rather than assumed: `class="…"` on its own
+    # also matches inside `:class="…"`, which is why the bindings read
+    # as covered when nothing in them was ever checked.
+    class_attr_re = re.compile(r'(:|x-bind:)?class="([^"]+)"')
+    # In a binding the value is an expression, so the class names live
+    # in its string and template literals. Double quotes cannot appear:
+    # they would close the attribute.
+    literal_re = re.compile(r"'([^']*)'|`([^`]*)`")
+    templates = root / 'src/anthias_server/app/templates'
+
+    def candidates(value: str, bound: bool) -> list[str]:
+        """Every class name an attribute value can put on an element."""
+        if not bound:
+            return django_tag_re.sub(' ', value).split()
+        return [
+            token
+            for literal in literal_re.finditer(value)
+            for token in (literal[1] or literal[2] or '').split()
+        ]
+
+    missing: list[str] = []
+    for path in sorted(templates.rglob('*.html')):
+        for attr in class_attr_re.finditer(path.read_text()):
+            for tok in candidates(attr[2], bound=bool(attr[1])):
+                if not tok.startswith('app-'):
+                    continue
+                # An interpolated name like `app-toast--${t.kind}` has
+                # no single value to look up, so its static prefix is
+                # held to the weaker bar that something defines it. That
+                # still fails if the whole .app-toast--* family is
+                # renamed or dropped, which is the failure worth having.
+                stem = tok.split('${')[0]
+                styled = (
+                    tok in defined
+                    if stem == tok
+                    else any(name.startswith(stem) for name in defined)
+                )
+                if not styled:
+                    missing.append(f'{path.name}: {tok}')
+    assert not missing, (
+        'Templates use .app-* classes that _styles.scss never defines, '
+        'so these elements render unstyled:\n  ' + '\n  '.join(missing)
     )
 
 
@@ -4641,3 +5382,76 @@ def test_system_info_storage_card_exposes_the_evidence(
     assert 'ext4_find_entry' in body
     assert 'SanDisk SC32G' in body
     assert 'survives reboots' in body
+
+
+# ---------------------------------------------------------------------------
+# Auth changes reap open /ws sockets (Copilot review on PR 3324).
+#
+# AssetConsumer decides authorization at handshake time, so a socket
+# opened before an auth change would otherwise keep streaming under the
+# old rules. The settings-save paths close them; these pin that the
+# HTML surface does, and that it stays quiet on an unrelated save.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_settings_save_drops_sockets_when_auth_is_enabled(
+    client: Client, _isolated_settings_conf: Any
+) -> None:
+    with (
+        mock.patch(
+            'anthias_server.settings.ViewerPublisher.send_to_viewer',
+            return_value=None,
+        ),
+        mock.patch(
+            'anthias_server.app.consumers.disconnect_all'
+        ) as disconnect,
+    ):
+        response = client.post(
+            reverse('anthias_app:settings_save'),
+            data={
+                'player_name': 'Test Player',
+                'default_duration': '15',
+                'default_streaming_duration': '300',
+                'audio_output': 'hdmi',
+                'date_format': 'mm/dd/yyyy',
+                'auth_backend': 'auth_basic',
+                'user': 'operator',
+                'password': 'a-str0ng-QA-passphrase',
+                'password_2': 'a-str0ng-QA-passphrase',
+            },
+        )
+
+    assert response.status_code in (200, 302)
+    disconnect.assert_called_once()
+
+
+@pytest.mark.django_db
+def test_settings_save_leaves_sockets_alone_when_auth_is_unchanged(
+    client: Client, _isolated_settings_conf: Any
+) -> None:
+    """The form POSTs the whole page, so an unrelated save (a player
+    rename) must not bounce every operator's dashboard socket."""
+    with (
+        mock.patch(
+            'anthias_server.settings.ViewerPublisher.send_to_viewer',
+            return_value=None,
+        ),
+        mock.patch(
+            'anthias_server.app.consumers.disconnect_all'
+        ) as disconnect,
+    ):
+        response = client.post(
+            reverse('anthias_app:settings_save'),
+            data={
+                'player_name': 'Renamed Player',
+                'default_duration': '15',
+                'default_streaming_duration': '300',
+                'audio_output': 'hdmi',
+                'date_format': 'mm/dd/yyyy',
+                'auth_backend': '',
+            },
+        )
+
+    assert response.status_code in (200, 302)
+    disconnect.assert_not_called()

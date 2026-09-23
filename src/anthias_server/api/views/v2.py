@@ -21,7 +21,12 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from anthias_common import device_helper, storage_health, undervoltage
+from anthias_common import (
+    board,
+    device_helper,
+    storage_health,
+    undervoltage,
+)
 from anthias_common.internal_auth import is_internal_request
 from anthias_common.utils import (
     clamp_screen_rotation,
@@ -691,7 +696,7 @@ class DeviceSettingsViewV2(APIView):
             auth_backend = data.get('auth_backend', settings['auth_backend'])
             prev_auth_backend = settings['auth_backend']
 
-            apply_auth_settings(
+            auth_changed = apply_auth_settings(
                 request,
                 new_auth_backend=auth_backend,
                 current_pwd=current_password,
@@ -752,6 +757,12 @@ class DeviceSettingsViewV2(APIView):
             settings.save()
             publisher = ViewerPublisher.get_instance()
             publisher.send_to_viewer('reload')
+            # After save(), so a socket that reconnects immediately is
+            # judged against the new auth_backend rather than the old one.
+            if auth_changed:
+                from anthias_server.app.consumers import disconnect_all
+
+                disconnect_all()
 
             return Response({'message': 'Settings were successfully saved.'})
         except AuthSettingsError as exc:
@@ -897,6 +908,16 @@ class InfoViewV2(InfoViewMixin):
 
         if device_model is None and machine() == 'x86_64':
             device_model = 'Generic x86_64 Device'
+
+        if device_model is None:
+            # Non-Pi SBCs write no cpuinfo Model line, so this field was
+            # null on every one of them. The device tree names the
+            # board; board.get_device_model reads it via the
+            # host_agent's Redis key because this container can't open
+            # the tree itself. Pi and x86 keep the exact strings they
+            # already returned — this only fills in a field that was
+            # null before.
+            device_model = board.get_device_model() or None
 
         return device_model
 
