@@ -28,6 +28,12 @@ REPO_ROOT = os.path.abspath(
 # (no balena deployment path), so only the device compose file remains.
 TEMPLATES = ('docker-compose.yml.tmpl',)
 
+# Docker Compose takes `core: 0` as written, so that is the expected
+# value everywhere. (Upstream's balena templates need `core: 1` because
+# balena's compose parser deletes zero-valued ulimit fields, but those
+# templates don't exist in this fork.)
+EXPECTED_CORE_LIMIT = dict.fromkeys(TEMPLATES, 0)
+
 
 Service = dict[str, object]
 
@@ -45,7 +51,7 @@ def test_every_service_disables_core_dumps(template: str) -> None:
         name: service.get('ulimits')
         for name, service in _services(template).items()
         if not isinstance(limits := service.get('ulimits'), dict)
-        or limits.get('core') != 0
+        or limits.get('core') != EXPECTED_CORE_LIMIT[template]
     }
 
     assert not offenders, (
@@ -59,7 +65,7 @@ def test_every_service_disables_core_dumps(template: str) -> None:
 def test_core_limit_is_shared_rather_than_retyped(template: str) -> None:
     """One anchor, aliased everywhere else.
 
-    Five copies of `core: 0` would drift the moment someone edits one of
+    Five copies of the core limit would drift the moment someone edits one of
     them, and the YAML alias is what makes "every service" checkable by
     reading a single line.
     """
@@ -75,7 +81,7 @@ def test_core_limit_is_shared_rather_than_retyped(template: str) -> None:
 
 
 def test_templates_agree_on_which_services_exist() -> None:
-    """The balena templates are easy to update in isolation and forget.
+    """Compose templates are easy to update in isolation and forget.
 
     If they ever diverge, the parametrised checks above still pass on
     each file separately while one deployment quietly loses a service's

@@ -242,12 +242,28 @@ class Scheduler:
             # refresh shouldn't disturb the current play-through.
             return
 
+        # ``self.index`` points at the slot due to play *next*. Remember
+        # which one that is before the list is swapped so the cursor can
+        # be re-anchored by identity below. The occurrence id names the
+        # exact slot (the same asset can hold several slots in the
+        # expanded playlist tree); the asset id is the fallback for a
+        # rebuild that re-minted occurrence ids for the same content.
+        next_up = (
+            self.assets[self.index] if self.index < len(self.assets) else None
+        )
+        next_occurrence_id = (
+            next_up.get('occurrence_id') if next_up is not None else None
+        )
+        next_asset_id = (
+            next_up.get('asset_id') if next_up is not None else None
+        )
+
         self.assets, self.deadline = new_assets, new_deadline
         self.counter = 0
         # Try to keep the same position in the play list. E.g., if a new asset
         # is added to the end of the list, we don't want to start over from
         # the beginning.
-        self.index = self.index % len(self.assets) if self.assets else 0
+        self.index = self._reanchor_index(next_occurrence_id, next_asset_id)
         logger.debug(
             'update_playlist done, count %s, counter %s, index %s, deadline %s',
             len(self.assets),
@@ -281,6 +297,41 @@ class Scheduler:
             if new_members.get(playlist_id) != self._members.get(playlist_id):
                 del self._played[playlist_id]
         self._members = new_members
+
+    def _reanchor_index(
+        self,
+        next_occurrence_id: str | None,
+        next_asset_id: str | None,
+    ) -> int:
+        """Where the cursor should sit in the freshly-built playlist.
+
+        Follow the slot that was due to play next by identity rather
+        than by numeric position. A bare ``index % len`` is only correct
+        when the list changes *at or after* the cursor; when it shrinks
+        ahead of the cursor the whole tail slides back one slot and the
+        stale index lands past the asset that was up next, silently
+        skipping it. The common way to hit that is removing the asset
+        currently on screen — the operator drops one asset and two come
+        off the rotation.
+
+        The occurrence id pins the exact slot even when the same asset
+        appears several times across the playlist tree; the asset id
+        catches a rebuild that re-minted occurrence ids for unchanged
+        content. Falls back to the historical modulo when the up-next
+        slot is itself gone (or there wasn't one), which still keeps an
+        append at the end of the list from restarting the play-through.
+        """
+        if not self.assets:
+            return 0
+        if next_occurrence_id is not None:
+            for position, asset in enumerate(self.assets):
+                if asset.get('occurrence_id') == next_occurrence_id:
+                    return position
+        if next_asset_id is not None:
+            for position, asset in enumerate(self.assets):
+                if asset.get('asset_id') == next_asset_id:
+                    return position
+        return self.index % len(self.assets)
 
     def get_db_mtime(self) -> float:
         # Newest mtime across the SQLite database and its WAL sidecars.
