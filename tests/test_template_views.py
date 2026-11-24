@@ -3920,15 +3920,27 @@ def test_humanize_duration_unit_buckets() -> None:
 
 
 @pytest.mark.django_db
-def test_schedule_pills_everyday_short_circuit(asset: Asset) -> None:
+def test_schedule_pills_unrestricted_asset_has_none(asset: Asset) -> None:
     from anthias_server.app.templatetags.asset_filters import schedule_pills
 
-    pills = schedule_pills(asset)
-    kinds = {p['kind'] for p in pills}
-    # Default fixture has no day filter and no time window — just the
-    # "Everyday" pill should fire.
-    assert kinds == {'all'}
-    assert pills[0]['label'] == 'Everyday'
+    # Default fixture has no day filter and no time window — the
+    # normal state of nearly every row. No chips: they appear only
+    # where a schedule actually narrows playback.
+    assert schedule_pills(asset) == []
+
+
+def test_weekday_summary_formats() -> None:
+    from anthias_server.app.templatetags.asset_filters import weekday_summary
+
+    assert weekday_summary([]) == 'Every day'
+    assert weekday_summary(list(range(1, 8))) == 'Every day'
+    assert weekday_summary([1, 2, 3, 4, 5]) == 'Mon–Fri'
+    assert weekday_summary([6, 7]) == 'Sat, Sun'
+    assert weekday_summary([1, 3, 5]) == 'Mon, Wed, Fri'
+    assert weekday_summary([1, 2, 3, 5, 6, 7]) == 'Mon–Wed, Fri–Sun'
+    # Junk in, readable default out.
+    assert weekday_summary(None) == 'Every day'
+    assert weekday_summary(['x']) == 'Every day'
 
 
 # ---------------------------------------------------------------------------

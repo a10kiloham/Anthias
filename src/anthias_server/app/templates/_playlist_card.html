@@ -14,7 +14,10 @@
 <section
   class="surface playlist-card {% if node.playlist.is_enabled %}surface--active{% endif %}"
   {% if node.depth %}style="margin-left: {{ node.depth }}rem"{% endif %}
-  x-data="{ open: {% if node.depth == 0 %}true{% else %}false{% endif %}, scheduleOpen: false, addOpen: false, q: '', sel: 0 }"
+  {% comment %} Cards start collapsed; playlistCard() (playlists.ts)
+     remembers which ones the operator expanded so the state survives
+     the 10 s poll's outerHTML swap of the whole tree. {% endcomment %}
+  x-data="playlistCard('{{ node.playlist.playlist_id }}')"
 >
   <header class="surface__header playlist-card__header">
     <button type="button" class="playlist-card__title" @click="open = !open"
@@ -98,8 +101,7 @@
     {% if node.playlist.play_time_from and node.playlist.play_time_to %}
       {{ node.playlist.play_time_from|time:'H:i' }}–{{ node.playlist.play_time_to|time:'H:i' }} ·
     {% endif %}
-    {% for day in node.playlist.get_play_days %}{{ day }}{% if not forloop.last %},{% endif %}{% endfor %}
-    (1=Mon … 7=Sun)
+    {{ node.playlist.get_play_days|weekday_summary }}
   </p>
   {% endif %}
 
@@ -286,12 +288,17 @@
       Empty playlist — use <strong>Add</strong> to put assets in it.
     </p>
     {% endif %}
-
-    {% for entry in node.entries %}
-      {% if entry.child %}
-        {% include "_playlist_card.html" with node=entry.child %}
-      {% endif %}
-    {% endfor %}
   </div>
+
+  {% comment %} Nested playlist cards stay OUTSIDE the x-show region:
+     every playlist lives inside Default (the schedule), so hiding
+     children behind the parent's collapse would make a freshly loaded
+     page show nothing but "Default". Collapsed cards are one-line
+     headers, so the always-on listing stays compact. {% endcomment %}
+  {% for entry in node.entries %}
+    {% if entry.child %}
+      {% include "_playlist_card.html" with node=entry.child %}
+    {% endif %}
+  {% endfor %}
 </section>
 {% endwith %}

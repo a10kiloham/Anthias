@@ -31,7 +31,7 @@
         <p class="schedule-window__primary">{{ window.primary }}</p>
         {% if row.playlist.has_window_filter %}
         <p class="schedule-window__secondary">
-          {% if row.playlist.play_time_from and row.playlist.play_time_to %}{{ row.playlist.play_time_from|time:'H:i' }}–{{ row.playlist.play_time_to|time:'H:i' }} · {% endif %}days {% for day in row.playlist.get_play_days %}{{ day }}{% if not forloop.last %},{% endif %}{% endfor %}
+          {% if row.playlist.play_time_from and row.playlist.play_time_to %}{{ row.playlist.play_time_from|time:'H:i' }}–{{ row.playlist.play_time_to|time:'H:i' }} · {% endif %}{{ row.playlist.get_play_days|weekday_summary }}
         </p>
         {% endif %}
       </div>

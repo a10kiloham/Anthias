@@ -30,15 +30,14 @@ def schedule_pills(asset: Any) -> list[dict[str, str]]:
 
     Each pill is a {kind, label} dict the row template iterates over.
     `kind` is one of:
-      - 'all'  — shorthand "Everyday" pill, emitted only when no
-                 day-of-week filter narrows the schedule.
       - 'day'  — one per active weekday: 'Mon', 'Tue', ...
       - 'time' — the play_time_from/to window, formatted in the
                  device's configured 24h/12h clock.
 
-    The list collapses to a single 'all' pill when the asset has no
-    day filter and no time window — the row then renders a green-ish
-    chip rather than a wall of seven Mon/Tue/Wed pills.
+    An unrestricted asset (full week, all hours) gets NO pills — that
+    is the normal state of nearly every row, and a chip repeated under
+    every name says nothing. Chips appear only where a schedule
+    actually narrows playback, which is what makes them scannable.
     """
     pills: list[dict[str, str]] = []
     days_set: list[int] = []
@@ -53,11 +52,6 @@ def schedule_pills(asset: Any) -> list[dict[str, str]]:
         for d in days_set:
             if 1 <= d <= 7:
                 pills.append({'kind': 'day', 'label': _DAY_LABELS[d - 1]})
-    elif not (pf and pt):
-        # Full-week plays that also play all hours get the catch-all
-        # "Everyday" pill so the row reads "Everyday" instead of
-        # nothing — matches the tooltip we used to show.
-        pills.append({'kind': 'all', 'label': 'Everyday'})
 
     if pf and pt:
         fmt = '%H:%M' if settings['use_24_hour_clock'] else '%I:%M %p'
@@ -71,6 +65,41 @@ def schedule_pills(asset: Any) -> list[dict[str, str]]:
             }
         )
     return pills
+
+
+@register.filter
+def weekday_summary(days: Any) -> str:
+    """Compress a 1–7 weekday list into reader-facing day names.
+
+    [1,2,3,4,5] → 'Mon–Fri'; [1,3,5] → 'Mon, Wed, Fri'; [6,7] →
+    'Sat, Sun'; empty or the full week → 'Every day'. Replaces the
+    raw day numbers plus the '(1=Mon … 7=Sun)' legend the templates
+    used to print — the legend existed only because the numbers were
+    unreadable.  Runs of three or more consecutive days collapse to a
+    'Mon–Fri' range; shorter runs stay comma-separated.
+    """
+    try:
+        selected = sorted({int(d) for d in days if 1 <= int(d) <= 7})
+    except (TypeError, ValueError):
+        return 'Every day'
+    if not selected or selected == list(range(1, 8)):
+        return 'Every day'
+
+    runs: list[list[int]] = [[selected[0]]]
+    for day in selected[1:]:
+        if day == runs[-1][-1] + 1:
+            runs[-1].append(day)
+        else:
+            runs.append([day])
+    parts: list[str] = []
+    for run in runs:
+        if len(run) >= 3:
+            parts.append(
+                f'{_DAY_LABELS[run[0] - 1]}–{_DAY_LABELS[run[-1] - 1]}'
+            )
+        else:
+            parts.extend(_DAY_LABELS[d - 1] for d in run)
+    return ', '.join(parts)
 
 
 def _to_dict(obj: Any) -> Any:

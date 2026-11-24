@@ -9,6 +9,79 @@
 // remove + add controls, which re-validate nesting rules
 // server-side).
 
+// ---------------------------------------------------------------------------
+// Playlist card expand/collapse state.
+//
+// The tree is swapped wholesale (hx-swap="outerHTML") by the 10 s
+// background poll and after every write, which tears down the Alpine
+// components and any x-data state with them. A card's open/closed
+// state therefore lives in this module, keyed by playlist id, so the
+// cards an operator expanded stay expanded across swaps. Every card
+// starts collapsed: the header row (name, chips, item count, total
+// runtime) is the overview, the item table is on demand.
+const openCards = new Set<string>()
+
+interface PlaylistCardData {
+  open: boolean
+  scheduleOpen: boolean
+  addOpen: boolean
+  q: string
+  sel: number
+  init(): void
+}
+
+function playlistCard(playlistId: string): PlaylistCardData {
+  return {
+    open: openCards.has(playlistId),
+    scheduleOpen: false,
+    addOpen: false,
+    q: '',
+    sel: 0,
+    init(
+      this: PlaylistCardData & {
+        $watch: (key: string, cb: (value: boolean) => void) => void
+      },
+    ) {
+      this.$watch('open', (value) => {
+        if (value) {
+          openCards.add(playlistId)
+        } else {
+          openCards.delete(playlistId)
+        }
+      })
+    },
+  }
+}
+
+// Gate for the background poll (the `[window.playlistTreeIdle()]`
+// condition on #playlist-tree's hx-trigger): skip the refresh while
+// the operator is interacting with the tree — an open schedule/add
+// panel or focus inside the tree means the swap would wipe half-typed
+// input. Event-driven refreshes (refresh-assets) are not gated; they
+// fire after the tree's own writes, when losing panel state is the
+// expected "done" transition.
+function playlistTreeIdle(): boolean {
+  const tree = document.getElementById('playlist-tree')
+  if (!tree) return true
+  const active = document.activeElement
+  if (active && active !== document.body && tree.contains(active)) {
+    return false
+  }
+  const panels = tree.querySelectorAll<HTMLElement>('.playlist-card__panel')
+  // offsetParent is null while an x-show has the panel display:none.
+  return !Array.from(panels).some((panel) => panel.offsetParent !== null)
+}
+
+declare global {
+  interface Window {
+    playlistCard: (playlistId: string) => PlaylistCardData
+    playlistTreeIdle: () => boolean
+  }
+}
+
+window.playlistCard = playlistCard
+window.playlistTreeIdle = playlistTreeIdle
+
 function csrfToken(): string {
   const fromForm = document.querySelector<HTMLInputElement>(
     'input[name=csrfmiddlewaretoken]',

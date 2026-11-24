@@ -7,7 +7,7 @@
 <div
   id="playlist-tree"
   hx-get="{% url 'anthias_app:playlists_tree' %}"
-  hx-trigger="every 10s, refresh-assets from:body"
+  hx-trigger="every 10s [window.playlistTreeIdle()], refresh-assets from:body"
   hx-swap="outerHTML"
   class="flex flex-col gap-4"
 >
